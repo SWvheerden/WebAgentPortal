@@ -204,12 +204,11 @@ fn key_leaf(key: &str) -> &str {
 /// name — which a fixed `-c` list cannot, because the name is the attacker's to
 /// choose.
 ///
-/// The disarming value is per key and was checked against git 2.52, not
-/// assumed: blanking `core.hooksPath` would *re-enable* the repository's own
-/// `.git/hooks`, and blanking a pager or editor is not the same as pointing it
-/// at something inert. `remote.*.uploadpack` and `remote.*.receivepack` are
-/// deliberately absent — measured, `-c` does **not** override them, so a
-/// repository declaring one is refused instead.
+/// The disarming value is per key. Both `core.hooksPath=` and
+/// `core.hooksPath=/dev/null` suppress hooks on git 2.52 (measured against a
+/// control that ran the hook); `/dev/null` is kept because it says what it
+/// means. `remote.*.uploadpack` and `remote.*.receivepack` are deliberately
+/// absent — see [`FLAG_PROTECTED_KEYS`].
 const EXECUTED_KEYS: &[(&str, &str)] = &[
     ("core.fsmonitor", ""),
     ("core.sshcommand", ""),
@@ -245,6 +244,21 @@ const EXECUTED_KEYS: &[(&str, &str)] = &[
     ("pager.*", "cat"),
     ("alias.*", ""),
 ];
+
+/// Keys `-c` cannot disarm, which a command-line argument handles instead.
+///
+/// Measured on git 2.52 with a control: with the repository declaring
+/// `remote.origin.uploadpack`, the command ran under no override, and still ran
+/// under `-c remote.origin.uploadpack=` and `-c …=git-upload-pack` — for
+/// `fetch --all`, `fetch origin` and `ls-remote`, over both a bare path and a
+/// `file://` URL — even though `config --get` showed the override had landed.
+/// Only `--upload-pack=git-upload-pack` suppressed it.
+///
+/// So these are neither disarmed nor refused: [`fetch`] pins the argument, and
+/// `fetch` is the only command here that contacts a remote at all. Refusing
+/// them instead would make a repository with a legitimate custom upload-pack —
+/// which some corporate setups need — unusable.
+const FLAG_PROTECTED_KEYS: &[&str] = &["remote.*.uploadpack", "remote.*.receivepack"];
 
 /// Words that end the name of a key git is likely to execute.
 ///
@@ -303,7 +317,17 @@ fn is_command_valued(key: &str, value: &str) -> bool {
     if value.is_empty() {
         return false;
     }
-    disarm_value(&key).is_some() || COMMAND_LEAVES.contains(&key_leaf(&key))
+    disarm_value(&key).is_some()
+        || is_flag_protected(&key)
+        || COMMAND_LEAVES.contains(&key_leaf(&key))
+}
+
+/// Is this key handled by a command-line argument rather than by `-c`?
+fn is_flag_protected(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    FLAG_PROTECTED_KEYS
+        .iter()
+        .any(|shape| matches_shape(&key, shape))
 }
 
 /// The value that disarms this key, if we know one. `None` means we cannot make
@@ -328,17 +352,74 @@ pub struct RepoGuard {
 }
 
 impl RepoGuard {
-    /// Build the guard from a repository's local config.
+    /// Build the guard from the configuration a repository actually puts into
+    /// effect.
     ///
-    /// `git config --local --list` reads the config and nothing else — no
-    /// working tree, so no filter driver runs — which is what makes it safe to
-    /// ask the repository about itself before working in it.
+    /// `git config --list` reads config files and nothing else — no working
+    /// tree, so no filter driver runs — which is what makes it safe to ask the
+    /// repository about itself before working in it.
+    ///
+    /// Two listings, both with `--includes`, because `--local` alone does not
+    /// show the effective configuration:
+    ///
+    /// * `include.path` pulls keys in from another file. Without `--includes`
+    ///   the only trace is the `include.path` entry itself, which is ordinary
+    ///   data — so a filter driver hidden behind one was invisible here while
+    ///   git honoured it.
+    /// * `extensions.worktreeConfig = true` puts keys in `.git/config.worktree`,
+    ///   which `--local` never reads.
+    ///
+    /// Deliberately *not* an unscoped `git config --list`: that would pull in
+    /// the operator's global config, where a normal `filter.lfs.clean` or
+    /// `credential.helper` would be blanked — breaking git-lfs and
+    /// authentication — and an unrecognised global key would refuse every
+    /// repository they own.
     pub fn read(repo: &Path) -> Self {
-        let Ok(listing) = git_raw(repo, &[], &["config", "--local", "--list", "-z"]) else {
-            // Not a repository, or a config git itself will not read.
+        if !is_git_repo(repo) {
+            // Not a repository: there is no repository config to guard.
             return Self::default();
+        }
+        let local = match git_raw(
+            repo,
+            &[],
+            &["config", "--local", "--list", "--includes", "-z"],
+        ) {
+            Ok(listing) => listing,
+            Err(err) => {
+                // A repository whose config git will not read is one we cannot
+                // vet. Running it under the fixed list alone is the fail-open
+                // case this guard exists to remove.
+                return Self {
+                    overrides: Vec::new(),
+                    refusals: vec![format!("its git config could not be read ({err})")],
+                };
+            }
         };
-        Self::from_listing(&listing)
+        let mut guard = Self::from_listing(&local);
+        // Errors when the worktreeConfig extension is off, which correctly
+        // means there is no worktree config in effect.
+        if let Ok(worktree) = git_raw(
+            repo,
+            &[],
+            &["config", "--worktree", "--list", "--includes", "-z"],
+        ) {
+            guard.absorb(Self::from_listing(&worktree));
+        }
+        guard
+    }
+
+    /// Fold a second listing's findings in.
+    fn absorb(&mut self, other: Self) {
+        for override_ in other.overrides {
+            if !self.overrides.contains(&override_) {
+                self.overrides.push(override_);
+            }
+        }
+        for refusal in other.refusals {
+            if !self.refusals.contains(&refusal) {
+                self.refusals.push(refusal);
+            }
+        }
     }
 
     /// Parse `git config --list -z` output: NUL-separated records, each
@@ -351,6 +432,10 @@ impl RepoGuard {
                 None => (record, ""),
             };
             if !is_command_valued(key, value) {
+                continue;
+            }
+            if is_flag_protected(key) {
+                // Handled by the argument `fetch` pins, not by `-c`.
                 continue;
             }
             if let Some(inert) = disarm_value(key) {
@@ -1208,12 +1293,40 @@ mod tests {
                 .expect("chmod");
         }
 
-        // A file the filter applies to, committed before the driver is planted.
-        std::fs::write(repo.path.join("a.txt"), "hello\n").expect("write");
-        std::fs::write(repo.path.join(".gitattributes"), "a.txt filter=evil\n")
-            .expect("write attributes");
+        // Files the filters apply to, committed before the drivers are planted.
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(repo.path.join(name), "hello\n").expect("write");
+        }
+        std::fs::write(
+            repo.path.join(".gitattributes"),
+            "a.txt filter=evil\nb.txt filter=included\nc.txt filter=worktree\n",
+        )
+        .expect("write attributes");
         git(&repo.path, &["add", "."]).expect("add");
         git(&repo.path, &["commit", "-q", "-m", "with attributes"]).expect("commit");
+
+        // A filter hidden behind an include: `.git/config` shows only the
+        // include line, which is ordinary data. Without expanding includes the
+        // guard sees nothing while git honours the driver.
+        let included = repo.path.join(".git").join("hidden.cfg");
+        std::fs::write(
+            &included,
+            format!(
+                "[filter \"included\"]\n\tclean = {p}\n\tsmudge = {p}\n",
+                p = payload.display()
+            ),
+        )
+        .expect("write included config");
+
+        // And one in the per-worktree config, which `--local` never reads.
+        std::fs::write(
+            repo.path.join(".git").join("config.worktree"),
+            format!(
+                "[filter \"worktree\"]\n\tclean = {p}\n\tsmudge = {p}\n",
+                p = payload.display()
+            ),
+        )
+        .expect("write worktree config");
 
         // Straight into .git/config, exactly as an unzipped directory would
         // arrive. Not via `git config`, so nothing sanitises it on the way in.
@@ -1225,17 +1338,30 @@ mod tests {
              \n[diff]\n\texternal = {p}\n\
              \n[uploadpack]\n\tpackObjectsHook = {p}\n\
              \n[remote \"origin\"]\n\turl = {dir}\n\
-             \n[alias]\n\tpwn = !{p}\n",
+             \n[alias]\n\tpwn = !{p}\n\
+             \n[include]\n\tpath = {inc}\n\
+             \n[extensions]\n\tworktreeConfig = true\n",
             p = payload.display(),
             dir = root.display(),
+            inc = included.display(),
         ));
         std::fs::write(&config, text).expect("write config");
 
+        // Three drivers now apply to the same file: one written directly, one
+        // reached through the include, one in the worktree config.
+        std::fs::write(
+            repo.path.join(".gitattributes"),
+            "a.txt filter=evil\nb.txt filter=included\nc.txt filter=worktree\n",
+        )
+        .expect("write attributes");
+
         // Same size, stale timestamp: git cannot decide from stat data alone
         // and has to re-hash the file — which is what runs the clean filter.
-        std::fs::write(repo.path.join("a.txt"), "HELLO\n").expect("modify");
         let stale = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
-        let _ = filetime(&repo.path.join("a.txt"), stale);
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(repo.path.join(name), "HELLO\n").expect("modify");
+            let _ = filetime(&repo.path.join(name), stale);
+        }
 
         // Everything an endpoint or the scanner can reach.
         let _ = is_git_repo(&repo.path);
@@ -1265,6 +1391,10 @@ mod tests {
             "core.pager=cat",
             "filter.evil.clean=",
             "filter.evil.smudge=",
+            "filter.included.clean=",
+            "filter.included.smudge=",
+            "filter.worktree.clean=",
+            "filter.worktree.smudge=",
             "diff.external=",
             "uploadpack.packobjectshook=",
             "alias.pwn=",
@@ -1313,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_upload_pack_command_is_refused_before_fetch_runs() {
+    fn a_remote_upload_pack_command_never_runs_on_fetch() {
         let Some(repo) = init_repo() else { return };
         let root = repo
             .path
@@ -1342,12 +1472,84 @@ mod tests {
         ));
         std::fs::write(&config, text).expect("write config");
 
-        let err = fetch(&repo.path).expect_err("must refuse");
-        assert!(format!("{err:#}").contains("runs commands"), "{err:#}");
+        // Not a refusal: a custom upload-pack is a legitimate thing for a
+        // repository to declare, and refusing would make it unusable. `-c`
+        // provably does not override this key, so `fetch` pins the argument
+        // that does.
+        let guard = RepoGuard::read(&repo.path);
+        assert!(guard.refusals.is_empty(), "{:?}", guard.refusals);
+        let _ = fetch(&repo.path);
         assert!(
             !sentinel.exists(),
             "a remote's upload-pack command must never run"
         );
+    }
+
+    /// The fixed `SAFE_CONFIG` list is the backstop for anything the per-repo
+    /// guard does not see, so it has to work on its own.
+    ///
+    /// `git_raw` is the runner that applies only that list — no per-repository
+    /// disarming — which is what makes this a test of the static entry rather
+    /// than of the guard. The control is the mutation: remove
+    /// `-c core.fsmonitor=` from `SAFE_CONFIG` and this fails.
+    #[test]
+    fn the_fixed_list_alone_suppresses_a_declared_fsmonitor() {
+        let Some(repo) = init_repo() else { return };
+        let root = repo
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let sentinel = root.join("FSMONITOR_PWNED");
+        let payload = root.join("fsmon.sh");
+        std::fs::write(
+            &payload,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", sentinel.display()),
+        )
+        .expect("write payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let config = repo.path.join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).expect("read config");
+        text.push_str(&format!("\n[core]\n\tfsmonitor = {}\n", payload.display()));
+        std::fs::write(&config, text).expect("write config");
+
+        std::fs::write(repo.path.join("README.md"), "changed\n").expect("modify");
+        let _ = git_raw(&repo.path, &[], &["status", "--porcelain"]);
+        assert!(
+            !sentinel.exists(),
+            "the fixed list must suppress core.fsmonitor by itself"
+        );
+    }
+
+    #[test]
+    fn a_repository_whose_config_cannot_be_read_is_refused() {
+        let Some(repo) = init_repo() else { return };
+        // git will not parse this, so we cannot vet what it declares. Running
+        // it under the fixed list alone is exactly the fail-open case the
+        // guard exists to remove.
+        std::fs::write(
+            repo.path.join(".git").join("config"),
+            "[core\nthis is not valid config\n",
+        )
+        .expect("write config");
+
+        let guard = RepoGuard::read(&repo.path);
+        assert!(!guard.refusals.is_empty(), "{guard:?}");
+        let err = git(&repo.path, &["status", "--porcelain"]).expect_err("must refuse");
+        assert!(format!("{err:#}").contains("could not be read"), "{err:#}");
+
+        // A plain directory is not a repository and needs no guard at all.
+        let plain = repo
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        assert_eq!(RepoGuard::read(&plain), RepoGuard::default());
     }
 
     #[test]
@@ -1378,6 +1580,11 @@ mod tests {
             ("user.email", "someone@example.com"),
             ("http.proxy", "http://proxy.example:3128"),
             ("submodule.lib.url", "https://example.com/lib.git"),
+            // An include is data. What matters is the keys it pulls in, and
+            // those are read by expanding includes rather than by trying to
+            // classify the include itself.
+            ("include.path", "/etc/some.cfg"),
+            ("extensions.worktreeconfig", "true"),
         ]));
         assert_eq!(guard, RepoGuard::default());
 
@@ -1402,13 +1609,13 @@ mod tests {
         );
         assert_eq!(guard.args().len(), 8, "two argv entries per override");
 
-        // `-c` does not override a remote's upload-pack, so it is a refusal.
+        // `-c` does not override a remote's upload-pack; `fetch` pins the
+        // argument that does, so it is neither disarmed nor refused here.
         let guard = RepoGuard::from_listing(&listing(&[
             ("remote.upstream.uploadpack", "/tmp/x.sh"),
             ("remote.upstream.receivepack", "/tmp/x.sh"),
         ]));
-        assert!(guard.overrides.is_empty(), "{:?}", guard.overrides);
-        assert_eq!(guard.refusals.len(), 2, "{:?}", guard.refusals);
+        assert_eq!(guard, RepoGuard::default());
 
         // Anything command-shaped in a namespace we do not understand refuses.
         for (key, value) in [

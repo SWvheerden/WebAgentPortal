@@ -412,20 +412,48 @@ stat data it cannot trust, and re-hashing runs the repository's own clean filter
 
 A fixed list of dangerous keys was tried twice and was incomplete both times:
 the second attempt covered `core.fsmonitor` but not `filter.<name>.clean`, whose
-name the attacker chooses. So before touching a repository, its **own** local
-config is read (`git config --local --list`, which reads no working tree and so
-runs no filter) and every command-valued key it declares is disarmed by that
-exact name, with the value that actually makes each inert — `/dev/null` for
-`core.hooksPath`, since blanking that would re-enable the repository's hooks.
+name the attacker chooses. So before touching a repository, the configuration it
+actually puts into effect is read and every command-valued key it declares is
+disarmed by that exact name.
+
+Reading it correctly took two more attempts, both caught by review:
+
+* `git config --local --list` shows only what is literally in `.git/config`. A
+  key reached through `include.path`, or living in `.git/config.worktree` behind
+  `extensions.worktreeConfig`, was invisible to the guard while git honoured it.
+  Both listings now pass `--includes`, and the per-worktree scope is read as a
+  second listing.
+* The read is scoped to the repository on purpose. An unscoped
+  `git config --list` would pull in the operator's *global* config, where a
+  normal `filter.lfs.clean` or `credential.helper` would be blanked — breaking
+  git-lfs and authentication — and an unrecognised global key would refuse every
+  repository they own.
+* A repository whose config git will not parse is refused rather than run under
+  the fixed list alone.
+
+The disarming value is per key, and each was measured against a control that
+first showed the command running. `core.hooksPath` is set to `/dev/null`;
+blanking it works equally well, and an earlier claim here that blanking would
+re-enable `.git/hooks` was wrong — it does not.
+
+`remote.<n>.uploadpack` and `remote.<n>.receivepack` are the exception: `-c`
+does not override them. Measured on git 2.52.0 with a control, the repository's
+command ran under no override *and* under `-c remote.origin.uploadpack=` and
+`-c …=git-upload-pack`, for `fetch --all`, `fetch origin` and `ls-remote`, over
+both a bare path and a `file://` URL — even though `git config --get` showed the
+override had landed. Only `--upload-pack=git-upload-pack` suppressed it, so
+`fetch` pins that argument, and `fetch` is the only command here that contacts a
+remote at all. (An independent re-run reported the opposite; the measurement
+above is what reproduces here, and the pinned argument is safe either way.)
+
 Anything command-shaped that we cannot prove inert makes the repository refuse
-inspection outright, named in the message: `remote.<n>.uploadpack` is one of
-those, because `-c` does not override it (measured — only the `--upload-pack`
-argument does, which `fetch` also passes). The picker shows such a repository as
+inspection outright, named in the message. The picker shows such a repository as
 "not inspected" and spawning into it is refused.
 
-The residual is the honest one: a key that git executes, whose name matches none
-of the shapes we know and does not end in a command-ish word, would still run.
-Clone URLs are restricted to https/ssh and absolute paths.
+The residual: a key that git executes, whose name matches none of the shapes we
+know and does not end in a command-ish word, would still run — and it would run
+under the fixed `SAFE_CONFIG` list, which stays as the backstop for exactly that
+case. Clone URLs are restricted to https/ssh and absolute paths.
 
 ### Endpoints
 ```
