@@ -56,6 +56,24 @@ CREATE TABLE IF NOT EXISTS repo_usage (
 );
 "#;
 
+/// Additive migrations applied after [`SCHEMA`].
+///
+/// `add_dirs` is the one column not in the design's §3 table: `--add-dir`
+/// values have to outlive the process or a resume after a server restart
+/// silently drops them. It is added, never required, so an older database
+/// opens unchanged.
+fn migrate(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(agents)")?;
+    let existing: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !existing.iter().any(|c| c == "add_dirs") {
+        conn.execute("ALTER TABLE agents ADD COLUMN add_dirs TEXT", [])
+            .context("adding the add_dirs column")?;
+    }
+    Ok(())
+}
+
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -80,6 +98,9 @@ pub struct AgentRecord {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub max_budget_usd: Option<f64>,
+    /// `--add-dir` values. Stored so a resume keeps them.
+    #[serde(default)]
+    pub add_dirs: Vec<String>,
     pub status: Status,
     pub status_detail: Option<String>,
     pub exit_code: Option<i64>,
@@ -127,6 +148,7 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("enabling foreign keys")?;
         conn.execute_batch(SCHEMA).context("applying schema")?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -160,9 +182,9 @@ impl Db {
                 "INSERT INTO agents (id, name, slug, repo_path, work_path, is_git, branch,
                      base_ref, uses_worktree, permission_mode, model, effort, max_budget_usd,
                      status, status_detail, exit_code, last_stderr, cost_usd, created_at,
-                     last_active_at)
+                     last_active_at, add_dirs)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18, ?19, ?20)",
+                     ?17, ?18, ?19, ?20, ?21)",
                 params![
                     a.id,
                     a.name,
@@ -184,6 +206,7 @@ impl Db {
                     a.cost_usd,
                     a.created_at,
                     a.last_active_at,
+                    serde_json::to_string(&a.add_dirs).unwrap_or_else(|_| "[]".to_string()),
                 ],
             )
             .context("inserting agent")?;
@@ -424,6 +447,29 @@ impl Db {
         })
     }
 
+    /// Close every outstanding permission request for an agent.
+    ///
+    /// A request id belongs to the process that asked; once that process is
+    /// gone the request can never be answered, so it is recorded as expired
+    /// rather than left to haunt the next launch (§5).
+    pub fn expire_pending_permissions(&self, agent_id: &str) -> Result<Vec<String>> {
+        let pending = self.pending_permissions(agent_id)?;
+        let mut expired = Vec::new();
+        for request in pending {
+            self.append_event(
+                agent_id,
+                EventKind::PermissionDecision,
+                &serde_json::json!({
+                    "request_id": request.request_id,
+                    "behavior": "expired",
+                    "tool_name": request.tool_name,
+                }),
+            )?;
+            expired.push(request.request_id);
+        }
+        Ok(expired)
+    }
+
     // -- repo usage ---------------------------------------------------------
 
     pub fn touch_repo(&self, path: &str) -> Result<()> {
@@ -453,7 +499,7 @@ impl Db {
 
 const AGENT_COLUMNS: &str = "id, name, slug, repo_path, work_path, is_git, branch, base_ref, \
      uses_worktree, permission_mode, model, effort, max_budget_usd, status, status_detail, \
-     exit_code, last_stderr, cost_usd, created_at, last_active_at";
+     exit_code, last_stderr, cost_usd, created_at, last_active_at, add_dirs";
 
 fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let mode: String = row.get(9)?;
@@ -480,6 +526,10 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         cost_usd: row.get(17)?,
         created_at: row.get(18)?,
         last_active_at: row.get(19)?,
+        add_dirs: row
+            .get::<_, Option<String>>(20)?
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -514,6 +564,7 @@ mod tests {
             model: Some("opus".to_string()),
             effort: None,
             max_budget_usd: None,
+            add_dirs: vec!["/extra/one".to_string()],
             status: Status::Starting,
             status_detail: None,
             exit_code: None,
@@ -747,5 +798,102 @@ mod tests {
             .expect("insert");
         let agents = db.run(|db| db.list_agents()).await.expect("list");
         assert_eq!(agents.len(), 1);
+    }
+
+    #[test]
+    fn add_dirs_survive_a_round_trip() {
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&sample_agent("a", "a")).expect("insert");
+        let back = db.get_agent("a").expect("get").expect("present");
+        assert_eq!(back.add_dirs, vec!["/extra/one".to_string()]);
+    }
+
+    #[test]
+    fn an_older_database_without_add_dirs_is_migrated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("old.db");
+        {
+            // The §3 schema exactly as it shipped, with no add_dirs column.
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE agents (
+                   id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+                   repo_path TEXT NOT NULL, work_path TEXT NOT NULL, is_git INTEGER NOT NULL,
+                   branch TEXT, base_ref TEXT, uses_worktree INTEGER NOT NULL,
+                   permission_mode TEXT NOT NULL, model TEXT, effort TEXT, max_budget_usd REAL,
+                   status TEXT NOT NULL, status_detail TEXT, exit_code INTEGER, last_stderr TEXT,
+                   cost_usd REAL NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                   last_active_at INTEGER NOT NULL);
+                 INSERT INTO agents (id, name, slug, repo_path, work_path, is_git, uses_worktree,
+                   permission_mode, status, cost_usd, created_at, last_active_at)
+                 VALUES ('old', 'Old agent', 'old', '/r', '/r', 1, 0, 'ask', 'stopped', 0, 1, 1);",
+            )
+            .expect("legacy schema");
+        }
+        let db = Db::open(&path).expect("open and migrate");
+        let agent = db.get_agent("old").expect("get").expect("present");
+        assert_eq!(agent.name, "Old agent");
+        assert!(agent.add_dirs.is_empty());
+        // And the migration is idempotent.
+        drop(db);
+        assert!(Db::open(&path).is_ok());
+    }
+
+    #[test]
+    fn expiring_pending_permissions_closes_them_for_good() {
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&sample_agent("a", "a")).expect("insert");
+        for id in ["1", "2"] {
+            db.append_event(
+                "a",
+                EventKind::PermissionRequest,
+                &json!({"request_id": id, "tool_name": "Write", "input": {}}),
+            )
+            .expect("append");
+        }
+        assert_eq!(db.pending_permissions("a").expect("pending").len(), 2);
+
+        let expired = db.expire_pending_permissions("a").expect("expire");
+        assert_eq!(expired, vec!["1".to_string(), "2".to_string()]);
+        assert!(db.pending_permissions("a").expect("pending").is_empty());
+        // Expiry is recorded in the log, not hidden.
+        let events = db.events_after("a", 0, 100).expect("events");
+        let decisions: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "permission_decision")
+            .collect();
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].payload["behavior"], json!("expired"));
+        // A second pass is a no-op.
+        assert!(
+            db.expire_pending_permissions("a")
+                .expect("expire")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_truncated_replay_page_can_be_detected() {
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&sample_agent("a", "a")).expect("insert");
+        for i in 1..=3000 {
+            db.append_event("a", EventKind::Assistant, &json!({"i": i}))
+                .expect("append");
+        }
+        // A client reconnecting from an old cursor gets one page, and the head
+        // is further on: the reply has to admit there is more.
+        let page = db.events_after("a", 100, 500).expect("query");
+        let cursor = page.last().map(|e| e.seq).unwrap_or(100);
+        assert_eq!(cursor, 600);
+        assert!(cursor < db.max_seq("a").expect("max"));
+
+        // Walking forward from the returned cursor eventually catches up.
+        let mut cursor = cursor;
+        while cursor < db.max_seq("a").expect("max") {
+            let page = db.events_after("a", cursor, 500).expect("query");
+            assert!(!page.is_empty(), "the walk must make progress");
+            cursor = page.last().map(|e| e.seq).unwrap_or(cursor);
+        }
+        assert_eq!(cursor, 3000);
     }
 }

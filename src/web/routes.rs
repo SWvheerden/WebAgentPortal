@@ -3,8 +3,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path as AxPath, Query, State};
+use axum::extract::{Path as AxPath, Query, Request, State};
 use axum::http::{StatusCode, Uri, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -28,6 +29,8 @@ struct Assets;
 pub struct AppState {
     pub sup: Arc<Supervisor>,
     pub config_path: PathBuf,
+    /// The port we are listening on, for the loopback `Host` check.
+    pub port: u16,
 }
 
 /// Anything an endpoint can refuse to do.
@@ -102,7 +105,76 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents/{id}/delete_preview", get(delete_preview))
         .route("/ws", get(super::ws::handler))
         .route("/api/health", get(health))
+        // Loopback binding alone does not survive DNS rebinding: a page on
+        // http://evil.example:7717 rebound to 127.0.0.1 would otherwise reach
+        // every endpoint here, including spawning an agent in `dangerous` mode.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            guard_loopback,
+        ))
         .with_state(state)
+}
+
+/// Hosts we answer to: loopback, on the port we are actually serving.
+pub fn host_allowed(host: Option<&str>, port: u16) -> bool {
+    let Some(host) = host else {
+        // HTTP/1.1 requires a Host header; a request without one is not a
+        // browser we want to trust.
+        return false;
+    };
+    let host = host.trim();
+    let (name, given_port) = match host.rsplit_once(':') {
+        // An IPv6 literal keeps its brackets: `[::1]:7717`.
+        Some((name, p)) if !name.ends_with('[') => (name, p.parse::<u16>().ok()),
+        _ => (host, None),
+    };
+    let name_ok = matches!(name, "127.0.0.1" | "localhost" | "[::1]" | "::1");
+    let port_ok = match given_port {
+        Some(p) => p == port,
+        // A missing port means the scheme default.
+        None => port == 80,
+    };
+    name_ok && port_ok
+}
+
+/// Origins we accept. Absent is fine — that is a non-browser client, which
+/// cannot be a rebinding victim; present and foreign is not.
+pub fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    let origin = origin.trim();
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        // "null" and anything exotic is refused.
+        return false;
+    };
+    host_allowed(Some(rest), port)
+}
+
+async fn guard_loopback(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let headers = req.headers();
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    if !host_allowed(host, state.port) {
+        tracing::warn!(?host, "refused a request with a non-loopback Host header");
+        return (
+            StatusCode::FORBIDDEN,
+            "claude-web only answers to a loopback Host header",
+        )
+            .into_response();
+    }
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    if !origin_allowed(origin, state.port) {
+        tracing::warn!(?origin, "refused a cross-origin request");
+        return (
+            StatusCode::FORBIDDEN,
+            "claude-web refuses cross-origin requests",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 // -- static assets ----------------------------------------------------------
@@ -149,6 +221,9 @@ async fn put_config(
     State(state): State<AppState>,
     Json(cfg): Json<Config>,
 ) -> ApiResult<Json<Config>> {
+    // The branch prefix reaches git as a positional argument, so an
+    // option-shaped one is refused here rather than at spawn time.
+    cfg.validate().map_err(ApiError::from)?;
     let path = state.config_path.clone();
     let to_save = cfg.clone();
     tokio::task::spawn_blocking(move || to_save.save(&path))
@@ -248,7 +323,9 @@ async fn clone_repo(
         .filter(|f| !f.trim().is_empty())
         .or_else(|| clone::folder_name_from_url(&req.url))
         .ok_or_else(|| ApiError::bad_request("could not derive a folder name from that URL"))?;
-    // Fail fast on a bad name before we tell the client the clone started.
+    // Fail fast on a bad URL or name before we tell the client the clone
+    // started: an option-shaped URL is refused here, not asynchronously.
+    clone::validate_url(&req.url).map_err(ApiError::from)?;
     clone::clone_destination(&root, &folder).map_err(ApiError::from)?;
 
     let clone_id = uuid::Uuid::new_v4().to_string();
@@ -378,10 +455,16 @@ async fn get_events(
         .await
         .map_err(ApiError::from)?;
     let cursor = events.last().map(|e| e.seq).unwrap_or(after);
+    let agent_id = record.id.clone();
+    let max_seq = db
+        .run(move |db| db.max_seq(&agent_id))
+        .await
+        .unwrap_or(cursor);
     Ok(Json(json!({
         "agent_id": record.id,
         "after": after,
         "cursor": cursor,
+        "has_more": cursor < max_seq,
         "events": events,
     })))
 }
@@ -567,5 +650,126 @@ mod tests {
     async fn missing_assets_are_a_404_not_a_panic() {
         let response = serve_embedded("nope.js");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn only_loopback_hosts_are_answered() {
+        for host in [
+            "127.0.0.1:7717",
+            "localhost:7717",
+            "[::1]:7717",
+            " localhost:7717 ",
+        ] {
+            assert!(host_allowed(Some(host), 7717), "{host} must be allowed");
+        }
+        for host in [
+            "evil.example:7717",
+            "attacker.test:7717",
+            "127.0.0.1.nip.io:7717",
+            "127.0.0.1:9999",
+            "localhost",
+            "192.168.1.5:7717",
+        ] {
+            assert!(!host_allowed(Some(host), 7717), "{host} must be refused");
+        }
+        assert!(!host_allowed(None, 7717), "a missing Host is refused");
+        assert!(host_allowed(Some("localhost"), 80));
+    }
+
+    #[test]
+    fn only_loopback_origins_are_accepted() {
+        assert!(
+            origin_allowed(None, 7717),
+            "non-browser clients send no Origin"
+        );
+        assert!(origin_allowed(Some("http://127.0.0.1:7717"), 7717));
+        assert!(origin_allowed(Some("http://localhost:7717"), 7717));
+        for origin in [
+            "http://evil.example",
+            "https://evil.example:7717",
+            "http://localhost:3000",
+            "null",
+            "file://",
+        ] {
+            assert!(
+                !origin_allowed(Some(origin), 7717),
+                "{origin} must be refused"
+            );
+        }
+    }
+
+    async fn test_state() -> AppState {
+        let db = crate::db::Db::open_in_memory().expect("db");
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        AppState {
+            sup: Supervisor::new(db, config),
+            config_path: PathBuf::from("/dev/null"),
+            port: 7717,
+        }
+    }
+
+    async fn status_of(request: axum::http::Request<axum::body::Body>) -> StatusCode {
+        use tower::ServiceExt;
+        router(test_state().await)
+            .oneshot(request)
+            .await
+            .expect("response")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn the_loopback_guard_lets_a_local_browser_through() {
+        let request = axum::http::Request::builder()
+            .uri("/api/health")
+            .header("host", "127.0.0.1:7717")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        assert_eq!(status_of(request).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_loopback_guard_refuses_a_rebound_host() {
+        let request = axum::http::Request::builder()
+            .uri("/api/health")
+            .header("host", "evil.example:7717")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        assert_eq!(status_of(request).await, StatusCode::FORBIDDEN);
+
+        // Even with a loopback Host, a foreign Origin is refused.
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/agents")
+            .header("host", "127.0.0.1:7717")
+            .header("origin", "http://evil.example")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .expect("request");
+        assert_eq!(status_of(request).await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_cross_origin_websocket_upgrade_is_refused() {
+        let build = |origin: &str| {
+            axum::http::Request::builder()
+                .uri("/ws")
+                .header("host", "127.0.0.1:7717")
+                .header("origin", origin)
+                .header("connection", "Upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(axum::body::Body::empty())
+                .expect("request")
+        };
+        assert_eq!(
+            status_of(build("http://evil.example")).await,
+            StatusCode::FORBIDDEN
+        );
+        // The same upgrade from the portal itself gets past the guard.
+        assert_ne!(
+            status_of(build("http://127.0.0.1:7717")).await,
+            StatusCode::FORBIDDEN
+        );
     }
 }

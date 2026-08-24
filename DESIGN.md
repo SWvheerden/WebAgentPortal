@@ -121,6 +121,13 @@ CREATE TABLE events (
 CREATE TABLE repo_usage (path TEXT PRIMARY KEY, last_used_at INTEGER NOT NULL);
 ```
 
+**Implementation note — one additive migration.** The shipped schema carries one
+column beyond the table above: `agents.add_dirs` (a JSON array, added by an
+`ALTER TABLE` guarded on `PRAGMA table_info`, so an existing database opens
+unchanged). Without it the `--add-dir` values chosen at spawn are lost on
+Resume after a server restart, which silently changes what the agent can reach.
+Everything else matches this schema exactly.
+
 **Not persisted:** `stream_event` partial-token deltas. `--include-partial-messages` drives
 live typing in the UI, but only completed blocks are written — otherwise the table grows by
 thousands of rows per turn and replay re-animates every keystroke.
@@ -243,6 +250,14 @@ The branch survives Delete by default.
 Loopback only (`127.0.0.1:7717`), no auth for now; the OS is the security boundary.
 Auth arrives when it binds to a non-loopback interface — mandatory, given the agents
 execute arbitrary code.
+
+### Host and Origin
+
+Loopback binding alone does not survive DNS rebinding: a page served from
+`http://evil.example:7717` and rebound to `127.0.0.1` is same-origin as far as
+the browser is concerned. Every request is therefore checked for a loopback
+`Host` header on the port actually being served, and any request carrying a
+foreign `Origin` — WebSocket upgrades included — is refused with 403.
 
 ### Endpoints
 ```

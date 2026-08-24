@@ -26,17 +26,37 @@ pub fn folder_name_from_url(url: &str) -> Option<String> {
     Some(tail.to_string())
 }
 
-/// Where a clone will land, refusing anything that escapes the chosen root.
+/// Where a clone will land, refusing anything that escapes the chosen root or
+/// that git would read as an option.
 pub fn clone_destination(root: &Path, folder: &str) -> Result<PathBuf> {
     if folder.is_empty()
         || folder == "."
         || folder == ".."
+        || folder.starts_with('-')
         || folder.contains('/')
         || folder.contains('\\')
+        || folder.chars().any(|c| c.is_control())
     {
         bail!("invalid folder name: {folder:?}");
     }
     Ok(root.join(folder))
+}
+
+/// A clone URL is a positional argument, so it must not look like an option.
+///
+/// `git clone --upload-pack=…` would otherwise run an arbitrary command.
+pub fn validate_url(url: &str) -> Result<()> {
+    let url = url.trim();
+    if url.is_empty() {
+        bail!("the clone URL is empty");
+    }
+    if url.starts_with('-') {
+        bail!("`{url}` starts with `-`, which git would read as an option");
+    }
+    if url.chars().any(|c| c.is_control()) {
+        bail!("the clone URL contains a control character");
+    }
+    Ok(())
 }
 
 /// Turn git's stderr into a friendlier message where we can.
@@ -77,6 +97,7 @@ pub async fn clone(
     folder: &str,
     mut on_progress: impl FnMut(String),
 ) -> Result<CloneOutcome> {
+    validate_url(url)?;
     let dest = clone_destination(root, folder)?;
     if dest.exists() {
         bail!(
@@ -91,7 +112,9 @@ pub async fn clone(
     let mut child = Command::new("git")
         .arg("clone")
         .arg("--progress")
-        .arg(url)
+        // `--` closes the option list: everything after it is a positional.
+        .arg("--")
+        .arg(url.trim())
         .arg(&dest)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
@@ -164,13 +187,58 @@ mod tests {
     }
 
     #[test]
+    fn option_shaped_urls_are_rejected() {
+        for bad in [
+            "--upload-pack=touch /tmp/pwned",
+            "-x",
+            "",
+            "   ",
+            "https://example.com/x\nmore",
+        ] {
+            assert!(validate_url(bad).is_err(), "{bad:?} must be rejected");
+        }
+        for good in [
+            "https://github.com/owner/repo.git",
+            "git@github.com:owner/repo.git",
+            "  https://github.com/owner/repo.git  ",
+            "/local/path",
+        ] {
+            assert!(validate_url(good).is_ok(), "{good:?} must be accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_option_shaped_url_never_reaches_git() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = clone(
+            "--upload-pack=touch /tmp/claude_web_pwned",
+            dir.path(),
+            "dest",
+            |_| {},
+        )
+        .await
+        .expect_err("must be refused");
+        assert!(err.to_string().contains("would read as an option"), "{err}");
+        assert!(!dir.path().join("dest").exists());
+    }
+
+    #[test]
     fn clone_destination_rejects_traversal() {
         let root = Path::new("/root");
         assert_eq!(
             clone_destination(root, "repo").expect("ok"),
             PathBuf::from("/root/repo")
         );
-        for bad in ["", ".", "..", "a/b", "../escape", "a\\b"] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "../escape",
+            "a\\b",
+            "-force",
+            "bad\u{7f}name",
+        ] {
             assert!(
                 clone_destination(root, bad).is_err(),
                 "{bad:?} should be rejected"

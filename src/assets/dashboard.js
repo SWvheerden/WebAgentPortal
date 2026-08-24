@@ -22,10 +22,14 @@ function agentCard(agent) {
 
   actions.append(el('a', { class: 'btn', href: `/agent/${agent.slug}`, text: 'Open' }));
   if (running) {
-    actions.append(el('button', { text: 'Interrupt', onclick: () => act(agent.id, 'interrupt') }));
-    actions.append(el('button', { text: 'Stop', onclick: () => act(agent.id, 'stop') }));
+    actions.append(
+      el('button', { text: 'Interrupt', onclick: (e) => act(agent.id, 'interrupt', e.target) }),
+    );
+    actions.append(el('button', { text: 'Stop', onclick: (e) => act(agent.id, 'stop', e.target) }));
   } else {
-    actions.append(el('button', { text: 'Resume', onclick: () => act(agent.id, 'resume') }));
+    actions.append(
+      el('button', { text: 'Resume', onclick: (e) => act(agent.id, 'resume', e.target) }),
+    );
   }
   actions.append(el('button', { text: 'Rename', onclick: () => rename(agent) }));
   actions.append(el('button', { class: 'danger', text: 'Delete', onclick: () => remove(agent) }));
@@ -63,11 +67,22 @@ async function loadAgents() {
   renderAgents();
 }
 
-async function act(id, verb) {
+// One verb per agent at a time. A double-clicked Resume would otherwise put
+// two requests in flight for one session.
+const inFlight = new Set();
+
+async function act(id, verb, button) {
+  const key = `${id}:${verb}`;
+  if (inFlight.has(key)) return;
+  inFlight.add(key);
+  if (button) button.disabled = true;
   try {
     await api(`/api/agents/${id}/${verb}`, { method: 'POST', body: '{}' });
   } catch (err) {
     toast(err.message, 'error');
+  } finally {
+    inFlight.delete(key);
+    if (button && button.isConnected) button.disabled = false;
   }
 }
 

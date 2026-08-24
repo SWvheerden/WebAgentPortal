@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -157,6 +158,9 @@ enum AgentCommand {
 struct RunnerHandle {
     tx: mpsc::UnboundedSender<AgentCommand>,
     commands: Arc<RwLock<Vec<SlashCommand>>>,
+    /// Which launch this handle belongs to. A runner only ever deregisters its
+    /// own generation, so a stale task cannot evict a live one.
+    generation: u64,
 }
 
 /// The registry of live agents.
@@ -164,10 +168,7 @@ pub struct Supervisor {
     db: Db,
     config: Arc<RwLock<Config>>,
     runners: Arc<RwLock<HashMap<String, RunnerHandle>>>,
-    /// `--add-dir` values per agent. The schema in §3 has no column for them,
-    /// so they live only as long as this process does; a resume after a server
-    /// restart launches without them.
-    extra_dirs: RwLock<HashMap<String, Vec<String>>>,
+    next_generation: AtomicU64,
     bus: broadcast::Sender<ServerMsg>,
 }
 
@@ -178,7 +179,7 @@ impl Supervisor {
             db,
             config,
             runners: Arc::new(RwLock::new(HashMap::new())),
-            extra_dirs: RwLock::new(HashMap::new()),
+            next_generation: AtomicU64::new(1),
             bus,
         })
     }
@@ -313,6 +314,11 @@ impl Supervisor {
                 .or_else(|| Some(cfg.default_model.clone())),
             effort: req.effort.clone(),
             max_budget_usd: req.max_budget_usd,
+            add_dirs: req
+                .add_dirs
+                .iter()
+                .map(|d| crate::config::expand_tilde(d).to_string_lossy().to_string())
+                .collect(),
             status: Status::Starting,
             status_detail: None,
             exit_code: None,
@@ -340,13 +346,6 @@ impl Supervisor {
         } else {
             None
         };
-
-        if !req.add_dirs.is_empty() {
-            self.extra_dirs
-                .write()
-                .await
-                .insert(record.id.clone(), req.add_dirs.clone());
-        }
 
         self.broadcast(ServerMsg::AgentAdded {
             agent: Box::new(record.clone()),
@@ -388,19 +387,42 @@ impl Supervisor {
                 model: record.model.clone(),
                 effort: record.effort.clone(),
                 max_budget_usd: record.max_budget_usd,
-                add_dirs: self
-                    .extra_dirs
-                    .read()
-                    .await
-                    .get(&record.id)
-                    .cloned()
-                    .unwrap_or_default(),
+                add_dirs: record.add_dirs.clone(),
             },
         };
 
+        // Approvals left outstanding by an earlier process died with it: their
+        // request ids mean nothing to the new child, so close them before it
+        // starts rather than showing the operator a card that can never be
+        // answered (§5).
+        let id_for_expiry = record.id.clone();
+        let expired = self
+            .db
+            .run(move |db| db.expire_pending_permissions(&id_for_expiry))
+            .await
+            .unwrap_or_default();
+        for request_id in expired {
+            self.broadcast(ServerMsg::PermissionResolved {
+                agent_id: record.id.clone(),
+                request_id,
+                behavior: "expired".to_string(),
+            });
+        }
+
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+
+        // The registry slot is claimed and the child spawned under one lock.
+        // Checking `is_running` and inserting separately would let two
+        // concurrent resumes both pass the check and start two children on one
+        // session id.
+        let mut runners = self.runners.write().await;
+        if runners.contains_key(&record.id) {
+            bail!("agent {} is already running", record.slug);
+        }
         let (child, msgs) = match process::spawn(&spawn_config) {
             Ok(pair) => pair,
             Err(err) => {
+                drop(runners);
                 let text = format!("{err:#}");
                 let id = record.id.clone();
                 let text_for_db = text.clone();
@@ -415,7 +437,7 @@ impl Supervisor {
                     status: Status::Failed,
                     status_detail: None,
                     exit_code: None,
-                    last_stderr: Some(text.clone()),
+                    last_stderr: Some(text),
                     cost_usd: record.cost_usd,
                 });
                 return Err(err);
@@ -424,13 +446,15 @@ impl Supervisor {
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let commands = Arc::new(RwLock::new(Vec::new()));
-        self.runners.write().await.insert(
+        runners.insert(
             record.id.clone(),
             RunnerHandle {
-                tx: cmd_tx.clone(),
+                tx: cmd_tx,
                 commands: commands.clone(),
+                generation,
             },
         );
+        drop(runners);
 
         let mut runner = Runner {
             id: record.id.clone(),
@@ -439,7 +463,9 @@ impl Supervisor {
             child,
             msgs,
             cmd_rx,
+            cmd_closed: false,
             status: Status::Starting,
+            status_detail: None,
             cost_usd: record.cost_usd,
             pending: HashMap::new(),
             next_request_id: 1,
@@ -463,7 +489,7 @@ impl Supervisor {
         let id = record.id.clone();
         tokio::spawn(async move {
             runner.run().await;
-            runners.write().await.remove(&id);
+            deregister(&runners, &id, generation).await;
         });
         Ok(())
     }
@@ -667,6 +693,21 @@ impl Supervisor {
     }
 }
 
+/// Remove a runner's registry entry, but only if it is still that runner's.
+///
+/// An unconditional remove would let a doomed runner evict the handle of the
+/// launch that replaced it, killing a healthy child.
+async fn deregister(
+    runners: &Arc<RwLock<HashMap<String, RunnerHandle>>>,
+    id: &str,
+    generation: u64,
+) {
+    let mut map = runners.write().await;
+    if map.get(id).is_some_and(|h| h.generation == generation) {
+        map.remove(id);
+    }
+}
+
 /// Why a delete was refused.
 #[derive(Debug)]
 pub enum DeleteError {
@@ -683,6 +724,9 @@ impl std::fmt::Display for DeleteError {
     }
 }
 
+/// The safety check, with every failure mode folded into an unsafe report.
+///
+/// A check that could not run must never read as "nothing would be lost".
 async fn safety_for(record: &AgentRecord) -> git::SafetyReport {
     if !record.is_git {
         return git::SafetyReport {
@@ -695,11 +739,15 @@ async fn safety_for(record: &AgentRecord) -> git::SafetyReport {
     let repo = PathBuf::from(&record.repo_path);
     let branch = record.branch.clone();
     let base = record.base_ref.clone();
-    tokio::task::spawn_blocking(move || {
+    match tokio::task::spawn_blocking(move || {
         git::safety_report(&work, &repo, branch.as_deref(), base.as_deref())
     })
     .await
-    .unwrap_or_default()
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(err)) => git::SafetyReport::failed(format!("{err:#}")),
+        Err(err) => git::SafetyReport::failed(err),
+    }
 }
 
 /// The workspace an agent will run in.
@@ -742,6 +790,9 @@ fn prepare_workspace(
         .filter(|b| !b.trim().is_empty())
         .or_else(|| git::current_branch(repo_path))
         .unwrap_or_else(|| "HEAD".to_string());
+    // Refuse an option-shaped base ref before anything is created or stored;
+    // it would otherwise be replayed by every later delete preview.
+    git::validate_ref(&base_ref).with_context(|| format!("base ref `{base_ref}`"))?;
 
     if req.in_place {
         git::create_branch_in_place(repo_path, &branch, Some(&base_ref))?;
@@ -787,7 +838,14 @@ struct Runner {
     child: ChildHandle,
     msgs: mpsc::UnboundedReceiver<ProcessMsg>,
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
+    /// Set once the command channel is closed. A closed `UnboundedReceiver`
+    /// returns `None` immediately and forever, so it must stop being polled or
+    /// the select loop spins.
+    cmd_closed: bool,
     status: Status,
+    /// The live sub-label naming the current tool (§4). Held here so an
+    /// unrelated status transition does not wipe it.
+    status_detail: Option<String>,
     cost_usd: f64,
     pending: HashMap<String, PermissionRequest>,
     next_request_id: u64,
@@ -802,6 +860,7 @@ struct Runner {
 impl Runner {
     async fn run(mut self) {
         loop {
+            let listening = !self.cmd_closed;
             tokio::select! {
                 msg = self.msgs.recv() => match msg {
                     Some(ProcessMsg::Action(action)) => self.on_action(action).await,
@@ -814,10 +873,14 @@ impl Runner {
                         break;
                     }
                 },
-                cmd = self.cmd_rx.recv() => match cmd {
+                cmd = self.cmd_rx.recv(), if listening => match cmd {
                     Some(cmd) => self.on_command(cmd).await,
-                    // Every sender is gone; the supervisor is going away.
+                    // Every sender is gone; the supervisor is going away. Ask
+                    // the child to stop once, then stop polling this channel —
+                    // it would return `None` forever — and drain `msgs` until
+                    // the exit arrives.
                     None => {
+                        self.cmd_closed = true;
                         self.stop_requested = true;
                         self.child.stop(STOP_GRACE);
                     }
@@ -854,34 +917,56 @@ impl Runner {
             tracing::debug!(agent = %self.id, ?transition, status = %self.status, "ignored transition");
             return;
         };
+        if transition == Transition::Spawned {
+            self.status_detail = None;
+        }
         self.status = next;
-        self.publish_status(None).await;
+        self.publish_status().await;
     }
 
-    async fn publish_status(&self, detail: Option<Option<String>>) {
+    /// Set the `Working` sub-label. `None` clears it — which only the end of a
+    /// turn does.
+    async fn set_detail(&mut self, detail: Option<String>) {
+        self.status_detail = detail.clone();
         let id = self.id.clone();
-        let status = self.status;
-        let exit_code = None;
-        let stderr = self.last_stderr.clone();
-        if let Some(detail) = detail.clone() {
-            let detail_for_db = detail.clone();
-            self.db
-                .run(move |db| db.set_status_detail(&id, detail_for_db.as_deref()))
-                .await
-                .ok();
-        } else {
-            let stderr_for_db = stderr.clone();
-            self.db
-                .run(move |db| {
-                    db.set_status(&id, status, None, exit_code, stderr_for_db.as_deref())
-                })
-                .await
-                .ok();
-        }
+        self.db
+            .run(move |db| db.set_status_detail(&id, detail.as_deref()))
+            .await
+            .ok();
         self.emit(ServerMsg::Status {
             agent_id: self.id.clone(),
             status: self.status,
-            status_detail: detail.flatten(),
+            status_detail: self.status_detail.clone(),
+            exit_code: None,
+            last_stderr: self.last_stderr.clone(),
+            cost_usd: self.cost_usd,
+        });
+    }
+
+    /// Write and announce the current status, carrying the sub-label with it.
+    async fn publish_status(&self) {
+        let id = self.id.clone();
+        let status = self.status;
+        let stderr = self.last_stderr.clone();
+        let detail = self.status_detail.clone();
+        let detail_for_db = detail.clone();
+        let stderr_for_db = stderr.clone();
+        self.db
+            .run(move |db| {
+                db.set_status(
+                    &id,
+                    status,
+                    detail_for_db.as_deref(),
+                    None,
+                    stderr_for_db.as_deref(),
+                )
+            })
+            .await
+            .ok();
+        self.emit(ServerMsg::Status {
+            agent_id: self.id.clone(),
+            status: self.status,
+            status_detail: detail,
             exit_code: None,
             last_stderr: stderr,
             cost_usd: self.cost_usd,
@@ -907,7 +992,7 @@ impl Runner {
                 payload,
             }),
             Action::Transition(t) => self.set_status(t).await,
-            Action::StatusDetail(detail) => self.publish_status(Some(detail)).await,
+            Action::StatusDetail(detail) => self.set_detail(detail).await,
             Action::Cost(cost) => {
                 self.cost_usd = cost;
                 let id = self.id.clone();
@@ -1067,6 +1152,32 @@ impl Runner {
             .signal
             .map(|s| format!("terminated by signal {s}"))
             .or_else(|| info.code.map(|c| format!("exited with code {c}")));
+        self.status_detail = detail.clone();
+
+        // Whatever this process was still asking permission for can never be
+        // answered now: close it out so the next launch starts clean (§5).
+        let outstanding: Vec<String> = self.pending.keys().cloned().collect();
+        for request_id in outstanding {
+            let tool = self
+                .pending
+                .remove(&request_id)
+                .map(|r| r.tool_name)
+                .unwrap_or_default();
+            self.persist(
+                EventKind::PermissionDecision,
+                json!({
+                    "request_id": request_id,
+                    "behavior": "expired",
+                    "tool_name": tool,
+                }),
+            )
+            .await;
+            self.emit(ServerMsg::PermissionResolved {
+                agent_id: self.id.clone(),
+                request_id,
+                behavior: "expired".to_string(),
+            });
+        }
 
         let id = self.id.clone();
         let detail_for_db = detail.clone();
@@ -1108,5 +1219,415 @@ impl Runner {
         if !requested {
             tracing::warn!(agent = %self.id, ?info, "agent exited unexpectedly");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::process::ChildHandle;
+    use crate::db::now_ms;
+    use tokio::sync::broadcast::Receiver;
+
+    fn agent_record(id: &str, work_path: &Path) -> AgentRecord {
+        AgentRecord {
+            id: id.to_string(),
+            name: "Test agent".to_string(),
+            slug: format!("slug_{id}"),
+            repo_path: work_path.to_string_lossy().to_string(),
+            work_path: work_path.to_string_lossy().to_string(),
+            is_git: false,
+            branch: None,
+            base_ref: None,
+            uses_worktree: false,
+            permission_mode: PermissionMode::Ask,
+            model: None,
+            effort: None,
+            max_budget_usd: None,
+            add_dirs: Vec::new(),
+            status: Status::Stopped,
+            status_detail: None,
+            exit_code: None,
+            last_stderr: None,
+            cost_usd: 0.0,
+            created_at: now_ms(),
+            last_active_at: now_ms(),
+        }
+    }
+
+    /// A runner wired to a child that does not exist, so the supervision logic
+    /// can be driven directly from synthetic process messages.
+    struct Harness {
+        db: Db,
+        id: String,
+        msgs: mpsc::UnboundedSender<ProcessMsg>,
+        cmds: Option<mpsc::UnboundedSender<AgentCommand>>,
+        events: Receiver<ServerMsg>,
+        stops: Arc<std::sync::atomic::AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+        _stdin: mpsc::UnboundedReceiver<Value>,
+    }
+
+    impl Harness {
+        fn start() -> Self {
+            let db = Db::open_in_memory().expect("db");
+            let dir = std::env::temp_dir();
+            let record = agent_record("agent-1", &dir);
+            db.insert_agent(&record).expect("insert");
+
+            let (bus, events) = broadcast::channel(256);
+            let (child, stdin, stops) = ChildHandle::detached();
+            let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+            let runner = Runner {
+                id: record.id.clone(),
+                db: db.clone(),
+                bus,
+                child,
+                msgs: msg_rx,
+                cmd_rx,
+                cmd_closed: false,
+                status: Status::Starting,
+                status_detail: None,
+                cost_usd: 0.0,
+                pending: HashMap::new(),
+                next_request_id: 1,
+                commands: Arc::new(RwLock::new(Vec::new())),
+                stop_requested: false,
+                last_stderr: None,
+                recently_sent: std::collections::VecDeque::new(),
+            };
+
+            Self {
+                db,
+                id: record.id,
+                msgs: msg_tx,
+                cmds: Some(cmd_tx),
+                events,
+                stops,
+                task: tokio::spawn(runner.run()),
+                _stdin: stdin,
+            }
+        }
+
+        fn action(&self, action: Action) {
+            self.msgs
+                .send(ProcessMsg::Action(action))
+                .expect("runner is alive");
+        }
+
+        /// Wait for the next status broadcast — the runner's own acknowledgement
+        /// that it processed what we sent, so no test needs a sleep.
+        async fn next_status(&mut self) -> (Status, Option<String>) {
+            loop {
+                match self.events.recv().await.expect("bus is alive") {
+                    ServerMsg::Status {
+                        status,
+                        status_detail,
+                        ..
+                    } => return (status, status_detail),
+                    _ => continue,
+                }
+            }
+        }
+
+        async fn finish(mut self) -> Db {
+            self.msgs
+                .send(ProcessMsg::Exited(ExitInfo {
+                    code: Some(0),
+                    signal: None,
+                    requested: true,
+                }))
+                .ok();
+            self.task.await.expect("runner should finish");
+            self.cmds.take();
+            self.db
+        }
+    }
+
+    // -- the command channel closing must end the loop, not spin on it -------
+
+    #[tokio::test]
+    async fn a_closed_command_channel_stops_the_child_once_and_terminates() {
+        let mut harness = Harness::start();
+        let cmds = harness.cmds.take().expect("sender");
+        drop(cmds);
+
+        // Give the runner every chance to spin. A loop that keeps polling a
+        // closed receiver would ask the child to stop on every iteration.
+        for _ in 0..500 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            harness.stops.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a closed command channel must ask for a stop exactly once"
+        );
+
+        // And the loop is still able to finish when the child exits.
+        harness
+            .msgs
+            .send(ProcessMsg::Exited(ExitInfo {
+                code: Some(143),
+                signal: Some(15),
+                requested: true,
+            }))
+            .expect("runner is alive");
+        harness.task.await.expect("runner should terminate");
+    }
+
+    // -- the Working sub-label survives unrelated transitions ----------------
+
+    #[tokio::test]
+    async fn status_detail_survives_an_unrelated_transition() {
+        let mut harness = Harness::start();
+
+        harness.action(Action::StatusDetail(Some("Bash: cargo test".to_string())));
+        let (_, detail) = harness.next_status().await;
+        assert_eq!(detail.as_deref(), Some("Bash: cargo test"));
+
+        // Asking for permission must not wipe the label naming the tool.
+        harness.action(Action::Transition(Transition::PermissionRequested));
+        let (status, detail) = harness.next_status().await;
+        assert_eq!(status, Status::AwaitingApproval);
+        assert_eq!(
+            detail.as_deref(),
+            Some("Bash: cargo test"),
+            "the sub-label must survive the transition"
+        );
+
+        let id = harness.id.clone();
+        let db = harness.finish().await;
+        let stored = db.get_agent(&id).expect("get").expect("present");
+        assert_eq!(stored.status, Status::Stopped);
+
+        // A turn ending is the one thing that clears it.
+        let mut harness = Harness::start();
+        harness.action(Action::StatusDetail(Some("Read: /a".to_string())));
+        harness.next_status().await;
+        harness.action(Action::StatusDetail(None));
+        let (_, detail) = harness.next_status().await;
+        assert_eq!(detail, None);
+        harness.finish().await;
+    }
+
+    // -- approvals do not outlive the process that asked --------------------
+
+    #[tokio::test]
+    async fn pending_approvals_do_not_survive_the_process_that_asked() {
+        let mut harness = Harness::start();
+        harness.action(Action::Permission(Box::new(PermissionRequest {
+            request_id: "77".to_string(),
+            tool_name: "Write".to_string(),
+            display_name: None,
+            description: None,
+            tool_use_id: None,
+            input: json!({"file_path": "/tmp/x"}),
+            permission_suggestions: Value::Null,
+        })));
+        harness.action(Action::Persist {
+            kind: EventKind::PermissionRequest,
+            payload: json!({"request_id": "77", "tool_name": "Write", "input": {}}),
+        });
+        harness.action(Action::Transition(Transition::PermissionRequested));
+        let (status, _) = harness.next_status().await;
+        assert_eq!(status, Status::AwaitingApproval);
+
+        let id = harness.id.clone();
+        let db = harness.finish().await;
+
+        let pending = db.pending_permissions(&id).expect("pending");
+        assert!(
+            pending.is_empty(),
+            "an approval the dead process asked for can never be answered: {pending:?}"
+        );
+        let decisions: Vec<_> = db
+            .events_after(&id, 0, 100)
+            .expect("events")
+            .into_iter()
+            .filter(|e| e.kind == "permission_decision")
+            .collect();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].payload["behavior"], json!("expired"));
+    }
+
+    #[tokio::test]
+    async fn a_relaunch_clears_approvals_left_over_from_a_crashed_process() {
+        let db = Db::open_in_memory().expect("db");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = agent_record("agent-2", dir.path());
+        db.insert_agent(&record).expect("insert");
+        // As if the server had died mid-approval, before on_exit could run.
+        db.append_event(
+            &record.id,
+            EventKind::PermissionRequest,
+            &json!({"request_id": "9", "tool_name": "Bash", "input": {}}),
+        )
+        .expect("append");
+        assert_eq!(
+            db.pending_permissions(&record.id).expect("pending").len(),
+            1
+        );
+
+        let sup = Supervisor::new(db.clone(), Arc::new(RwLock::new(missing_binary_config())));
+        // The launch itself fails (there is no CLI), but the stale approval is
+        // cleared before the child would ever have started.
+        sup.resume(&record.id).await.expect_err("no such binary");
+        assert!(
+            db.pending_permissions(&record.id)
+                .expect("pending")
+                .is_empty()
+        );
+    }
+
+    fn missing_binary_config() -> Config {
+        Config {
+            claude_bin: "/nonexistent/claude-web-test-binary".to_string(),
+            ..Config::default()
+        }
+    }
+
+    // -- one child per agent, whatever the interleaving ----------------------
+
+    /// A stand-in CLI that ignores its arguments and stays alive until its
+    /// stdin closes or it is signalled. No `claude`, no network, no timers.
+    fn stub_cli(dir: &Path) -> Option<String> {
+        let path = dir.join("stub-cli");
+        std::fs::write(&path, "#!/bin/sh\nexec cat >/dev/null\n").ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok()?;
+        }
+        if !Path::new("/bin/sh").exists() {
+            return None;
+        }
+        Some(path.to_string_lossy().to_string())
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_resumes_start_exactly_one_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(bin) = stub_cli(dir.path()) else {
+            return;
+        };
+        let db = Db::open_in_memory().expect("db");
+        let record = agent_record("agent-3", dir.path());
+        db.insert_agent(&record).expect("insert");
+        let sup = Supervisor::new(
+            db.clone(),
+            Arc::new(RwLock::new(Config {
+                claude_bin: bin,
+                ..Config::default()
+            })),
+        );
+
+        // A double-click on Resume: both requests are in flight at once.
+        let (first, second) = tokio::join!(sup.resume(&record.id), sup.resume(&record.id));
+        assert!(
+            first.is_ok() ^ second.is_ok(),
+            "exactly one resume may win: {first:?} / {second:?}"
+        );
+        let loser = first.err().or(second.err()).expect("one must lose");
+        assert!(
+            format!("{loser:#}").contains("already running"),
+            "{loser:#}"
+        );
+        assert_eq!(sup.running_count().await, 1, "one agent, one child");
+        assert!(
+            sup.is_running(&record.id).await,
+            "the winner must still be registered"
+        );
+
+        sup.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_runner_cannot_deregister_the_launch_that_replaced_it() {
+        let runners: Arc<RwLock<HashMap<String, RunnerHandle>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        runners.write().await.insert(
+            "a".to_string(),
+            RunnerHandle {
+                tx,
+                commands: Arc::new(RwLock::new(Vec::new())),
+                generation: 2,
+            },
+        );
+
+        // The older, doomed runner finishes and tries to clean up.
+        deregister(&runners, "a", 1).await;
+        assert!(
+            runners.read().await.contains_key("a"),
+            "generation 1 must not evict generation 2"
+        );
+
+        // The current runner's own cleanup does remove it.
+        deregister(&runners, "a", 2).await;
+        assert!(!runners.read().await.contains_key("a"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_leaves_no_registry_entry_and_marks_the_agent_failed() {
+        let db = Db::open_in_memory().expect("db");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = agent_record("agent-4", dir.path());
+        db.insert_agent(&record).expect("insert");
+        let sup = Supervisor::new(db.clone(), Arc::new(RwLock::new(missing_binary_config())));
+
+        sup.resume(&record.id).await.expect_err("no such binary");
+        assert_eq!(sup.running_count().await, 0);
+        let stored = db.get_agent(&record.id).expect("get").expect("present");
+        assert_eq!(stored.status, Status::Failed);
+        assert!(stored.last_stderr.is_some());
+    }
+
+    #[tokio::test]
+    async fn add_dirs_are_persisted_so_a_resume_keeps_them() {
+        let db = Db::open_in_memory().expect("db");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = agent_record("agent-5", dir.path());
+        record.add_dirs = vec!["/extra/one".to_string(), "/extra/two".to_string()];
+        db.insert_agent(&record).expect("insert");
+
+        // Reading the agent back is what a resume does, and the launch argv is
+        // built from exactly that.
+        let stored = db.get_agent(&record.id).expect("get").expect("present");
+        let argv = LaunchArgs {
+            session_id: stored.id.clone(),
+            resume: true,
+            permission_mode: stored.permission_mode,
+            model: stored.model.clone(),
+            effort: stored.effort.clone(),
+            max_budget_usd: stored.max_budget_usd,
+            add_dirs: stored.add_dirs.clone(),
+        }
+        .to_argv();
+        assert_eq!(argv.iter().filter(|a| *a == "--add-dir").count(), 2);
+        assert!(argv.iter().any(|a| a == "/extra/two"));
+    }
+
+    #[tokio::test]
+    async fn a_non_intercepting_agent_cannot_be_asked_for_a_decision() {
+        let db = Db::open_in_memory().expect("db");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = agent_record("agent-6", dir.path());
+        record.permission_mode = PermissionMode::Bypass;
+        db.insert_agent(&record).expect("insert");
+        let sup = Supervisor::new(db, Arc::new(RwLock::new(Config::default())));
+
+        let err = sup
+            .decide(
+                &record.id,
+                "1",
+                PermissionDecision::Allow {
+                    updated_input: None,
+                },
+            )
+            .await
+            .expect_err("bypass never reaches the approval queue");
+        assert!(format!("{err:#}").contains("bypass"), "{err:#}");
     }
 }

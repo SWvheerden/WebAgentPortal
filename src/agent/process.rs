@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
@@ -227,6 +227,9 @@ pub struct ChildHandle {
     pub pid: u32,
     stdin: mpsc::UnboundedSender<Value>,
     exited: Arc<AtomicBool>,
+    /// How many times a stop has been asked for. One per stop in normal
+    /// operation; a runaway supervisor loop shows up here immediately.
+    stop_requests: Arc<AtomicUsize>,
 }
 
 impl ChildHandle {
@@ -238,34 +241,67 @@ impl ChildHandle {
     }
 
     pub fn has_exited(&self) -> bool {
-        self.exited.load(Ordering::SeqCst)
+        self.exited.load(Ordering::Acquire)
     }
 
     /// SIGTERM, so `SessionEnd` hooks run and the interrupted turn is recorded,
     /// then SIGKILL after the grace period (§4).
+    ///
+    /// The signal goes to the whole process group, not just the CLI: `claude`
+    /// spawns its own children for Bash tool calls, and a `cargo build` left
+    /// running would hold the worktree open and break the delete path.
     pub fn stop(&self, grace: std::time::Duration) {
+        self.stop_requests.fetch_add(1, Ordering::AcqRel);
         if self.has_exited() {
             return;
         }
-        signal_pid(self.pid, nix::sys::signal::Signal::SIGTERM);
+        signal_group(self.pid, nix::sys::signal::Signal::SIGTERM);
         let pid = self.pid;
         let exited = self.exited.clone();
         tokio::spawn(async move {
             tokio::time::sleep(grace).await;
-            if !exited.load(Ordering::SeqCst) {
+            if !exited.load(Ordering::Acquire) {
                 tracing::warn!(pid, "child ignored SIGTERM; sending SIGKILL");
-                signal_pid(pid, nix::sys::signal::Signal::SIGKILL);
+                signal_group(pid, nix::sys::signal::Signal::SIGKILL);
             }
         });
     }
+
+    /// A handle with no process behind it, for testing the supervisor without
+    /// spawning anything. It reports as already exited, so no signal is ever
+    /// sent — signalling pid 0 would hit our own process group.
+    #[cfg(test)]
+    pub fn detached() -> (Self, mpsc::UnboundedReceiver<Value>, Arc<AtomicUsize>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let stop_requests = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                pid: 0,
+                stdin: tx,
+                exited: Arc::new(AtomicBool::new(true)),
+                stop_requests: stop_requests.clone(),
+            },
+            rx,
+            stop_requests,
+        )
+    }
 }
 
-fn signal_pid(pid: u32, sig: nix::sys::signal::Signal) {
-    let pid = nix::unistd::Pid::from_raw(pid as i32);
-    if let Err(err) = nix::sys::signal::kill(pid, sig) {
-        // ESRCH simply means it is already gone.
-        if err != nix::errno::Errno::ESRCH {
-            tracing::warn!(?err, ?sig, "failed to signal child");
+/// Signal the child's whole process group, falling back to the child alone if
+/// it never became a group leader.
+fn signal_group(pid: u32, sig: nix::sys::signal::Signal) {
+    let target = nix::unistd::Pid::from_raw(pid as i32);
+    match nix::sys::signal::killpg(target, sig) {
+        Ok(()) => {}
+        // ESRCH simply means the group is already gone.
+        Err(nix::errno::Errno::ESRCH) => {}
+        Err(err) => {
+            tracing::debug!(?err, ?sig, "killpg failed; signalling the child directly");
+            if let Err(err) = nix::sys::signal::kill(target, sig)
+                && err != nix::errno::Errno::ESRCH
+            {
+                tracing::warn!(?err, ?sig, "failed to signal child");
+            }
         }
     }
 }
@@ -284,6 +320,9 @@ pub fn spawn(config: &SpawnConfig) -> Result<(ChildHandle, mpsc::UnboundedReceiv
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Its own process group, so stopping the agent also stops whatever its
+        // tool calls started.
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawning {}", config.claude_bin))?;
@@ -363,7 +402,7 @@ pub fn spawn(config: &SpawnConfig) -> Result<(ChildHandle, mpsc::UnboundedReceiv
     tokio::spawn(async move {
         let _ = stdout_task.await;
         let status = child.wait().await;
-        exit_flag.store(true, Ordering::SeqCst);
+        exit_flag.store(true, Ordering::Release);
         let info = match status {
             Ok(status) => ExitInfo {
                 code: status.code(),
@@ -387,6 +426,7 @@ pub fn spawn(config: &SpawnConfig) -> Result<(ChildHandle, mpsc::UnboundedReceiv
             pid,
             stdin: stdin_tx,
             exited,
+            stop_requests: Arc::new(AtomicUsize::new(0)),
         },
         msg_rx,
     ))

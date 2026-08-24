@@ -253,11 +253,20 @@ async fn replay(state: &AppState, agent_id: &str, after_seq: Option<i64>) -> Val
         Vec::new()
     };
     let cursor = events.last().map(|e| e.seq).unwrap_or(after);
+    let id_for_head = id.clone();
+    let head = db
+        .run(move |db| db.max_seq(&id_for_head))
+        .await
+        .unwrap_or(cursor);
     json!({
         "type": "replay",
         "agent_id": agent_id,
         "after": after,
         "cursor": cursor,
+        // The page is capped, so a client reconnecting from an old cursor has
+        // to be told to come back for the rest — otherwise the events between
+        // the page and the live stream are lost for good (§7).
+        "has_more": cursor < head,
         "events": events,
         "pending_permissions": pending,
     })

@@ -137,6 +137,10 @@ function atBottom() {
 function appendEvents(events, prepend = false) {
   const host = $('transcript');
   const stick = atBottom();
+  // Replay and the live stream overlap: an event persisted between the replay
+  // query and the socket catching up arrives twice. The cursor is the filter.
+  if (!prepend) events = events.filter((e) => e.seq > state.cursor);
+  if (!events.length) return;
   const nodes = events.map(renderEvent).filter(Boolean);
   if (prepend) host.prepend(...nodes);
   else host.append(...nodes);
@@ -328,6 +332,7 @@ async function loadEarlier() {
   const after = Math.max(0, state.earliest - 201);
   const data = await api(`/api/agents/${state.agent.id}/events?after=${after}&limit=200`);
   const older = data.events.filter((e) => e.seq < state.earliest);
+  if (!older.length) return;
   appendEvents(older, true);
   $('load-earlier').classList.toggle('hidden', state.earliest <= 1);
 }
@@ -344,7 +349,19 @@ async function main() {
 
   $('btn-interrupt').onclick = () => socket.send({ type: 'interrupt', agent_id: state.agent.id });
   $('btn-stop').onclick = () => api(`/api/agents/${state.agent.id}/stop`, { method: 'POST', body: '{}' }).catch((e) => toast(e.message, 'error'));
-  $('btn-resume').onclick = () => api(`/api/agents/${state.agent.id}/resume`, { method: 'POST', body: '{}' }).catch((e) => toast(e.message, 'error'));
+  // The button stays disabled until the request settles: two resumes in flight
+  // would otherwise race for one session.
+  $('btn-resume').onclick = async () => {
+    const button = $('btn-resume');
+    if (button.disabled) return;
+    button.disabled = true;
+    try {
+      await api(`/api/agents/${state.agent.id}/resume`, { method: 'POST', body: '{}' });
+    } catch (err) {
+      toast(err.message, 'error');
+      button.disabled = false;
+    }
+  };
   $('send').onclick = send;
   $('load-earlier').onclick = () => loadEarlier().catch((e) => toast(e.message, 'error'));
   $('input').addEventListener('input', updateAutocomplete);
@@ -392,10 +409,17 @@ async function main() {
     .on('replay', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
       if (state.earliest === null) state.earliest = msg.after + 1;
+      const before = state.cursor;
       appendEvents(msg.events);
       state.pending = new Map((msg.pending_permissions || []).map((r) => [r.request_id, r]));
       renderApprovals();
       $('load-earlier').classList.toggle('hidden', (state.earliest || 1) <= 1);
+      // A replay page is capped. If the head is further on, ask for the next
+      // page from the cursor we now hold, or the events between this page and
+      // the live stream would be lost for good.
+      if (msg.has_more && msg.cursor > before) {
+        socket.send({ type: 'subscribe', agent_id: state.agent.id, after_seq: msg.cursor });
+      }
     })
     .on('event', (msg) => {
       if (msg.agent_id !== state.agent.id) return;

@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         sup: sup.clone(),
         config_path,
+        port,
     };
     let app = web::routes::router(state);
 

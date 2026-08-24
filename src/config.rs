@@ -54,7 +54,10 @@ impl Config {
         if path.exists() {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            Self::from_toml_str(&text)
+            let cfg = Self::from_toml_str(&text)?;
+            cfg.validate()
+                .with_context(|| format!("in {}", path.display()))?;
+            Ok(cfg)
         } else {
             let cfg = Self::default();
             cfg.save(path)?;
@@ -69,6 +72,24 @@ impl Config {
         }
         std::fs::write(path, self.to_toml_string()?)
             .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Reject a configuration that would be unsafe or unusable.
+    ///
+    /// The branch prefix ends up as a positional argument to git, so it is held
+    /// to the same rules as a ref name.
+    pub fn validate(&self) -> Result<()> {
+        crate::repo::git::validate_branch_prefix(&self.branch_prefix)?;
+        if self.repo_roots.is_empty() {
+            anyhow::bail!("at least one repo root is required");
+        }
+        if self.max_agents == 0 {
+            anyhow::bail!("max_agents must be at least 1");
+        }
+        if self.claude_bin.trim().is_empty() {
+            anyhow::bail!("claude_bin cannot be empty");
+        }
+        Ok(())
     }
 
     /// Repo roots with `~` expanded.
@@ -192,5 +213,55 @@ pinned_cli_version = "2.1.241"
             PathBuf::from("~notuser")
         );
         assert_eq!(expand_tilde_with("~/Code", None), PathBuf::from("~/Code"));
+    }
+
+    #[test]
+    fn an_option_shaped_branch_prefix_is_refused() {
+        let cfg = Config {
+            branch_prefix: "--force".to_string(),
+            ..Config::default()
+        };
+        let err = cfg.validate().expect_err("must be refused");
+        assert!(
+            format!("{err:#}").contains("would read as an option"),
+            "{err:#}"
+        );
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn an_unusable_config_is_refused() {
+        assert!(
+            Config {
+                repo_roots: vec![],
+                ..Config::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Config {
+                max_agents: 0,
+                ..Config::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Config {
+                claude_bin: "  ".to_string(),
+                ..Config::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_unsafe_config_fails_to_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "branch_prefix = \"--upload-pack=x\"\n").expect("write");
+        assert!(Config::load_or_create(&path).is_err());
     }
 }
