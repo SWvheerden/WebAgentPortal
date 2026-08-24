@@ -300,13 +300,14 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
 
 /// A plain-language hint for the most common `git worktree remove` failure.
 ///
-/// Something the agent started can still be holding the checkout open — the
-/// sweep at stop time catches tool-call process groups, but not a process the
-/// agent deliberately detached (see `agent::process::ChildHandle::stop`).
+/// Something the agent started can still be holding the checkout open. The
+/// sweep at stop time catches process groups still running under the CLI, but
+/// not one that had already left its subtree — a job backgrounded with `&`
+/// included (see `agent::process::ChildHandle::stop`).
 fn worktree_removal_hint(path: &Path) -> String {
     format!(
         "could not remove the worktree at {}. If a process the agent started is still \
-         running there (a build, a dev server, anything detached with `nohup` or `setsid`), \
+         running there (a build, a dev server, or something backgrounded with `&`), \
          stop it and try again, or delete anyway to force it",
         path.display()
     )

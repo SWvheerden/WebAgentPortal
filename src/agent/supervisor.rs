@@ -1025,11 +1025,11 @@ impl Runner {
     /// Run a snapshot cycle and fold the result into what we already know.
     ///
     /// Scheduled off the runner loop so a `ps` never delays event handling.
-    /// Two snapshots follow each tool call starting, because the shape we are
-    /// chasing changes within milliseconds: an early one catches a `&` job
-    /// while it is still in the tool shell's process group and the shell is
-    /// still a descendant of the CLI, and a later one catches a process that
-    /// took a moment to come up.
+    /// Several snapshots follow each tool call starting. The later ones do the
+    /// real work — they record a child that is still running, which is what
+    /// makes it reachable at teardown. The earliest are a cheap best effort at
+    /// a shell that exits immediately; they occasionally win, but they do not
+    /// close the backgrounded-job case (DESIGN.md §4).
     fn refresh_sweep(&self, delay: Duration) {
         let pid = self.child.pid as i32;
         if pid <= 0 {
@@ -1136,18 +1136,22 @@ impl Runner {
                 }
                 self.refresh_on_activity();
                 match kind {
-                    // A tool call is starting. Look twice: once almost
-                    // immediately, which is what catches a `&` job before its
-                    // shell exits and it reparents to init, and once after it
-                    // has had a moment to come up.
+                    // A tool call is starting. Sample a few times over the
+                    // first quarter-second: what matters is catching a child
+                    // that is still running later, and the early samples are a
+                    // cheap best effort at a shell that exits at once. They are
+                    // NOT a fix for a job backgrounded with `&` — measured
+                    // against the real CLI those reparent to pid 1 before the
+                    // first sample can run and are not swept (DESIGN.md §4).
                     EventKind::ToolUse => {
                         for ms in [0, 8, 20, 45, 90, 250] {
                             self.refresh_sweep(Duration::from_millis(ms));
                         }
                     }
                     // A tool call returned, or the turn ended. Anything still
-                    // running was left behind deliberately — a dev server, a
-                    // build — and is exactly what has to be caught.
+                    // running under the CLI now — a dev server, a build — is
+                    // exactly what has to be caught, and is what the teardown
+                    // reliably reaches.
                     EventKind::ToolResult | EventKind::Result => self.refresh_sweep(Duration::ZERO),
                     _ => {}
                 }

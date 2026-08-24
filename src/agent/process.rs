@@ -267,10 +267,17 @@ impl ChildHandle {
     /// The tree is snapshotted **before** the first signal, because SIGTERM to
     /// the CLI tears the tree down and there would be nothing left to walk.
     ///
-    /// **Not** handled: a process the agent deliberately detached — `nohup … &`,
-    /// `setsid`, anything already reparented to pid 1 before the snapshot. It is
-    /// in neither the CLI's group nor its subtree, and macOS has no cgroup
-    /// equivalent to catch it. See DESIGN.md §4.
+    /// **Not** handled: anything that has already left the CLI's subtree by the
+    /// time we look. That includes a job backgrounded with a plain `&` inside a
+    /// tool call — measured against `claude` 2.1.241 on 2026-08-24, those are
+    /// *not* swept (0 of 4 controlled trials), because the tool's shell exits
+    /// within milliseconds and the job reparents to pid 1 before our first
+    /// sample can run — as well as `nohup` and `setsid`. It is then in neither
+    /// the CLI's group nor its subtree, and macOS has no cgroup equivalent to
+    /// recover the relationship. What *is* reliably swept is a process still
+    /// running as a descendant when the agent stops, crashes or the server
+    /// shuts down: the build or dev server holding the worktree open. See
+    /// DESIGN.md §4.
     pub fn stop(&self, grace: std::time::Duration, known: Sweep) {
         self.stop_requests.fetch_add(1, Ordering::AcqRel);
         if self.has_exited() {
@@ -1193,15 +1200,17 @@ mod tests {
     }
 
     #[test]
-    fn a_detached_descendant_is_honestly_out_of_reach() {
+    fn a_process_that_has_left_the_subtree_is_out_of_reach() {
         // Something already reparented to init is in neither the CLI's group
-        // nor its subtree, so a snapshot taken now cannot see it. The early
-        // snapshot exists to catch it *before* this happens.
+        // nor its subtree, so no snapshot can see it. This is the documented
+        // limitation, asserted so it stays honest: against the real CLI a job
+        // backgrounded with `&` reaches this state before our first sample runs,
+        // and is not swept.
         let table = vec![
             entry(1, 0, 1),
             entry(100, 1, 99),
             entry(200, 100, 200),
-            entry(43060, 1, 43058), // the live capture of a `nohup … &`
+            entry(43060, 1, 43058), // a live capture of a backgrounded job
         ];
         assert!(
             !sweep_targets(&table, 200, 100, 99, NOW)

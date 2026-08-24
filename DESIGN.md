@@ -181,14 +181,15 @@ them after the fact. The process tree under the CLI is snapshotted (`ps -axo
 pid,ppid,pgid,etime`, walked breadth-first with a visited set, in
 `spawn_blocking`) several times in the first quarter-second of each tool call,
 again when it returns or the turn ends, and every couple of seconds while the
-agent is otherwise busy and there is something to keep track of. The early
-samples are what catch a `&` job: it stays in the tool shell's process group,
-and that shell is a descendant of the CLI only for as long as it lives, which
-for `sleep … & echo done` is a few milliseconds. A single sample at 25ms missed
-that case in testing; a short cascade caught it every time. The groups found are accumulated over the
-session; a group is dropped only once nothing of it is left, never because it is
-old, because a group recorded early and still running is precisely the one worth
-keeping.
+agent is otherwise busy and there is something to keep track of. The groups found
+are accumulated over the session; a group is dropped only once nothing of it is
+left, never because it is old, because a group recorded early and still running
+is precisely the one worth keeping.
+
+The early samples in that first quarter-second are a cheap best effort at
+catching a tool call whose shell exits immediately. They are kept because they
+cost little and occasionally win, but they are **not** a fix for backgrounded
+jobs — see the measurements below.
 
 Nothing is signalled on the strength of a group id alone. A group counts as the
 agent's only while some live member **started before the last moment we proved
@@ -209,23 +210,44 @@ finish shutting down — until it has completed. Without that, shutdown returned
 soon as the CLI died and the escalation was cancelled with the runtime. pid 1,
 the server's own pid and the server's own process group are never signalled.
 
-**Residual limitation.** A process that leaves the CLI's subtree before any
-snapshot sees it is out of reach: nothing connects it back to the agent, and
-macOS has no cgroup or PID-namespace equivalent to catch it. This needs no
-deliberate detaching — a plain `&` in a tool call that returns quickly reparents
-to init just as fast as `nohup` does. The early snapshot exists precisely for
-this case and closes most of it, because a `&` job in a non-interactive shell
-stays in that shell's process group, and the shell is still a descendant of the
-CLI for as long as the tool call runs. What remains uncatchable is a process that
-both starts *and* is orphaned inside the gap between two samples — sampling can
-never make that impossible, only unlikely — one that calls `setsid` for itself,
-and anything at all when the server is killed with SIGKILL, which runs no
-teardown. The conservative ownership test above also
-means a group whose every live member is younger than our last proof is left
-alone: leaving a build running is a nuisance, signalling the user's editor is
-not. When a worktree removal is then refused because something is still holding
-it, git's own stderr is surfaced to the operator with the path and a "delete
-anyway" hint rather than a generic failure.
+**What is reliably swept, and what is not.** Measured against `claude` 2.1.241
+on 2026-08-24, with an unrelated decoy process running throughout to check for
+over-signalling:
+
+| case | result |
+|---|---|
+| A tool call's child still running when the agent is **stopped** | swept |
+| …when the CLI **crashes** (SIGKILL to the CLI) | swept |
+| …when the **server shuts down** | swept |
+| A job backgrounded with `&` inside a tool call (`sleep 1201 &`, `bash -c "sleep 1117 &"`) | **not swept** — 0 of 4 controlled trials, and at best 1 of 8 overall |
+| An unrelated process of the user's, on any path | never signalled, ~10 trials |
+
+The first three are the case this machinery exists for: a `cargo build`, an
+`npm run dev`, anything still holding the worktree open at the moment the agent
+goes away. Those are descendants of the CLI when we look, and they are reliably
+caught.
+
+A job backgrounded with `&` is, in practice, **not** caught, and no sampling
+cadence fixes that. The tool's shell exits within a few milliseconds of starting
+the job, and our first sample cannot run until we have already observed the
+`tool_use` event — by which time the shell is usually gone and the job has
+reparented to pid 1, in neither the CLI's process group nor its subtree. macOS
+has no cgroup or PID-namespace equivalent to recover the relationship after the
+fact. The same applies to `nohup`, to `setsid`, and to anything at all when the
+server is killed with SIGKILL, which runs no teardown.
+
+(An earlier stub-based measurement suggested the early samples caught the `&`
+case 9 times out of 9. That stub reproduced the process *topology* but not the
+*timing* — its shell lived long enough to be observed — so the figure said
+nothing about real behaviour and is recorded here only so it is not mistaken for
+evidence.)
+
+The conservative ownership test above also means a group whose every live member
+is younger than our last proof is left alone: leaving a build running is a
+nuisance, signalling the user's editor is not. When a worktree removal is then
+refused because something is still holding it, git's own stderr is surfaced to
+the operator with the path and a "delete anyway" hint rather than a generic
+failure.
 
 ### Shutdown
 SIGTERM every child → 5s → SIGKILL stragglers, then the same escalation for any
