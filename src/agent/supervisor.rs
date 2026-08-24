@@ -632,10 +632,23 @@ impl Supervisor {
                     .await
                     .map_err(|e| DeleteError::Other(e.to_string()))?;
             if let Err(err) = result {
+                // git's own stderr is the useful part here — typically
+                // "contains modified or untracked files" or a process still
+                // holding the checkout — so it is passed through verbatim
+                // rather than flattened into a generic failure.
                 if !force {
                     return Err(DeleteError::Other(format!("{err:#}")));
                 }
                 tracing::warn!(?err, "forced delete continued past worktree removal");
+                self.broadcast(ServerMsg::Notice {
+                    agent_id: Some(record.id.clone()),
+                    level: "warn".to_string(),
+                    text: format!(
+                        "The agent was deleted, but its worktree at {} could not be removed \
+                         cleanly: {err:#}",
+                        record.work_path
+                    ),
+                });
             }
         }
 

@@ -159,13 +159,42 @@ cwd = work_path
 | Verb | Effect |
 |---|---|
 | **Interrupt** | `control_request`/`interrupt` (F5). Cancels the in-flight turn **only**; reports `still_queued`. Separate "clear queue" action. |
-| **Stop** | SIGTERM (runs `SessionEnd` hooks, records the interrupted turn), 5s grace, then SIGKILL. History and `session_id` retained. Worktree untouched. |
+| **Stop** | SIGTERM (runs `SessionEnd` hooks, records the interrupted turn), 5s grace, then SIGKILL — to the CLI's process group *and* to every other process group found under it (see below). History and `session_id` retained. Worktree untouched. |
 | **Resume** | Respawn with `--resume <session_id>` (F7). |
 | **Delete** | Removes agent + events. Worktree safety check first — see §6. |
 | **Rename** | Display name only; slug and branch are immutable. |
 
 **No auto-restart.** An unexpected exit surfaces `Failed` with exit code and last stderr,
 and offers one-click Resume. Silent respawn duplicates side effects.
+
+### What a Stop can and cannot reach
+
+The child is spawned in its own process group, so `killpg` reaps it and anything
+that stays in that group. That is not enough on its own: **`claude` runs each
+Bash tool call in a *new* process group**, so a `cargo build` or `npm run dev`
+started by a tool call is invisible to `killpg` on the CLI's group. Verified
+live against `claude` 2.1.241 — the CLI led group *N*, its Bash descendant led
+group *M*, unrelated to *N*.
+
+So a stop first snapshots the process tree under the CLI (`ps -axo
+pid,ppid,pgid`, walked breadth-first with a visited set), collects the distinct
+process groups of those descendants, and signals each of them alongside the
+CLI's own group: SIGTERM, then SIGKILL after the same 5s grace, and only to
+groups that still hold a process from the snapshot. The snapshot is taken
+**before** the first signal, because SIGTERM to the CLI destroys the tree we
+would otherwise walk. The whole sweep runs in `spawn_blocking`, and pid 1, the
+server's own pid and the server's own process group are never signalled.
+
+**Residual limitation, not fixed and not fixable here.** A process the agent
+*deliberately detaches* — `nohup … &`, `setsid`, anything already reparented to
+pid 1 before the snapshot — is in neither the CLI's process group nor its
+subtree. Nothing in the tree connects it back to the agent, and macOS has no
+cgroup or PID-namespace equivalent to catch it, so it survives both Stop and
+server shutdown. Confirmed live: a `nohup sleep 941 &` started by a tool call
+outlives both. What *is* handled is the case that actually breaks things — a
+still-running descendant holding the worktree open — and when a worktree removal
+is refused anyway, git's own stderr is surfaced to the operator with the path
+and a "delete anyway" hint rather than a generic failure.
 
 ### Shutdown
 SIGTERM every child → 5s → SIGKILL stragglers. All marked `Stopped` so Resume works next boot.

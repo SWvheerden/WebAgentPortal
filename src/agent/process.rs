@@ -5,6 +5,7 @@
 //! below only moves bytes, so the protocol handling can be tested against
 //! synthetic stdout without a real `claude` binary anywhere near it.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -247,22 +248,67 @@ impl ChildHandle {
     /// SIGTERM, so `SessionEnd` hooks run and the interrupted turn is recorded,
     /// then SIGKILL after the grace period (§4).
     ///
-    /// The signal goes to the whole process group, not just the CLI: `claude`
-    /// spawns its own children for Bash tool calls, and a `cargo build` left
-    /// running would hold the worktree open and break the delete path.
+    /// Three things are signalled, not one:
+    ///
+    /// * the CLI's own process group (it is a group leader, see
+    ///   `process_group(0)` in [`spawn`]);
+    /// * every *other* process group found under the CLI in the process tree —
+    ///   `claude` puts each Bash tool call in a **new** group of its own, so
+    ///   `killpg` on the CLI's group structurally cannot reach a running
+    ///   `cargo build` or `npm run dev` started by a tool call, and that is
+    ///   exactly what holds the worktree open and breaks delete;
+    /// * both again with SIGKILL once the grace period is up.
+    ///
+    /// The tree is snapshotted **before** the first signal, because SIGTERM to
+    /// the CLI tears the tree down and there would be nothing left to walk.
+    ///
+    /// **Not** handled: a process the agent deliberately detached — `nohup … &`,
+    /// `setsid`, anything already reparented to pid 1 before the snapshot. It is
+    /// in neither the CLI's group nor its subtree, and macOS has no cgroup
+    /// equivalent to catch it. See DESIGN.md §4.
     pub fn stop(&self, grace: std::time::Duration) {
         self.stop_requests.fetch_add(1, Ordering::AcqRel);
         if self.has_exited() {
             return;
         }
-        signal_group(self.pid, nix::sys::signal::Signal::SIGTERM);
         let pid = self.pid;
         let exited = self.exited.clone();
         tokio::spawn(async move {
+            // Reading /the process table shells out; keep it off the runtime.
+            let sweep = tokio::task::spawn_blocking(move || sweep_for(pid as i32))
+                .await
+                .unwrap_or_default();
+            if !sweep.groups.is_empty() {
+                tracing::info!(
+                    pid,
+                    groups = ?sweep.groups,
+                    "stopping process groups started by the agent's tool calls"
+                );
+            }
+
+            signal_group(pid, nix::sys::signal::Signal::SIGTERM);
+            for group in &sweep.groups {
+                signal_group_id(*group, nix::sys::signal::Signal::SIGTERM);
+            }
+
             tokio::time::sleep(grace).await;
+
             if !exited.load(Ordering::Acquire) {
                 tracing::warn!(pid, "child ignored SIGTERM; sending SIGKILL");
                 signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+            if sweep.groups.is_empty() {
+                return;
+            }
+            // Only kill a group that still holds one of the processes we
+            // recorded, so a pid recycled into that group id in the meantime is
+            // not caught in the blast.
+            let survivors = tokio::task::spawn_blocking(move || surviving_groups(&sweep))
+                .await
+                .unwrap_or_default();
+            for group in survivors {
+                tracing::warn!(group, "process group ignored SIGTERM; sending SIGKILL");
+                signal_group_id(group, nix::sys::signal::Signal::SIGKILL);
             }
         });
     }
@@ -284,6 +330,147 @@ impl ChildHandle {
             rx,
             stop_requests,
         )
+    }
+}
+
+/// One row of the process table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcEntry {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+}
+
+/// What a stop should signal beyond the child's own process group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sweep {
+    /// Every descendant pid found under the child at snapshot time.
+    pub pids: Vec<i32>,
+    /// The distinct process groups those descendants belong to, minus the
+    /// child's own group and anything it would be unsafe to signal.
+    pub groups: Vec<i32>,
+}
+
+/// Work out which process groups a stop has to reach, from a process table.
+///
+/// Pure, so the walk can be tested without spawning anything: it is given the
+/// table rather than reading it.
+///
+/// The walk is breadth-first over `ppid` links with a visited set, so a
+/// malformed table containing a cycle terminates instead of hanging. pid 1, our
+/// own pid and our own process group are never returned — signalling those
+/// would take down init or the server itself.
+pub fn sweep_targets(table: &[ProcEntry], root_pid: i32, own_pid: i32, own_pgid: i32) -> Sweep {
+    let root_pgid = table
+        .iter()
+        .find(|e| e.pid == root_pid)
+        .map(|e| e.pgid)
+        .unwrap_or(root_pid);
+
+    let mut children: HashMap<i32, Vec<&ProcEntry>> = HashMap::new();
+    for entry in table {
+        children.entry(entry.ppid).or_default().push(entry);
+    }
+
+    let mut seen: HashSet<i32> = HashSet::from([root_pid]);
+    let mut queue: VecDeque<i32> = VecDeque::from([root_pid]);
+    let mut pids = Vec::new();
+    let mut groups: Vec<i32> = Vec::new();
+
+    while let Some(pid) = queue.pop_front() {
+        let Some(kids) = children.get(&pid) else {
+            continue;
+        };
+        for kid in kids {
+            // A cycle, or a process claiming itself as its own parent.
+            if !seen.insert(kid.pid) {
+                continue;
+            }
+            queue.push_back(kid.pid);
+            if kid.pid <= 1 || kid.pid == own_pid {
+                continue;
+            }
+            pids.push(kid.pid);
+            let group = kid.pgid;
+            if group <= 1 || group == own_pid || group == own_pgid || group == root_pgid {
+                continue;
+            }
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+    }
+
+    pids.sort_unstable();
+    groups.sort_unstable();
+    Sweep { pids, groups }
+}
+
+/// Read the process table. Blocking: call from `spawn_blocking`.
+pub fn process_table() -> Vec<ProcEntry> {
+    let output = match std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid="])
+        .output()
+    {
+        Ok(output) if output.status.success() => output.stdout,
+        Ok(output) => {
+            tracing::warn!(
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "could not read the process table"
+            );
+            return Vec::new();
+        }
+        Err(err) => {
+            tracing::warn!(?err, "could not run ps");
+            return Vec::new();
+        }
+    };
+    parse_process_table(&String::from_utf8_lossy(&output))
+}
+
+/// Parse `ps -axo pid=,ppid=,pgid=` output. Unparseable lines are skipped.
+pub fn parse_process_table(text: &str) -> Vec<ProcEntry> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let pgid = fields.next()?.parse().ok()?;
+            Some(ProcEntry { pid, ppid, pgid })
+        })
+        .collect()
+}
+
+/// The live sweep: snapshot the table and work out what to signal.
+fn sweep_for(root_pid: i32) -> Sweep {
+    let own_pid = std::process::id() as i32;
+    let own_pgid = nix::unistd::getpgrp().as_raw();
+    sweep_targets(&process_table(), root_pid, own_pid, own_pgid)
+}
+
+/// Of the groups we signalled, which still hold a process we recorded?
+fn surviving_groups(sweep: &Sweep) -> Vec<i32> {
+    let table = process_table();
+    sweep
+        .groups
+        .iter()
+        .copied()
+        .filter(|group| {
+            table
+                .iter()
+                .any(|e| e.pgid == *group && sweep.pids.contains(&e.pid))
+        })
+        .collect()
+}
+
+/// Signal a process group by group id, ignoring "already gone".
+fn signal_group_id(pgid: i32, sig: nix::sys::signal::Signal) {
+    if pgid <= 1 {
+        return;
+    }
+    match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), sig) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(err) => tracing::warn!(?err, ?sig, pgid, "failed to signal process group"),
     }
 }
 
@@ -667,5 +854,140 @@ mod tests {
         };
         assert_eq!(payload["text"], json!("warning: something happened"));
         assert!(d.on_stderr("   ").is_empty());
+    }
+
+    // -- the descendant sweep ------------------------------------------------
+
+    fn entry(pid: i32, ppid: i32, pgid: i32) -> ProcEntry {
+        ProcEntry { pid, ppid, pgid }
+    }
+
+    /// The shape the reviewer captured live: the CLI leads its own group, but
+    /// each Bash tool call sits in a **new** group, unreachable from it.
+    fn realistic_table() -> Vec<ProcEntry> {
+        vec![
+            entry(1, 0, 1),       // init
+            entry(99, 1, 99),     // the terminal that started us
+            entry(100, 99, 99),   // the server, sharing the terminal's group
+            entry(200, 100, 200), // claude: its own group, via process_group(0)
+            entry(300, 200, 300), // a Bash tool call: a NEW group
+            entry(310, 300, 300), // cargo build, inside the tool call's group
+            entry(311, 310, 300), // rustc, deeper still
+            entry(400, 200, 400), // a second tool call, another new group
+            entry(500, 1, 500),   // an unrelated process on the machine
+        ]
+    }
+
+    #[test]
+    fn the_sweep_finds_every_group_started_by_a_tool_call() {
+        let sweep = sweep_targets(&realistic_table(), 200, 100, 99);
+        assert_eq!(sweep.pids, vec![300, 310, 311, 400], "the whole subtree");
+        assert_eq!(
+            sweep.groups,
+            vec![300, 400],
+            "one entry per tool-call group, deduped"
+        );
+    }
+
+    #[test]
+    fn the_sweep_never_returns_init_or_the_server_itself() {
+        let table = vec![
+            entry(1, 0, 1),
+            entry(99, 1, 99),
+            entry(100, 99, 99),
+            entry(200, 100, 200),
+            // Pathological rows: a child claiming our group, our pid, and init.
+            entry(300, 200, 99),  // the server's own group
+            entry(301, 200, 100), // the server's pid as a group
+            entry(302, 200, 1),   // init's group
+            entry(303, 200, 0),   // no group at all
+            entry(304, 200, 304), // a legitimate one, to prove the walk ran
+        ];
+        let sweep = sweep_targets(&table, 200, 100, 99);
+        assert_eq!(sweep.groups, vec![304]);
+        assert!(!sweep.groups.contains(&1), "never signal init");
+        assert!(!sweep.groups.contains(&99), "never signal our own group");
+        assert!(!sweep.groups.contains(&100), "never signal ourselves");
+        assert!(!sweep.pids.contains(&1));
+        assert!(!sweep.pids.contains(&100));
+    }
+
+    #[test]
+    fn the_sweep_excludes_the_childs_own_group_which_killpg_already_covers() {
+        let sweep = sweep_targets(&realistic_table(), 200, 100, 99);
+        assert!(
+            !sweep.groups.contains(&200),
+            "the CLI's own group is signalled directly, not swept"
+        );
+    }
+
+    #[test]
+    fn the_sweep_terminates_on_a_cycle() {
+        // A malformed table where two processes are each other's parent.
+        let table = vec![
+            entry(1, 0, 1),
+            entry(100, 1, 100),
+            entry(200, 100, 200),
+            entry(300, 200, 300),
+            entry(400, 500, 400),
+            entry(500, 400, 500), // 400 <-> 500
+            entry(600, 300, 600),
+            entry(300, 600, 300), // and a self-referential loop back to 300
+        ];
+        let sweep = sweep_targets(&table, 200, 100, 100);
+        assert!(sweep.pids.contains(&300));
+        assert!(sweep.pids.contains(&600));
+        assert!(
+            !sweep.pids.contains(&400),
+            "an unrelated cycle is not a descendant"
+        );
+        assert_eq!(sweep.groups, vec![300, 600]);
+    }
+
+    #[test]
+    fn a_child_with_no_descendants_sweeps_nothing() {
+        let table = vec![entry(1, 0, 1), entry(100, 1, 99), entry(200, 100, 200)];
+        assert_eq!(sweep_targets(&table, 200, 100, 99), Sweep::default());
+        // And an unknown pid is simply empty, not a panic.
+        assert_eq!(sweep_targets(&table, 9999, 100, 99), Sweep::default());
+        assert_eq!(sweep_targets(&[], 200, 100, 99), Sweep::default());
+    }
+
+    #[test]
+    fn a_detached_descendant_is_honestly_out_of_reach() {
+        // `nohup sleep 941 &` reparents to init before we ever look: it is not
+        // in the CLI's group and not in its subtree, so the sweep cannot see it.
+        // This is the documented residual limitation, asserted so it stays honest.
+        let table = vec![
+            entry(1, 0, 1),
+            entry(100, 1, 99),
+            entry(200, 100, 200),
+            entry(43060, 1, 43058), // the reviewer's live capture
+        ];
+        let sweep = sweep_targets(&table, 200, 100, 99);
+        assert!(!sweep.pids.contains(&43060));
+        assert!(!sweep.groups.contains(&43058));
+    }
+
+    #[test]
+    fn the_process_table_parses_real_ps_output() {
+        let text = "    1     0     1\n  195     1   195\n42962 42921 42962\n";
+        assert_eq!(
+            parse_process_table(text),
+            vec![
+                entry(1, 0, 1),
+                entry(195, 1, 195),
+                entry(42962, 42921, 42962)
+            ]
+        );
+    }
+
+    #[test]
+    fn unparseable_process_table_lines_are_skipped_not_fatal() {
+        let text = "PID PPID PGID\n  1 0 1\nnot a row\n\n  2 1\n  3 1 3 extra\n";
+        assert_eq!(
+            parse_process_table(text),
+            vec![entry(1, 0, 1), entry(3, 1, 3)]
+        );
     }
 }

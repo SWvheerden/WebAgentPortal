@@ -279,13 +279,35 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
     args.push("--");
     args.push(path_str);
     let result = git(repo, &args);
-    if result.is_err() && force {
-        // The checkout may already be gone; drop the registration either way.
-        std::fs::remove_dir_all(path).ok();
-        git(repo, &["worktree", "prune"])?;
+    if let Err(err) = &result
+        && force
+    {
+        // The checkout may already be gone; drop the registration either way,
+        // but keep git's own words on why it refused.
+        let original = format!("{err:#}");
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("git refused to remove the worktree ({original}), and"))?;
+        git(repo, &["worktree", "prune"])
+            .with_context(|| format!("git refused to remove the worktree ({original}), and"))?;
         return Ok(());
     }
-    result.map(|_| ())
+    result
+        .map(|_| ())
+        .with_context(|| worktree_removal_hint(path))
+}
+
+/// A plain-language hint for the most common `git worktree remove` failure.
+///
+/// Something the agent started can still be holding the checkout open — the
+/// sweep at stop time catches tool-call process groups, but not a process the
+/// agent deliberately detached (see `agent::process::ChildHandle::stop`).
+fn worktree_removal_hint(path: &Path) -> String {
+    format!(
+        "could not remove the worktree at {}. If a process the agent started is still \
+         running there (a build, a dev server, anything detached with `nohup` or `setsid`), \
+         stop it and try again, or delete anyway to force it",
+        path.display()
+    )
 }
 
 /// In-place branching for the "work in the main checkout instead" toggle.
@@ -774,5 +796,38 @@ mod tests {
             report.error.unwrap_or_default().contains("main"),
             "the git failure must be surfaced to the operator"
         );
+    }
+
+    #[test]
+    fn a_refused_worktree_removal_surfaces_gits_own_words() {
+        let Some(repo) = init_repo() else { return };
+        let root = repo
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let wt = worktree_path(&root, "repo", "busy");
+        add_worktree(&repo.path, &wt, "sw_busy", Some("main")).expect("add worktree");
+        std::fs::write(wt.join("build-output.txt"), "still here").expect("write");
+
+        let err = remove_worktree(&repo.path, &wt, false).expect_err("git must refuse");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("could not remove the worktree"),
+            "the operator needs to know which worktree: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("untracked") || text.to_lowercase().contains("modified"),
+            "git's own reason must be passed through, not flattened: {text}"
+        );
+        assert!(
+            text.contains("delete anyway"),
+            "and how to get past it: {text}"
+        );
+        assert!(wt.exists(), "a refused removal must change nothing");
+
+        // Forcing does remove it, and says nothing misleading on success.
+        remove_worktree(&repo.path, &wt, true).expect("force remove");
+        assert!(!wt.exists());
     }
 }
