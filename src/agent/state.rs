@@ -178,6 +178,25 @@ impl PermissionMode {
         }
     }
 
+    /// How much this mode constrains the agent. Higher is stricter.
+    ///
+    /// Used to tell a downgrade from an upgrade: relaxing the permission mode
+    /// is a security decision and has to be a deliberate operator action, not
+    /// something that can be slipped through.
+    pub fn strictness(self) -> u8 {
+        match self {
+            PermissionMode::Ask => 3,
+            PermissionMode::AcceptEdits => 2,
+            PermissionMode::Bypass => 1,
+            PermissionMode::Dangerous => 0,
+        }
+    }
+
+    /// Would moving from `current` to this mode give the agent more freedom?
+    pub fn relaxes(self, current: PermissionMode) -> bool {
+        self.strictness() < current.strictness()
+    }
+
     /// Whether this mode routes tool permission checks through our stdio handler.
     pub fn intercepts_permissions(self) -> bool {
         matches!(self, PermissionMode::Ask | PermissionMode::AcceptEdits)
@@ -339,5 +358,18 @@ mod tests {
         assert!(PermissionMode::Ask.intercepts_permissions());
         assert!(!PermissionMode::Bypass.intercepts_permissions());
         assert_eq!(PermissionMode::Dangerous.control_value(), None);
+    }
+
+    #[test]
+    fn relaxing_the_permission_mode_is_recognised() {
+        use PermissionMode::*;
+        assert!(Bypass.relaxes(Ask));
+        assert!(Dangerous.relaxes(Bypass));
+        assert!(AcceptEdits.relaxes(Ask));
+        assert!(!Ask.relaxes(Bypass), "tightening is not relaxing");
+        assert!(!Ask.relaxes(Ask), "no change is not relaxing");
+        assert!(Ask.strictness() > AcceptEdits.strictness());
+        assert!(AcceptEdits.strictness() > Bypass.strictness());
+        assert!(Bypass.strictness() > Dangerous.strictness());
     }
 }

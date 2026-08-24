@@ -140,13 +140,28 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 .ev.result .body { color: var(--accent); font-size: 11px; }
 details.tool { border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; background: var(--panel); }
 details.tool summary { cursor: pointer; color: var(--warn); }
-details.tool pre { margin: 6px 0 0; font-size: 11px; color: var(--dim); overflow-x: auto; }
+/* Attacker-influenced text. It must wrap: a `pre` that scrolls horizontally
+   hides everything past the right edge, and macOS overlay scrollbars give no
+   hint that there is more — which is how `npm test<200 spaces>; curl … | sh`
+   reads as `npm test` in the approval prompt. */
+details.tool pre, .approval pre {
+  margin: 6px 0 0;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-x: hidden;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+details.tool pre { color: var(--dim); }
 .partial { color: var(--dim); font-style: italic; }
 
 /* approvals */
 .approval { border: 1px solid var(--warn); border-radius: 6px; padding: 10px; margin-bottom: 10px; background: #1c1a10; }
 .approval h3 { margin: 0 0 6px; font-size: 12px; color: var(--warn); }
-.approval pre { background: #0a0e14; padding: 6px; border-radius: 4px; overflow-x: auto; font-size: 11px; }
+.approval pre { background: #0a0e14; padding: 6px; border-radius: 4px; font-size: 11px; }
+.approval .modified { color: var(--warn); }
+.truncated { color: var(--warn); font-size: 10px; }
 
 /* composer */
 .composer { display: flex; gap: 8px; margin-top: 10px; align-items: flex-start; position: relative; }

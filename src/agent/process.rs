@@ -23,8 +23,19 @@ use super::protocol::{
 use super::state::Transition;
 
 /// How long stdout is drained after the child exits, before the exit is
-/// reported. Bounded because a process the CLI left running inherits its stdout
-/// pipe and would otherwise hold it open indefinitely.
+/// reported.
+///
+/// Bounded because *any* child that inherited the CLI's stdout pipe keeps it
+/// open, and waiting for EOF would then hang forever — the agent would sit in
+/// `Idle`, never failing and never resumable.
+///
+/// Measured against `claude` 2.1.241: its **Bash tool calls** do not inherit
+/// this pipe (their fds are `/dev/null` and a temporary file), so that
+/// particular case cannot arise. The bound stays because it costs 500ms on an
+/// exit that has already happened, it holds for anything else the CLI spawns
+/// that does inherit stdout, and the alternative failure is unbounded. The test
+/// `an_exit_is_reported_even_when_a_grandchild_holds_the_stdout_pipe`
+/// demonstrates the failure mode with a stub that does inherit it.
 const DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// One consequence of a line of CLI output.
@@ -48,8 +59,12 @@ pub enum Action {
         payload: Value,
         is_error: bool,
     },
-    /// The slash command list from `initialize` (F9).
-    Commands(Vec<SlashCommand>),
+    /// The slash command list from `initialize` (F9), tagged with the request
+    /// it answers so an unsolicited list cannot be injected.
+    Commands {
+        request_id: Option<String>,
+        commands: Vec<SlashCommand>,
+    },
     /// The session id the CLI reported.
     SessionId(String),
     /// A line we could not classify — logged and surfaced, never fatal.
@@ -159,7 +174,10 @@ impl Dispatcher {
                 if let Some(payload) = res.payload() {
                     let commands = protocol::commands_from_initialize(payload);
                     if !commands.is_empty() {
-                        out.push(Action::Commands(commands));
+                        out.push(Action::Commands {
+                            request_id: res.request_id().map(str::to_string),
+                            commands,
+                        });
                     }
                 }
                 if let Some(id) = res.request_id() {
@@ -278,7 +296,7 @@ impl ChildHandle {
     /// running as a descendant when the agent stops, crashes or the server
     /// shuts down: the build or dev server holding the worktree open. See
     /// DESIGN.md §4.
-    pub fn stop(&self, grace: std::time::Duration, known: Sweep) {
+    pub fn stop(&self, grace: std::time::Duration, known: Sweep, forbidden: Vec<i32>) {
         self.stop_requests.fetch_add(1, Ordering::AcqRel);
         if self.has_exited() {
             return;
@@ -294,9 +312,11 @@ impl ChildHandle {
             // signal: the accumulated half of `known` holds ids recorded a long
             // time ago, and a group id whose processes have gone may since have
             // been recycled onto something of the user's.
-            let groups = tokio::task::spawn_blocking(move || stop_targets_now(&known, pid as i32))
-                .await
-                .unwrap_or_default();
+            let groups = tokio::task::spawn_blocking(move || {
+                stop_targets_now(&known, pid as i32, &forbidden)
+            })
+            .await
+            .unwrap_or_default();
             if !groups.is_empty() {
                 tracing::info!(
                     pid,
@@ -370,6 +390,11 @@ pub struct ProcEntry {
     pub pgid: i32,
     /// Seconds since the process started, or `None` when `ps` did not say.
     pub elapsed_secs: Option<i64>,
+    /// A process that has exited and is waiting to be reaped. It holds nothing
+    /// and cannot be signalled to any effect, so it never counts as a group
+    /// being alive — otherwise a group would look alive until its parent got
+    /// round to `wait`ing.
+    pub zombie: bool,
 }
 
 impl ProcEntry {
@@ -386,8 +411,16 @@ pub struct GroupRecord {
     pub pgid: i32,
     /// When this group was first observed under the agent, epoch ms.
     pub first_seen_ms: i64,
+    /// The group *leader* we saw under the CLI, pinned by pid and start time.
+    ///
+    /// A descendant may `setpgid(0, G)` itself into any pre-existing group in
+    /// its session — the server, its agents and (when launched from a terminal)
+    /// the operator's shell all share one session — so "a descendant is in this
+    /// group" proves nothing. That the group's *leader* is a descendant does.
+    pub witness_pid: i32,
+    pub witness_started_ms: i64,
     /// The most recent moment at which this group was *proved* to be the
-    /// agent's — either by the tree walk, or by the continuity test below.
+    /// agent's — by the witness, or by the continuity test below.
     pub proven_ms: i64,
 }
 
@@ -424,6 +457,8 @@ impl Sweep {
         self.groups.push(GroupRecord {
             pgid,
             first_seen_ms: now_ms,
+            witness_pid: 0,
+            witness_started_ms: 0,
             proven_ms: now_ms,
         });
         let last = self.groups.len() - 1;
@@ -437,6 +472,12 @@ impl Sweep {
             let existing = self.record(group.pgid, group.first_seen_ms);
             existing.first_seen_ms = existing.first_seen_ms.min(group.first_seen_ms);
             existing.proven_ms = existing.proven_ms.max(group.proven_ms);
+            // The first witness is the one we keep: it is the sighting the
+            // continuity argument is anchored to.
+            if existing.witness_pid == 0 {
+                existing.witness_pid = group.witness_pid;
+                existing.witness_started_ms = group.witness_started_ms;
+            }
         }
     }
 
@@ -487,12 +528,31 @@ impl Sweep {
 /// cannot be told apart from a recycled id, so it is refused — leaving a build
 /// running is a nuisance, signalling the user's editor is not.
 fn owns(group: &GroupRecord, table: &[ProcEntry], now_ms: i64) -> bool {
+    // The leader we saw under the CLI, still alive and still the same process:
+    // a recycled pid would not also match the start time we recorded.
+    let witness_alive = table.iter().any(|e| {
+        !e.zombie
+            && e.pid == group.witness_pid
+            && e.pgid == group.pgid
+            && e.started_ms(now_ms)
+                .is_some_and(|s| (s - group.witness_started_ms).abs() <= CLOCK_SLACK_MS)
+    });
+    if witness_alive {
+        return true;
+    }
+    // Or a live member that was already running when we last proved the group
+    // was ours, which means it has been non-empty ever since.
+    //
+    // The slack is *subtracted*: `ps` truncates elapsed seconds, so a process
+    // can look up to a second younger than it is. Adding the slack would admit
+    // processes that genuinely started after the proof; subtracting it only
+    // refuses a few that genuinely predate it.
     table
         .iter()
-        .filter(|e| e.pgid == group.pgid && e.pid > 1)
+        .filter(|e| e.pgid == group.pgid && e.pid > 1 && !e.zombie)
         .any(|e| {
             e.started_ms(now_ms)
-                .is_some_and(|started| started <= group.proven_ms + CLOCK_SLACK_MS)
+                .is_some_and(|started| started + CLOCK_SLACK_MS <= group.proven_ms)
         })
 }
 
@@ -508,6 +568,7 @@ pub fn sweep_targets(
     root_pid: i32,
     own_pid: i32,
     own_pgid: i32,
+    forbidden: &[i32],
     now_ms: i64,
 ) -> Sweep {
     let root_pgid = table
@@ -539,14 +600,36 @@ pub fn sweep_targets(
                 continue;
             }
             let group = kid.pgid;
-            if group <= 1 || group == own_pid || group == own_pgid || group == root_pgid {
+            if group <= 1
+                || group == own_pid
+                || group == own_pgid
+                || group == root_pgid
+                || forbidden.contains(&group)
+            {
                 continue;
             }
-            // Found in the CLI's subtree right now: proof enough, and the
-            // moment of proof is now.
+            if kid.zombie {
+                continue;
+            }
+            // Only the group's *leader* being a descendant makes the group the
+            // agent's. A descendant that merely joined an existing group proves
+            // nothing about that group — and adopting one would hand the agent
+            // a way to have the server SIGKILL anything in its session.
+            if kid.pid != group {
+                continue;
+            }
+            let Some(started) = kid.started_ms(now_ms) else {
+                // Without a start time there is no witness to pin, and every
+                // later proof would rest on nothing.
+                continue;
+            };
             let record = sweep.record(group, now_ms);
             record.first_seen_ms = record.first_seen_ms.min(now_ms);
             record.proven_ms = record.proven_ms.max(now_ms);
+            if record.witness_pid == 0 {
+                record.witness_pid = kid.pid;
+                record.witness_started_ms = started;
+            }
         }
     }
 
@@ -576,9 +659,10 @@ pub fn stop_targets(
     root_pid: i32,
     own_pid: i32,
     own_pgid: i32,
+    forbidden: &[i32],
     now_ms: i64,
 ) -> Vec<i32> {
-    let mut sweep = sweep_targets(table, root_pid, own_pid, own_pgid, now_ms);
+    let mut sweep = sweep_targets(table, root_pid, own_pid, own_pgid, forbidden, now_ms);
     sweep.merge(known.clone());
     groups_to_kill(&sweep, table, now_ms)
 }
@@ -586,7 +670,7 @@ pub fn stop_targets(
 /// Read the process table. Blocking: call from `spawn_blocking`.
 pub fn process_table() -> Vec<ProcEntry> {
     let output = match std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,pgid=,etime="])
+        .args(["-axo", "pid=,ppid=,pgid=,etime=,state="])
         .output()
     {
         Ok(output) if output.status.success() => output.stdout,
@@ -605,7 +689,8 @@ pub fn process_table() -> Vec<ProcEntry> {
     parse_process_table(&String::from_utf8_lossy(&output))
 }
 
-/// Parse `ps -axo pid=,ppid=,pgid=,etime=` output. Unparseable lines are skipped.
+/// Parse `ps -axo pid=,ppid=,pgid=,etime=,state=` output. Unparseable lines are
+/// skipped.
 pub fn parse_process_table(text: &str) -> Vec<ProcEntry> {
     text.lines()
         .filter_map(|line| {
@@ -614,11 +699,13 @@ pub fn parse_process_table(text: &str) -> Vec<ProcEntry> {
             let ppid = fields.next()?.parse().ok()?;
             let pgid = fields.next()?.parse().ok()?;
             let elapsed_secs = fields.next().and_then(parse_etime);
+            let zombie = fields.next().is_some_and(|state| state.starts_with('Z'));
             Some(ProcEntry {
                 pid,
                 ppid,
                 pgid,
                 elapsed_secs,
+                zombie,
             })
         })
         .collect()
@@ -647,7 +734,7 @@ pub fn parse_etime(text: &str) -> Option<i64> {
 /// current members of groups we still own, and drop the ones that are gone.
 ///
 /// Blocking: call from `spawn_blocking`.
-pub fn refresh_sweep(mut known: Sweep, root_pid: i32) -> Sweep {
+pub fn refresh_sweep(mut known: Sweep, root_pid: i32, forbidden: &[i32]) -> Sweep {
     if root_pid <= 0 {
         return known;
     }
@@ -658,7 +745,9 @@ pub fn refresh_sweep(mut known: Sweep, root_pid: i32) -> Sweep {
     let now = crate::db::now_ms();
     let own_pid = std::process::id() as i32;
     let own_pgid = nix::unistd::getpgrp().as_raw();
-    known.merge(sweep_targets(&table, root_pid, own_pid, own_pgid, now));
+    known.merge(sweep_targets(
+        &table, root_pid, own_pid, own_pgid, forbidden, now,
+    ));
     known.confirm(&table, now);
     known.prune(&table, now);
     known
@@ -670,7 +759,7 @@ pub fn surviving_groups(sweep: &Sweep) -> Vec<i32> {
 }
 
 /// [`stop_targets`] against the live process table. Blocking.
-pub fn stop_targets_now(known: &Sweep, root_pid: i32) -> Vec<i32> {
+pub fn stop_targets_now(known: &Sweep, root_pid: i32, forbidden: &[i32]) -> Vec<i32> {
     if root_pid <= 0 {
         return Vec::new();
     }
@@ -682,6 +771,7 @@ pub fn stop_targets_now(known: &Sweep, root_pid: i32) -> Vec<i32> {
         root_pid,
         own_pid,
         own_pgid,
+        forbidden,
         crate::db::now_ms(),
     )
 }
@@ -817,11 +907,11 @@ pub fn spawn(config: &SpawnConfig) -> Result<(ChildHandle, mpsc::UnboundedReceiv
     // Exit monitor.
     //
     // The child is reaped as soon as it exits, and stdout is drained only for a
-    // bounded moment afterwards. Waiting for stdout to reach EOF first would
-    // hang forever whenever a tool call leaves a process holding the CLI's
-    // stdout pipe open — a backgrounded build inherits that pipe — and the
-    // agent would sit in `Idle` for as long as that process lived, never
-    // reporting the exit and never becoming resumable.
+    // bounded moment afterwards. Waiting for stdout to reach EOF first hangs for
+    // as long as anything that inherited the pipe keeps it open, and the agent
+    // would sit in `Idle` all the while — never reporting the exit, never
+    // becoming resumable. See DRAIN_AFTER_EXIT for what was measured about
+    // which children actually inherit it.
     let exited = Arc::new(AtomicBool::new(false));
     let exit_flag = exited.clone();
     tokio::spawn(async move {
@@ -1017,13 +1107,18 @@ mod tests {
         let actions = dispatch(&[
             r#"{"type":"control_response","response":{"subtype":"success","request_id":"1","response":{"commands":[{"name":"/compact","description":"d","argumentHint":"h"}]}}}"#,
         ]);
-        let Some(Action::Commands(cmds)) =
-            actions.iter().find(|a| matches!(a, Action::Commands(_)))
+        let Some(Action::Commands {
+            request_id,
+            commands,
+        }) = actions
+            .iter()
+            .find(|a| matches!(a, Action::Commands { .. }))
         else {
             panic!("expected commands");
         };
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].name, "/compact");
+        assert_eq!(request_id.as_deref(), Some("1"));
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "/compact");
     }
 
     #[test]
@@ -1105,6 +1200,14 @@ mod tests {
             ppid,
             pgid,
             elapsed_secs: Some(age_secs),
+            zombie: false,
+        }
+    }
+
+    fn zombie(pid: i32, ppid: i32, pgid: i32, age_secs: i64) -> ProcEntry {
+        ProcEntry {
+            zombie: true,
+            ..aged(pid, ppid, pgid, age_secs)
         }
     }
 
@@ -1139,7 +1242,7 @@ mod tests {
 
     #[test]
     fn the_sweep_finds_every_group_started_by_a_tool_call() {
-        let sweep = sweep_targets(&realistic_table(), 200, 100, 99, NOW);
+        let sweep = sweep_targets(&realistic_table(), 200, 100, 99, &[], NOW);
         assert_eq!(sweep.group_ids(), vec![300, 400]);
         assert_eq!(group(&sweep, 300).first_seen_ms, NOW);
         assert_eq!(group(&sweep, 300).proven_ms, NOW);
@@ -1159,7 +1262,7 @@ mod tests {
             entry(303, 200, 0),   // no group at all
             entry(304, 200, 304), // a legitimate one, to prove the walk ran
         ];
-        let sweep = sweep_targets(&table, 200, 100, 99, NOW);
+        let sweep = sweep_targets(&table, 200, 100, 99, &[], NOW);
         assert_eq!(sweep.group_ids(), vec![304]);
         for forbidden in [1, 99, 100, 0] {
             assert!(
@@ -1171,7 +1274,7 @@ mod tests {
 
     #[test]
     fn the_sweep_excludes_the_childs_own_group_which_killpg_already_covers() {
-        let sweep = sweep_targets(&realistic_table(), 200, 100, 99, NOW);
+        let sweep = sweep_targets(&realistic_table(), 200, 100, 99, &[], NOW);
         assert!(!sweep.group_ids().contains(&200));
     }
 
@@ -1187,16 +1290,16 @@ mod tests {
             entry(600, 300, 600),
             entry(300, 600, 300), // and a loop back to 300
         ];
-        let sweep = sweep_targets(&table, 200, 100, 100, NOW);
+        let sweep = sweep_targets(&table, 200, 100, 100, &[], NOW);
         assert_eq!(sweep.group_ids(), vec![300, 600]);
     }
 
     #[test]
     fn a_child_with_no_descendants_sweeps_nothing() {
         let table = vec![entry(1, 0, 1), entry(100, 1, 99), entry(200, 100, 200)];
-        assert!(sweep_targets(&table, 200, 100, 99, NOW).is_empty());
-        assert!(sweep_targets(&table, 9999, 100, 99, NOW).is_empty());
-        assert!(sweep_targets(&[], 200, 100, 99, NOW).is_empty());
+        assert!(sweep_targets(&table, 200, 100, 99, &[], NOW).is_empty());
+        assert!(sweep_targets(&table, 9999, 100, 99, &[], NOW).is_empty());
+        assert!(sweep_targets(&[], 200, 100, 99, &[], NOW).is_empty());
     }
 
     #[test]
@@ -1213,7 +1316,7 @@ mod tests {
             entry(43060, 1, 43058), // a live capture of a backgrounded job
         ];
         assert!(
-            !sweep_targets(&table, 200, 100, 99, NOW)
+            !sweep_targets(&table, 200, 100, 99, &[], NOW)
                 .group_ids()
                 .contains(&43058)
         );
@@ -1221,24 +1324,40 @@ mod tests {
 
     // -- ownership: what may and may not be signalled ------------------------
 
-    /// A group observed — and last proved to be ours — one minute ago.
+    /// A group whose leader we saw under the CLI a minute ago, and last proved
+    /// ours at that moment. The leader has since exited.
     fn observed_group() -> Sweep {
         Sweep {
             groups: vec![GroupRecord {
                 pgid: 300,
                 first_seen_ms: NOW - 60_000,
+                witness_pid: 300,
+                witness_started_ms: NOW - 61_000,
                 proven_ms: NOW - 60_000,
             }],
         }
     }
 
     #[test]
+    fn a_live_witness_proves_the_group() {
+        let table = vec![entry(1, 0, 1), aged(300, 1, 300, 61)];
+        assert_eq!(groups_to_kill(&observed_group(), &table, NOW), vec![300]);
+    }
+
+    #[test]
+    fn a_witness_pid_that_came_back_as_something_else_proves_nothing() {
+        // Same pid, wrong age: the leader we recorded is gone and this is a
+        // different process wearing its number.
+        let table = vec![entry(1, 0, 1), aged(300, 1, 300, 3)];
+        assert!(groups_to_kill(&observed_group(), &table, NOW).is_empty());
+    }
+
+    #[test]
     fn a_group_holding_a_member_older_than_our_proof_is_ours() {
-        // The pids we walked may be long gone, but this process predates the
-        // proof, so the group has been alive continuously ever since and its id
-        // cannot have been handed to anything else. `npm run dev &` left behind
-        // by a tool call is exactly this shape, and pid-identity matching
-        // dropped it on the floor.
+        // The witness has gone, but this process predates the proof, so the
+        // group has been alive continuously ever since and its id cannot have
+        // been handed to anything else. `npm run dev &` left behind by a tool
+        // call is exactly this shape.
         let table = vec![entry(1, 0, 1), aged(4242, 1, 300, 120)];
         assert_eq!(
             groups_to_kill(&observed_group(), &table, NOW),
@@ -1259,58 +1378,59 @@ mod tests {
     }
 
     #[test]
-    fn a_recycled_pid_does_not_prove_ownership() {
-        // The recycled group's leader has the very pid the tree walk recorded a
-        // minute ago. Identity would say "ours"; it is not, and only its age
-        // gives it away.
+    fn the_clock_slack_is_subtracted_never_added() {
+        // `ps` truncates elapsed seconds, so a process can look younger than it
+        // is. The slack must not become a licence to signal processes that
+        // genuinely started *after* the last proof.
         let sweep = Sweep {
             groups: vec![GroupRecord {
                 pgid: 300,
-                first_seen_ms: NOW - 3_600_000,
-                proven_ms: NOW - 3_600_000,
+                first_seen_ms: NOW - 10_000,
+                witness_pid: 300,
+                witness_started_ms: NOW - 11_000,
+                proven_ms: NOW - 10_000,
             }],
         };
-        let table = vec![entry(1, 0, 1), aged(300, 1, 300, 5)];
-        assert!(groups_to_kill(&sweep, &table, NOW).is_empty());
-    }
-
-    #[test]
-    fn a_group_with_nothing_left_alive_is_not_signalled() {
-        assert!(groups_to_kill(&observed_group(), &[entry(1, 0, 1)], NOW).is_empty());
-        assert!(groups_to_kill(&Sweep::default(), &realistic_table(), NOW).is_empty());
+        // Started one second after the proof: inside the old, additive window.
+        let just_after = vec![entry(1, 0, 1), aged(9001, 1, 300, 9)];
+        assert!(
+            groups_to_kill(&sweep, &just_after, NOW).is_empty(),
+            "a process younger than the proof must never carry it"
+        );
+        // Comfortably older than the proof: allowed.
+        let older = vec![entry(1, 0, 1), aged(9001, 1, 300, 20)];
+        assert_eq!(groups_to_kill(&sweep, &older, NOW), vec![300]);
     }
 
     #[test]
     fn a_process_of_unknown_age_proves_nothing() {
-        // `ps` said nothing useful about elapsed time, so there is no proof to
-        // be had and the group is left alone.
         let unknown = ProcEntry {
             pid: 310,
             ppid: 1,
             pgid: 300,
             elapsed_secs: None,
+            zombie: false,
         };
         assert!(groups_to_kill(&observed_group(), &[unknown], NOW).is_empty());
     }
 
     #[test]
     fn re_proving_keeps_forked_workers_reachable_after_their_parent_exits() {
-        // The dev server forks workers born long after the sighting that first
-        // recorded the group. While its parent is alive, each refresh re-proves
-        // the group and moves the proof forward past them.
+        // While the witness is alive, each refresh re-proves the group and
+        // moves the proof forward past workers born since the first sighting.
         let mut sweep = observed_group();
         let table = vec![
             entry(1, 0, 1),
-            aged(310, 1, 300, 59), // the original, older than the proof
-            aged(7001, 310, 300, 2),
-            aged(7002, 310, 300, 2),
+            aged(300, 1, 300, 61), // the witness, still alive
+            aged(7001, 300, 300, 30),
+            aged(7002, 300, 300, 30),
         ];
         sweep.confirm(&table, NOW);
         assert_eq!(group(&sweep, 300).proven_ms, NOW);
 
-        // The parent exits, leaving only the workers. They predate the latest
+        // The witness exits, leaving only the workers. They predate the latest
         // proof, so the group is still provably ours.
-        let later = vec![entry(1, 0, 1), aged(7001, 1, 300, 62)];
+        let later = vec![entry(1, 0, 1), aged(7001, 1, 300, 90)];
         assert_eq!(
             groups_to_kill(&sweep, &later, NOW + 60_000),
             vec![300],
@@ -1321,7 +1441,6 @@ mod tests {
     #[test]
     fn a_group_we_cannot_prove_is_never_re_proved_into_existence() {
         let mut sweep = observed_group();
-        // The group id has been recycled: nothing here predates our proof.
         let table = vec![entry(1, 0, 1), aged(300, 1, 300, 5), aged(301, 300, 300, 4)];
         sweep.confirm(&table, NOW);
         assert_eq!(
@@ -1332,48 +1451,120 @@ mod tests {
         assert!(groups_to_kill(&sweep, &table, NOW).is_empty());
     }
 
+    // -- what may be ADOPTED in the first place ------------------------------
+
+    #[test]
+    fn a_group_a_descendant_merely_joined_is_never_adopted() {
+        // The server never calls setsid, so the server, its agents and the
+        // operator's shell share a session — and any process may setpgid itself
+        // into any group in its own session. A tool call that joins the
+        // operator's editor's group must not make that group the agent's.
+        let table = vec![
+            aged(1, 0, 1, 90_000),
+            aged(100, 1, 99, 5_000),  // the server
+            aged(200, 100, 200, 600), // claude
+            aged(700, 1, 700, 4_000), // the operator's editor, leading group 700
+            aged(701, 700, 700, 4_000),
+            aged(301, 200, 700, 2), // a tool call that joined group 700
+        ];
+        let sweep = sweep_targets(&table, 200, 100, 99, &[], NOW);
+        assert!(
+            !sweep.group_ids().contains(&700),
+            "joining a group must not adopt it: {:?}",
+            sweep.group_ids()
+        );
+        assert!(sweep.is_empty());
+        assert!(groups_to_kill(&sweep, &table, NOW).is_empty());
+    }
+
+    #[test]
+    fn a_sibling_agents_group_is_never_adopted() {
+        // Two agents run at once. One must never be able to have the server
+        // signal the other's process group.
+        // The worst case for the leader rule: a process that IS a group leader
+        // and IS in our subtree, but whose group belongs to another agent.
+        let table = vec![
+            aged(1, 0, 1, 90_000),
+            aged(100, 1, 99, 5_000),
+            aged(200, 100, 200, 600), // our claude
+            aged(250, 200, 250, 600), // a sibling agent's group, in our subtree
+            aged(300, 200, 300, 5),   // an ordinary tool call of ours
+        ];
+        let sweep = sweep_targets(&table, 200, 100, 99, &[250], NOW);
+        assert!(
+            !sweep.group_ids().contains(&250),
+            "no agent may sweep another's process group"
+        );
+        assert_eq!(
+            sweep.group_ids(),
+            vec![300],
+            "its own tool calls are unaffected"
+        );
+    }
+
+    #[test]
+    fn a_group_without_a_readable_start_time_is_not_adopted() {
+        // No start time means no witness to pin, and every later proof would
+        // rest on nothing.
+        let table = vec![
+            aged(1, 0, 1, 9000),
+            aged(100, 1, 99, 500),
+            aged(200, 100, 200, 60),
+            ProcEntry {
+                pid: 300,
+                ppid: 200,
+                pgid: 300,
+                elapsed_secs: None,
+                zombie: false,
+            },
+        ];
+        assert!(sweep_targets(&table, 200, 100, 99, &[], NOW).is_empty());
+    }
+
+    #[test]
+    fn the_witness_recorded_is_the_leader_we_saw() {
+        let sweep = sweep_targets(&realistic_table(), 200, 100, 99, &[], NOW);
+        assert_eq!(group(&sweep, 300).witness_pid, 300);
+        assert_eq!(group(&sweep, 300).witness_started_ms, NOW - 60_000);
+        assert_eq!(group(&sweep, 400).witness_pid, 400);
+    }
+
     // -- accumulation and eviction ------------------------------------------
+
+    fn recorded(pgid: i32, seen_ms: i64) -> GroupRecord {
+        GroupRecord {
+            pgid,
+            first_seen_ms: seen_ms,
+            witness_pid: pgid,
+            witness_started_ms: seen_ms,
+            proven_ms: seen_ms,
+        }
+    }
 
     #[test]
     fn a_live_group_is_never_evicted_however_many_tool_calls_follow() {
-        // The requirement: a group recorded early and still running is exactly
-        // the one worth keeping. Insertion-order eviction threw those away
-        // first, which is backwards.
+        // A group recorded early and still running is exactly the one worth
+        // keeping. Insertion-order eviction threw those away first.
         let mut sweep = Sweep::default();
         sweep.merge(Sweep {
-            groups: vec![GroupRecord {
-                pgid: 1001,
-                first_seen_ms: NOW - 600_000,
-                proven_ms: NOW - 600_000,
-            }],
+            groups: vec![recorded(1001, NOW - 600_000)],
         });
 
         // 200 later tool calls, each its own group, all of them long gone.
-        let mut table = vec![entry(1, 0, 1), aged(1001, 1, 1001, 900)];
+        let mut table = vec![entry(1, 0, 1), aged(1001, 1, 1001, 600)];
         for i in 0..200 {
             let pgid = 5000 + i;
             sweep.merge(Sweep {
-                groups: vec![GroupRecord {
-                    pgid,
-                    first_seen_ms: NOW - 1000,
-                    proven_ms: NOW - 1000,
-                }],
+                groups: vec![recorded(pgid, NOW - 1000)],
             });
             sweep.prune(&table, NOW);
         }
 
         assert!(
             sweep.group_ids().contains(&1001),
-            "the one group still running must survive {} later tool calls",
-            200
+            "the one group still running must survive 200 later tool calls"
         );
-        assert_eq!(
-            sweep.group_ids(),
-            vec![1001],
-            "and the groups that have exited must be the ones dropped"
-        );
-
-        // It is still reachable, which is the point of keeping it.
+        assert_eq!(sweep.group_ids(), vec![1001]);
         assert_eq!(groups_to_kill(&sweep, &table, NOW), vec![1001]);
 
         // Once it exits too, it is dropped.
@@ -1383,25 +1574,25 @@ mod tests {
     }
 
     #[test]
-    fn re_observing_a_group_keeps_its_original_sighting_and_adds_members() {
+    fn re_observing_a_group_keeps_its_original_witness_and_takes_the_later_proof() {
         let mut sweep = observed_group();
         sweep.merge(Sweep {
             groups: vec![GroupRecord {
                 pgid: 300,
-                first_seen_ms: NOW, // a later sighting
+                first_seen_ms: NOW,
+                witness_pid: 999,
+                witness_started_ms: NOW,
                 proven_ms: NOW,
             }],
         });
+        let g = group(&sweep, 300);
         assert_eq!(
-            group(&sweep, 300).first_seen_ms,
+            g.first_seen_ms,
             NOW - 60_000,
             "the earliest sighting is kept"
         );
-        assert_eq!(
-            group(&sweep, 300).proven_ms,
-            NOW,
-            "and the latest proof wins, so newer members can carry it"
-        );
+        assert_eq!(g.witness_pid, 300, "the original witness anchors the proof");
+        assert_eq!(g.proven_ms, NOW, "and the latest proof wins");
     }
 
     #[test]
@@ -1411,13 +1602,9 @@ mod tests {
         for i in 0..400 {
             let pgid = 6000 + i;
             sweep.merge(Sweep {
-                groups: vec![GroupRecord {
-                    pgid,
-                    first_seen_ms: NOW - 1000,
-                    proven_ms: NOW - 1000,
-                }],
+                groups: vec![recorded(pgid, NOW - 10_000)],
             });
-            table.push(aged(pgid, 1, pgid, 2000));
+            table.push(aged(pgid, 1, pgid, 10));
         }
         sweep.prune(&table, NOW);
         assert!(sweep.groups.len() <= 128, "{}", sweep.groups.len());
@@ -1426,11 +1613,7 @@ mod tests {
         let mut one = observed_group();
         for _ in 0..500 {
             one.merge(Sweep {
-                groups: vec![GroupRecord {
-                    pgid: 300,
-                    first_seen_ms: NOW,
-                    proven_ms: NOW,
-                }],
+                groups: vec![recorded(300, NOW)],
             });
         }
         assert_eq!(one.groups.len(), 1);
@@ -1440,18 +1623,16 @@ mod tests {
 
     #[test]
     fn a_stop_never_signals_an_unprovable_group_from_the_accumulated_list() {
-        // Session-long bookkeeping: group 300 is long gone and its id has been
-        // recycled onto something of the user's; group 400 is a live tool call.
+        // Session-long bookkeeping: group 45123 is long gone and its id has
+        // been recycled onto something of the user's; 400 is a live tool call.
         let known = Sweep {
             groups: vec![
-                GroupRecord {
-                    pgid: 45123,
-                    first_seen_ms: NOW - 3_600_000,
-                    proven_ms: NOW - 3_600_000,
-                },
+                recorded(45123, NOW - 3_600_000),
                 GroupRecord {
                     pgid: 400,
                     first_seen_ms: NOW - 30_000,
+                    witness_pid: 400,
+                    witness_started_ms: NOW - 30_000,
                     proven_ms: NOW - 30_000,
                 },
             ],
@@ -1465,7 +1646,7 @@ mod tests {
             aged(45200, 45123, 45123, 9), // and its child
         ];
 
-        let targets = stop_targets(&known, &table, 200, 100, 99, NOW);
+        let targets = stop_targets(&known, &table, 200, 100, 99, &[], NOW);
         assert_eq!(
             targets,
             vec![400],
@@ -1477,15 +1658,27 @@ mod tests {
     #[test]
     fn a_stop_signals_a_group_the_fresh_walk_finds_even_if_it_was_never_recorded() {
         let table = realistic_table();
-        let targets = stop_targets(&Sweep::default(), &table, 200, 100, 99, NOW);
+        let targets = stop_targets(&Sweep::default(), &table, 200, 100, 99, &[], NOW);
         assert_eq!(targets, vec![300, 400]);
+    }
+
+    #[test]
+    fn a_stop_never_signals_a_group_a_descendant_merely_joined() {
+        let table = vec![
+            aged(1, 0, 1, 90_000),
+            aged(100, 1, 99, 5_000),
+            aged(200, 100, 200, 600),
+            aged(700, 1, 700, 4_000), // the operator's editor
+            aged(301, 200, 700, 2),   // our tool call, joined to it
+        ];
+        assert!(stop_targets(&Sweep::default(), &table, 200, 100, 99, &[], NOW).is_empty());
     }
 
     // -- the process table ---------------------------------------------------
 
     #[test]
     fn the_process_table_parses_real_ps_output() {
-        let text = "    1     0     1 03-07:11:59\n  195     1   195    06:04:30\n42962 42921 42962       12:03\n";
+        let text = "    1     0     1 03-07:11:59 Ss\n  195     1   195    06:04:30 S\n42962 42921 42962       12:03 S\n";
         assert_eq!(
             parse_process_table(text),
             vec![
@@ -1509,7 +1702,7 @@ mod tests {
 
     #[test]
     fn unparseable_process_table_lines_are_skipped_not_fatal() {
-        let text = "PID PPID PGID ELAPSED\n  1 0 1 00:10\nnot a row\n\n  2 1\n  3 1 3 bogus\n";
+        let text = "PID PPID PGID ELAPSED S\n  1 0 1 00:10 S\nnot a row\n\n  2 1\n  3 1 3 bogus\n";
         let table = parse_process_table(text);
         assert_eq!(table.len(), 2);
         assert_eq!(table[0], aged(1, 0, 1, 10));
@@ -1521,9 +1714,9 @@ mod tests {
     #[test]
     fn a_refresh_of_a_nonsense_pid_changes_nothing() {
         let known = observed_group();
-        assert_eq!(refresh_sweep(known.clone(), 0), known);
-        assert_eq!(refresh_sweep(known.clone(), -1), known);
-        assert!(stop_targets_now(&known, 0).is_empty());
+        assert_eq!(refresh_sweep(known.clone(), 0, &[]), known);
+        assert_eq!(refresh_sweep(known.clone(), -1, &[]), known);
+        assert!(stop_targets_now(&known, 0, &[]).is_empty());
     }
 
     /// A stub that backgrounds a process inheriting its stdout and then exits —
@@ -1581,5 +1774,51 @@ mod tests {
 
         // Tidy up the grandchild: it is still in the stub's process group.
         signal_group(handle.pid, nix::sys::signal::Signal::SIGKILL);
+    }
+
+    #[test]
+    fn a_zombie_never_makes_a_group_look_alive() {
+        // A process that has exited but not been reaped is still listed by
+        // `ps`. It holds nothing and cannot be signalled to any effect.
+        let sweep = Sweep {
+            groups: vec![GroupRecord {
+                pgid: 300,
+                first_seen_ms: NOW - 60_000,
+                witness_pid: 300,
+                witness_started_ms: NOW - 61_000,
+                proven_ms: NOW - 60_000,
+            }],
+        };
+        let table = vec![entry(1, 0, 1), zombie(300, 1, 300, 61)];
+        assert!(
+            groups_to_kill(&sweep, &table, NOW).is_empty(),
+            "a group holding only a zombie is finished"
+        );
+        // The same group with a live member is still ours.
+        let table = vec![
+            entry(1, 0, 1),
+            zombie(300, 1, 300, 61),
+            aged(301, 1, 300, 120),
+        ];
+        assert_eq!(groups_to_kill(&sweep, &table, NOW), vec![300]);
+    }
+
+    #[test]
+    fn a_zombie_leader_is_not_adopted() {
+        let table = vec![
+            aged(1, 0, 1, 90_000),
+            aged(100, 1, 99, 5_000),
+            aged(200, 100, 200, 600),
+            zombie(300, 200, 300, 5),
+        ];
+        assert!(sweep_targets(&table, 200, 100, 99, &[], NOW).is_empty());
+    }
+
+    #[test]
+    fn the_process_state_column_is_read() {
+        let table = parse_process_table("1 0 1 00:10 Ss\n2 1 2 00:05 Z+\n3 1 3 00:05 R\n");
+        assert!(!table[0].zombie);
+        assert!(table[1].zombie, "Z means a zombie");
+        assert!(!table[2].zombie);
     }
 }

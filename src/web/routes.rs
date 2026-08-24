@@ -31,7 +31,60 @@ pub struct AppState {
     pub config_path: PathBuf,
     /// The port we are listening on, for the loopback `Host` check.
     pub port: u16,
+    /// The per-boot token every API call and socket upgrade must carry.
+    pub token: Arc<SessionToken>,
 }
+
+/// A random token minted at startup and handed to the browser in the URL the
+/// server opens.
+///
+/// Loopback binding is not an authentication boundary: everything on the
+/// machine can reach it, and that includes the agents themselves. §5 makes the
+/// permission mode a control *over the agent*, so the endpoints that change it
+/// must not be reachable by the agent — otherwise one approved Bash call is
+/// enough for an agent to `POST /api/agents/<id>/permission_mode {"mode":
+/// "bypass"}` and never be asked again.
+///
+/// The token is never written to disk, never logged, and never embedded in a
+/// served page; it exists only in this process's memory and in the URL the
+/// operator's browser was opened with.
+pub struct SessionToken(String);
+
+impl SessionToken {
+    pub fn mint() -> Self {
+        // Two v4 UUIDs: 256 bits from the OS random source.
+        Self(format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Compare without leaking the answer through timing.
+    pub fn matches(&self, candidate: &str) -> bool {
+        let expected = self.0.as_bytes();
+        let given = candidate.as_bytes();
+        let mut diff = expected.len() ^ given.len();
+        for (i, byte) in given.iter().enumerate() {
+            diff |= usize::from(byte ^ expected.get(i).copied().unwrap_or(0));
+        }
+        diff == 0
+    }
+}
+
+impl std::fmt::Debug for SessionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never let it reach a log through a derived Debug.
+        f.write_str("SessionToken(<redacted>)")
+    }
+}
+
+/// The header a browser sends the token in.
+pub const TOKEN_HEADER: &str = "x-claude-web-token";
 
 /// Anything an endpoint can refuse to do.
 pub struct ApiError {
@@ -40,6 +93,13 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    pub fn unauthorized(msg: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            body: json!({ "error": msg.to_string() }),
+        }
+    }
+
     pub fn bad_request(msg: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -154,6 +214,38 @@ pub fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
     host_allowed(Some(rest), port)
 }
 
+/// Endpoints that carry data or change state. The pages and their assets stay
+/// navigable so the browser can bootstrap; they contain nothing but markup.
+pub fn requires_token(path: &str) -> bool {
+    path.starts_with("/api/") || path == "/ws"
+}
+
+/// `Sec-Fetch-Site`, where the browser sends it. `same-origin` is our own page;
+/// `none` is a typed URL or a bookmark. Anything else is another site asking.
+pub fn fetch_site_allowed(site: Option<&str>) -> bool {
+    match site {
+        None => true,
+        Some(site) => matches!(site.trim(), "same-origin" | "none"),
+    }
+}
+
+/// The token a request carries, from the header or — for the socket upgrade,
+/// where a browser cannot set headers — the query string.
+fn token_of(req: &Request) -> Option<String> {
+    if let Some(value) = req
+        .headers()
+        .get(TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        return Some(value.trim().to_string());
+    }
+    let query = req.uri().query()?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "token").then(|| value.trim().to_string())
+    })
+}
+
 async fn guard_loopback(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let headers = req.headers();
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
@@ -174,17 +266,58 @@ async fn guard_loopback(State(state): State<AppState>, req: Request, next: Next)
         )
             .into_response();
     }
+
+    let path = req.uri().path().to_string();
+    if requires_token(&path) {
+        // A cross-origin no-cors GET carries no `Origin` at all — an `<img>` or
+        // `<script>` tag on any page reaches loopback with a loopback `Host` —
+        // so absence of `Origin` cannot be read as "same origin". Two things
+        // close it: the browser's own `Sec-Fetch-Site`, and the token, which
+        // also keeps out non-browser callers on this machine, agents included.
+        let site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
+        if !fetch_site_allowed(site) {
+            tracing::warn!(?site, %path, "refused a cross-site request");
+            return (
+                StatusCode::FORBIDDEN,
+                "claude-web refuses cross-site requests",
+            )
+                .into_response();
+        }
+        let presented = token_of(&req);
+        if !presented.is_some_and(|t| state.token.matches(&t)) {
+            tracing::warn!(%path, "refused a request with no valid session token");
+            return ApiError::unauthorized(
+                "This request needs the session token. Open the link claude-web printed at \
+                 startup — the token changes every time the server restarts.",
+            )
+            .into_response();
+        }
+    }
+
     next.run(req).await
 }
 
 // -- static assets ----------------------------------------------------------
+
+/// Everything is served from this origin, nothing may frame us, and no page
+/// may navigate or post anywhere. Approve is a one-click destructive action, so
+/// clickjacking matters here.
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+     img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss:; \
+     frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'";
 
 fn serve_embedded(path: &str) -> Response {
     match Assets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             (
-                [(header::CONTENT_TYPE, mime.as_ref())],
+                [
+                    (header::CONTENT_TYPE, mime.as_ref()),
+                    (header::CONTENT_SECURITY_POLICY, CSP),
+                    (header::X_FRAME_OPTIONS, "DENY"),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                    (header::REFERRER_POLICY, "no-referrer"),
+                ],
                 content.data.into_owned(),
             )
                 .into_response()
@@ -259,8 +392,24 @@ struct BranchInfo {
     is_git: bool,
 }
 
-async fn repo_branches(Query(q): Query<PathQuery>) -> ApiResult<Json<BranchInfo>> {
-    let path = crate::config::expand_tilde(&q.path);
+/// Resolve a caller-supplied repo path, refusing anything outside the roots.
+///
+/// `git` honours the config of the directory it runs in, so an unconfined path
+/// here is an arbitrary-command primitive, not merely an information leak.
+async fn confined_repo(state: &AppState, path: &str) -> ApiResult<PathBuf> {
+    let roots = state.sup.config().await.roots();
+    let candidate = crate::config::expand_tilde(path);
+    tokio::task::spawn_blocking(move || crate::config::confine_to_roots(&candidate, &roots))
+        .await
+        .map_err(ApiError::bad_request)?
+        .map_err(ApiError::from)
+}
+
+async fn repo_branches(
+    State(state): State<AppState>,
+    Query(q): Query<PathQuery>,
+) -> ApiResult<Json<BranchInfo>> {
+    let path = confined_repo(&state, &q.path).await?;
     let info = tokio::task::spawn_blocking(move || {
         let is_git = git::is_git_repo(&path);
         BranchInfo {
@@ -283,8 +432,11 @@ async fn repo_branches(Query(q): Query<PathQuery>) -> ApiResult<Json<BranchInfo>
     Ok(Json(info))
 }
 
-async fn fetch_repo(Json(q): Json<PathQuery>) -> ApiResult<Json<Value>> {
-    let path = crate::config::expand_tilde(&q.path);
+async fn fetch_repo(
+    State(state): State<AppState>,
+    Json(q): Json<PathQuery>,
+) -> ApiResult<Json<Value>> {
+    let path = confined_repo(&state, &q.path).await?;
     let output = tokio::task::spawn_blocking(move || git::fetch(&path))
         .await
         .map_err(ApiError::bad_request)?
@@ -310,7 +462,9 @@ async fn clone_repo(
 ) -> ApiResult<Json<Value>> {
     let cfg = state.sup.config().await;
     let root = match &req.root {
-        Some(r) => crate::config::expand_tilde(r),
+        // A caller-chosen root is confined to the configured ones: without
+        // this, a clone writes anywhere on disk, creating parents as it goes.
+        Some(r) => confined_repo(&state, r).await?,
         None => cfg
             .roots()
             .first()
@@ -529,6 +683,10 @@ async fn rename_agent(
 #[derive(Debug, Deserialize)]
 struct PermissionModeBody {
     mode: PermissionMode,
+    /// Set by the UI once the operator has confirmed a change that gives the
+    /// agent more freedom.
+    #[serde(default)]
+    confirm: bool,
 }
 
 async fn set_permission_mode(
@@ -537,7 +695,10 @@ async fn set_permission_mode(
     Json(body): Json<PermissionModeBody>,
 ) -> ApiResult<Json<Value>> {
     let record = resolve(&state, &id).await?;
-    state.sup.set_permission_mode(&record.id, body.mode).await?;
+    state
+        .sup
+        .set_permission_mode(&record.id, body.mode, body.confirm)
+        .await?;
     Ok(Json(json!({"ok": true, "mode": body.mode})))
 }
 
@@ -698,6 +859,8 @@ mod tests {
         }
     }
 
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     async fn test_state() -> AppState {
         let db = crate::db::Db::open_in_memory().expect("db");
         let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
@@ -705,6 +868,7 @@ mod tests {
             sup: Supervisor::new(db, config),
             config_path: PathBuf::from("/dev/null"),
             port: 7717,
+            token: Arc::new(SessionToken(TEST_TOKEN.to_string())),
         }
     }
 
@@ -717,14 +881,179 @@ mod tests {
             .status()
     }
 
+    /// A request as a browser page of ours would make it.
+    fn api_request(path: &str) -> axum::http::request::Builder {
+        axum::http::Request::builder()
+            .uri(path)
+            .header("host", "127.0.0.1:7717")
+    }
+
     #[tokio::test]
     async fn the_loopback_guard_lets_a_local_browser_through() {
-        let request = axum::http::Request::builder()
-            .uri("/api/health")
-            .header("host", "127.0.0.1:7717")
+        let request = api_request("/api/health")
+            .header(TOKEN_HEADER, TEST_TOKEN)
+            .header("sec-fetch-site", "same-origin")
             .body(axum::body::Body::empty())
             .expect("request");
         assert_eq!(status_of(request).await, StatusCode::OK);
+    }
+
+    // -- the token ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_origin_less_cross_origin_get_is_refused() {
+        // `<img src="http://127.0.0.1:7717/api/repos">` on any page: no Origin
+        // is sent, and Host is loopback because that is what the URL says. This
+        // reached every GET route before the token and the Sec-Fetch-Site check.
+        let request = api_request("/api/repos")
+            .header("sec-fetch-site", "cross-site")
+            .header("sec-fetch-mode", "no-cors")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        assert_eq!(status_of(request).await, StatusCode::FORBIDDEN);
+
+        // And with no Sec-Fetch-Site at all — an older browser, or curl — the
+        // token still stands in the way.
+        let request = api_request("/api/repos")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        assert_eq!(status_of(request).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn every_api_route_needs_the_token() {
+        for (method, path) in [
+            ("GET", "/api/health"),
+            ("GET", "/api/repos"),
+            ("GET", "/api/agents"),
+            ("GET", "/api/config"),
+            ("PUT", "/api/config"),
+            ("POST", "/api/agents"),
+            ("POST", "/api/repos/clone"),
+            ("POST", "/api/agents/x/permission_mode"),
+            ("POST", "/api/agents/x/stop"),
+            ("DELETE", "/api/agents/x"),
+        ] {
+            let request = api_request(path)
+                .method(method)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .expect("request");
+            assert_eq!(
+                status_of(request).await,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} must not be reachable without the token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_token_is_no_better_than_none() {
+        let request = api_request("/api/agents")
+            .header(TOKEN_HEADER, "f".repeat(64))
+            .body(axum::body::Body::empty())
+            .expect("request");
+        assert_eq!(status_of(request).await, StatusCode::UNAUTHORIZED);
+
+        // Nor is a prefix of the real one.
+        let request = api_request("/api/agents")
+            .header(TOKEN_HEADER, &TEST_TOKEN[..32])
+            .body(axum::body::Body::empty())
+            .expect("request");
+        assert_eq!(status_of(request).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_socket_upgrade_needs_the_token_too() {
+        let build = |query: &str| {
+            axum::http::Request::builder()
+                .uri(format!("/ws{query}"))
+                .header("host", "127.0.0.1:7717")
+                .header("connection", "Upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(axum::body::Body::empty())
+                .expect("request")
+        };
+        assert_eq!(status_of(build("")).await, StatusCode::UNAUTHORIZED);
+        // A browser cannot set headers on an upgrade, so the token may ride in
+        // the query string there.
+        assert_ne!(
+            status_of(build(&format!("?token={TEST_TOKEN}"))).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pages_stay_navigable_without_a_token() {
+        for path in ["/", "/agent/some_slug", "/assets/app.css"] {
+            let request = api_request(path)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            assert_eq!(status_of(request).await, StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn served_pages_carry_a_framing_and_content_policy() {
+        use tower::ServiceExt;
+        let request = api_request("/")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = router(test_state().await)
+            .oneshot(request)
+            .await
+            .expect("response");
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("x-frame-options").map(|v| v.as_bytes()),
+            Some(&b"DENY"[..])
+        );
+        let csp = headers
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("default-src 'self'"), "{csp}");
+        assert_eq!(
+            headers.get("x-content-type-options").map(|v| v.as_bytes()),
+            Some(&b"nosniff"[..])
+        );
+    }
+
+    #[test]
+    fn token_comparison_rejects_length_and_content_mismatches() {
+        let token = SessionToken(TEST_TOKEN.to_string());
+        assert!(token.matches(TEST_TOKEN));
+        assert!(!token.matches(""));
+        assert!(!token.matches(&TEST_TOKEN[..63]));
+        assert!(!token.matches(&format!("{TEST_TOKEN}x")));
+        assert!(!token.matches(&"0".repeat(64)));
+        // Minted tokens are long, random and never printed by Debug.
+        let minted = SessionToken::mint();
+        assert_eq!(minted.as_str().len(), 64);
+        assert_ne!(minted.as_str(), SessionToken::mint().as_str());
+        assert_eq!(format!("{minted:?}"), "SessionToken(<redacted>)");
+    }
+
+    #[test]
+    fn only_same_origin_fetches_are_allowed() {
+        assert!(fetch_site_allowed(None));
+        assert!(fetch_site_allowed(Some("same-origin")));
+        assert!(fetch_site_allowed(Some("none")));
+        assert!(!fetch_site_allowed(Some("cross-site")));
+        assert!(!fetch_site_allowed(Some("same-site")));
+    }
+
+    #[test]
+    fn only_data_and_control_routes_need_the_token() {
+        assert!(requires_token("/api/agents"));
+        assert!(requires_token("/api/health"));
+        assert!(requires_token("/ws"));
+        assert!(!requires_token("/"));
+        assert!(!requires_token("/agent/slug"));
+        assert!(!requires_token("/assets/app.css"));
     }
 
     #[tokio::test]
@@ -752,7 +1081,7 @@ mod tests {
     async fn a_cross_origin_websocket_upgrade_is_refused() {
         let build = |origin: &str| {
             axum::http::Request::builder()
-                .uri("/ws")
+                .uri(format!("/ws?token={TEST_TOKEN}"))
                 .header("host", "127.0.0.1:7717")
                 .header("origin", origin)
                 .header("connection", "Upgrade")

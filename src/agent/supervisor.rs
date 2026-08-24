@@ -168,6 +168,9 @@ pub struct Supervisor {
     db: Db,
     config: Arc<RwLock<Config>>,
     runners: Arc<RwLock<HashMap<String, RunnerHandle>>>,
+    /// The pids of every live agent CLI. Each is its own group leader, and no
+    /// agent may ever sweep another's group.
+    agent_pids: Arc<RwLock<HashSet<i32>>>,
     next_generation: AtomicU64,
     bus: broadcast::Sender<ServerMsg>,
 }
@@ -179,6 +182,7 @@ impl Supervisor {
             db,
             config,
             runners: Arc::new(RwLock::new(HashMap::new())),
+            agent_pids: Arc::new(RwLock::new(HashSet::new())),
             next_generation: AtomicU64::new(1),
             bus,
         })
@@ -257,10 +261,45 @@ impl Supervisor {
     /// Create an agent: allocate names, prepare the worktree, launch the child.
     pub async fn spawn_agent(&self, req: SpawnRequest) -> Result<SpawnOutcome> {
         let cfg = self.config().await;
-        let repo_path = crate::config::expand_tilde(&req.repo_path);
-        if !repo_path.is_dir() {
-            bail!("{} is not a directory", repo_path.display());
+        if let Some(model) = req.model.as_deref().filter(|m| !m.trim().is_empty()) {
+            protocol::validate_cli_value("model", model)?;
         }
+        if let Some(effort) = req.effort.as_deref().filter(|e| !e.trim().is_empty()) {
+            protocol::validate_cli_value("effort", effort)?;
+        }
+
+        // The repository, and every extra directory the agent is given, must be
+        // inside the configured roots. Otherwise a spawn is an arbitrary-path
+        // primitive: a non-git directory becomes the work path verbatim, and
+        // `--add-dir /` hands the agent the whole filesystem.
+        let roots = cfg.roots();
+        let requested = crate::config::expand_tilde(&req.repo_path);
+        let extra: Vec<PathBuf> = req
+            .add_dirs
+            .iter()
+            .filter(|d| !d.trim().is_empty())
+            .map(|d| crate::config::expand_tilde(d))
+            .collect();
+        let roots_for_check = roots.clone();
+        let (repo_path, add_dirs) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let repo = crate::config::confine_to_roots(&requested, &roots_for_check)
+                .context("the repository")?;
+            if !repo.is_dir() {
+                bail!("{} is not a directory", repo.display());
+            }
+            let mut dirs = Vec::with_capacity(extra.len());
+            for dir in extra {
+                dirs.push(
+                    crate::config::confine_to_roots(&dir, &roots_for_check)
+                        .with_context(|| format!("extra directory {}", dir.display()))?
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+            Ok((repo, dirs))
+        })
+        .await
+        .context("path check panicked")??;
 
         let taken_slugs: HashSet<String> = self
             .db
@@ -314,11 +353,7 @@ impl Supervisor {
                 .or_else(|| Some(cfg.default_model.clone())),
             effort: req.effort.clone(),
             max_budget_usd: req.max_budget_usd,
-            add_dirs: req
-                .add_dirs
-                .iter()
-                .map(|d| crate::config::expand_tilde(d).to_string_lossy().to_string())
-                .collect(),
+            add_dirs,
             status: Status::Starting,
             status_detail: None,
             exit_code: None,
@@ -459,8 +494,11 @@ impl Supervisor {
             }
         };
 
+        self.agent_pids.write().await.insert(child.pid as i32);
+
         let mut runner = Runner {
             id: record.id.clone(),
+            agent_pids: self.agent_pids.clone(),
             db: self.db.clone(),
             bus: self.bus.clone(),
             child,
@@ -472,6 +510,7 @@ impl Supervisor {
             cost_usd: record.cost_usd,
             pending: HashMap::new(),
             next_request_id: 1,
+            outstanding: HashSet::new(),
             commands,
             stop_requested: false,
             last_stderr: None,
@@ -493,8 +532,11 @@ impl Supervisor {
 
         let runners = self.runners_ref();
         let id = record.id.clone();
+        let agent_pids = self.agent_pids.clone();
+        let child_pid = runner.child.pid as i32;
         tokio::spawn(async move {
             runner.run().await;
+            agent_pids.write().await.remove(&child_pid);
             deregister(&runners, &id, generation).await;
         });
         Ok(())
@@ -539,13 +581,72 @@ impl Supervisor {
         self.command(id, AgentCommand::Interrupt).await
     }
 
-    pub async fn set_permission_mode(&self, id: &str, mode: PermissionMode) -> Result<()> {
+    /// Change an agent's permission mode.
+    ///
+    /// Relaxing it is a security decision: it must be confirmed explicitly, and
+    /// it is written into the agent's own event log with who asked for it, so a
+    /// switch is visible in the transcript rather than silent.
+    pub async fn set_permission_mode(
+        &self,
+        id: &str,
+        mode: PermissionMode,
+        confirmed: bool,
+    ) -> Result<()> {
+        let record = self.require_agent(id).await?;
+        let current = record.permission_mode;
+        if mode == current {
+            return Ok(());
+        }
+        if mode.relaxes(current) && !confirmed {
+            bail!(
+                "switching from `{current}` to `{mode}` gives the agent more freedom; \
+                 confirm the change explicitly"
+            );
+        }
+        let running = self.is_running(id).await;
+        if running && mode.control_value().is_none() {
+            // `--dangerously-skip-permissions` is a launch flag with no runtime
+            // equivalent. Recording it while sending nothing would leave the
+            // displayed mode diverging from the one in force, and every prompt
+            // the child kept asking would then be refused.
+            bail!(
+                "`{mode}` can only be applied at launch: stop the agent and resume it in that mode"
+            );
+        }
+
         {
             let id = id.to_string();
             self.db
                 .run(move |db| db.set_permission_mode(&id, mode))
                 .await?;
         }
+        let agent_id = id.to_string();
+        let payload = json!({
+            "type": "system",
+            "subtype": "permission_mode_change",
+            "from": current.as_str(),
+            "to": mode.as_str(),
+            // Only the operator can reach this: the endpoint requires the
+            // session token, which agents never see.
+            "initiator": "operator",
+            "relaxed": mode.relaxes(current),
+        });
+        let payload_for_db = payload.clone();
+        if let Ok(seq) = self
+            .db
+            .run(move |db| db.append_event(&agent_id, EventKind::System, &payload_for_db))
+            .await
+        {
+            self.broadcast(ServerMsg::Event {
+                agent_id: id.to_string(),
+                seq,
+                ts: now_ms(),
+                kind: EventKind::System.as_str().to_string(),
+                payload,
+            });
+        }
+        tracing::info!(agent = %id, %current, %mode, "operator changed the permission mode");
+
         // A running agent is switched live; a stopped one picks it up on resume.
         self.command(id, AgentCommand::SetPermissionMode(mode))
             .await
@@ -866,6 +967,8 @@ struct Runner {
     id: String,
     db: Db,
     bus: broadcast::Sender<ServerMsg>,
+    /// Every live agent's pid, so a sweep never adopts a sibling's group.
+    agent_pids: Arc<RwLock<HashSet<i32>>>,
     child: ChildHandle,
     msgs: mpsc::UnboundedReceiver<ProcessMsg>,
     cmd_rx: mpsc::UnboundedReceiver<AgentCommand>,
@@ -880,6 +983,9 @@ struct Runner {
     cost_usd: f64,
     pending: HashMap<String, PermissionRequest>,
     next_request_id: u64,
+    /// Control requests we have sent and not yet seen answered. A response for
+    /// anything else is not ours to act on.
+    outstanding: HashSet<String>,
     commands: Arc<RwLock<Vec<SlashCommand>>>,
     stop_requested: bool,
     last_stderr: Option<String>,
@@ -926,7 +1032,8 @@ impl Runner {
                         self.cmd_closed = true;
                         self.stop_requested = true;
                         let known = self.sweep_snapshot().await;
-                        self.child.stop(STOP_GRACE, known);
+                        let forbidden = self.forbidden_groups().await;
+                        self.child.stop(STOP_GRACE, known, forbidden);
                     }
                 },
             }
@@ -1022,6 +1129,11 @@ impl Runner {
         self.sweep.read().await.clone()
     }
 
+    /// Process groups no sweep may ever adopt: every other live agent's.
+    async fn forbidden_groups(&self) -> Vec<i32> {
+        self.agent_pids.read().await.iter().copied().collect()
+    }
+
     /// Run a snapshot cycle and fold the result into what we already know.
     ///
     /// Scheduled off the runner loop so a `ps` never delays event handling.
@@ -1036,16 +1148,19 @@ impl Runner {
             return;
         }
         let shared = self.sweep.clone();
+        let siblings = self.agent_pids.clone();
         tokio::spawn(async move {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
             // Held across the cycle so two refreshes cannot interleave and undo
             // each other's pruning.
+            let forbidden: Vec<i32> = siblings.read().await.iter().copied().collect();
             let mut guard = shared.write().await;
             let known = guard.clone();
             if let Ok(updated) =
-                tokio::task::spawn_blocking(move || process::refresh_sweep(known, pid)).await
+                tokio::task::spawn_blocking(move || process::refresh_sweep(known, pid, &forbidden))
+                    .await
             {
                 *guard = updated;
             }
@@ -1175,6 +1290,25 @@ impl Runner {
                 self.db.run(move |db| db.set_cost(&id, cost)).await.ok();
             }
             Action::Permission(request) => {
+                if self.pending.contains_key(&request.request_id) {
+                    // Request ids are the child's to choose. Overwriting a live
+                    // entry would let a second prompt inherit the operator's
+                    // answer to the first.
+                    tracing::warn!(
+                        agent = %self.id,
+                        request_id = %request.request_id,
+                        "ignored a permission request reusing a pending id"
+                    );
+                    self.emit(ServerMsg::Notice {
+                        agent_id: Some(self.id.clone()),
+                        level: "warn".to_string(),
+                        text: format!(
+                            "The agent asked twice with the same request id ({}); the second was ignored.",
+                            request.request_id
+                        ),
+                    });
+                    return;
+                }
                 self.pending
                     .insert(request.request_id.clone(), (*request).clone());
                 self.emit(ServerMsg::PermissionRequest {
@@ -1187,6 +1321,14 @@ impl Runner {
                 payload,
                 is_error,
             } => {
+                if !self.outstanding.remove(&request_id) {
+                    tracing::warn!(
+                        agent = %self.id,
+                        %request_id,
+                        "ignored a control response to a request we never sent"
+                    );
+                    return;
+                }
                 if is_error {
                     tracing::warn!(agent = %self.id, %request_id, ?payload, "control request failed");
                 }
@@ -1197,7 +1339,16 @@ impl Runner {
                     });
                 }
             }
-            Action::Commands(commands) => {
+            Action::Commands {
+                request_id,
+                commands,
+            } => {
+                // Only a list answering a request of ours: an unsolicited one
+                // would drive the operator's slash-command autocomplete.
+                if !request_id.is_some_and(|id| self.outstanding.contains(&id)) {
+                    tracing::warn!(agent = %self.id, "ignored an unsolicited command list");
+                    return;
+                }
                 *self.commands.write().await = commands.clone();
                 self.emit(ServerMsg::Commands {
                     agent_id: self.id.clone(),
@@ -1236,7 +1387,8 @@ impl Runner {
             AgentCommand::Stop => {
                 self.stop_requested = true;
                 let known = self.sweep_snapshot().await;
-                self.child.stop(STOP_GRACE, known);
+                let forbidden = self.forbidden_groups().await;
+                self.child.stop(STOP_GRACE, known, forbidden);
             }
         }
     }
@@ -1272,19 +1424,46 @@ impl Runner {
     }
 
     async fn decide(&mut self, request_id: &str, decision: PermissionDecision) {
-        let original = self
-            .pending
-            .remove(request_id)
-            .map(|r| r.input)
-            .unwrap_or(Value::Null);
+        // Only a prompt that is actually outstanding may be answered: an
+        // `allow` for anything else is a decision nobody asked for.
+        let Some(request) = self.pending.remove(request_id) else {
+            tracing::warn!(agent = %self.id, %request_id, "refused a decision for an unknown request");
+            self.emit(ServerMsg::Notice {
+                agent_id: Some(self.id.clone()),
+                level: "warn".to_string(),
+                text: "That approval is no longer outstanding — it was already answered, or \
+                       belonged to a process that has since exited."
+                    .to_string(),
+            });
+            return;
+        };
+
+        let requested_input = request.input.clone();
+        let sent_input = match &decision {
+            PermissionDecision::Allow { updated_input } => updated_input
+                .clone()
+                .unwrap_or_else(|| requested_input.clone()),
+            PermissionDecision::Deny { .. } => Value::Null,
+        };
+        let modified =
+            matches!(decision, PermissionDecision::Allow { .. }) && sent_input != requested_input;
+
         self.write(protocol::permission_response(
-            request_id, &decision, &original,
+            request_id,
+            &decision,
+            &requested_input,
         ));
+        // The log records what was actually approved, not merely that something
+        // was: `updated_input` replaces the tool input outright, and a decision
+        // that only said "allow" would misstate what ran.
         self.persist(
             EventKind::PermissionDecision,
             json!({
                 "request_id": request_id,
                 "behavior": decision.behavior(),
+                "tool_name": request.tool_name,
+                "input": sent_input,
+                "input_modified": modified,
             }),
         )
         .await;
@@ -1299,6 +1478,12 @@ impl Runner {
     fn take_request_id(&mut self) -> String {
         let id = format!("req_{}", self.next_request_id);
         self.next_request_id += 1;
+        self.outstanding.insert(id.clone());
+        // A misbehaving child could otherwise make this grow without bound.
+        if self.outstanding.len() > 256 {
+            self.outstanding.clear();
+            self.outstanding.insert(id.clone());
+        }
         id
     }
 
@@ -1457,6 +1642,10 @@ mod tests {
         }
 
         fn start_with(pid: u32, sweep: Sweep) -> Self {
+            Self::start_with_grace(pid, sweep, Duration::from_millis(20))
+        }
+
+        fn start_with_grace(pid: u32, sweep: Sweep, grace: Duration) -> Self {
             let db = Db::open_in_memory().expect("db");
             let dir = std::env::temp_dir();
             let record = agent_record("agent-1", &dir);
@@ -1471,6 +1660,7 @@ mod tests {
                 id: record.id.clone(),
                 db: db.clone(),
                 bus,
+                agent_pids: Arc::new(RwLock::new(HashSet::new())),
                 child,
                 msgs: msg_rx,
                 cmd_rx,
@@ -1480,12 +1670,13 @@ mod tests {
                 cost_usd: 0.0,
                 pending: HashMap::new(),
                 next_request_id: 1,
+                outstanding: HashSet::new(),
                 commands: Arc::new(RwLock::new(Vec::new())),
                 stop_requested: false,
                 last_stderr: None,
                 sweep: Arc::new(RwLock::new(sweep)),
                 last_refresh: std::time::Instant::now(),
-                grace: Duration::from_millis(20),
+                grace,
                 recently_sent: std::collections::VecDeque::new(),
             };
 
@@ -1853,6 +2044,8 @@ mod tests {
                 groups: vec![crate::agent::process::GroupRecord {
                     pgid: self.pid(),
                     first_seen_ms: crate::db::now_ms(),
+                    witness_pid: self.pid(),
+                    witness_started_ms: crate::db::now_ms(),
                     proven_ms: crate::db::now_ms(),
                 }],
             }
@@ -1993,5 +2186,287 @@ mod tests {
             "shutdown must not return while a runner is still tearing down"
         );
         assert_eq!(sup.running_count().await, 0);
+    }
+
+    // -- what a decision records --------------------------------------------
+
+    #[tokio::test]
+    async fn an_edited_approval_records_what_was_actually_sent() {
+        let mut harness = Harness::start();
+        harness.action(Action::Permission(Box::new(PermissionRequest {
+            request_id: "abc".to_string(),
+            tool_name: "Bash".to_string(),
+            display_name: None,
+            description: None,
+            tool_use_id: None,
+            input: json!({"command": "cargo test"}),
+            permission_suggestions: Value::Null,
+        })));
+        harness.action(Action::Transition(Transition::PermissionRequested));
+        harness.next_status().await;
+
+        // The operator approves, but with a different command than the one the
+        // agent asked for. `updated_input` replaces the tool input outright.
+        harness
+            .cmds
+            .as_ref()
+            .expect("sender")
+            .send(AgentCommand::Decide {
+                request_id: "abc".to_string(),
+                decision: PermissionDecision::Allow {
+                    updated_input: Some(json!({"command": "cargo test --lib"})),
+                },
+            })
+            .expect("runner is alive");
+        harness.next_status().await;
+
+        let id = harness.id.clone();
+        let db = harness.finish().await;
+        let decision = db
+            .events_after(&id, 0, 100)
+            .expect("events")
+            .into_iter()
+            .find(|e| e.kind == "permission_decision")
+            .expect("a decision event");
+        assert_eq!(decision.payload["behavior"], json!("allow"));
+        assert_eq!(
+            decision.payload["input"],
+            json!({"command": "cargo test --lib"}),
+            "the log must say what actually ran, not merely that something was approved"
+        );
+        assert_eq!(decision.payload["input_modified"], json!(true));
+        assert_eq!(decision.payload["tool_name"], json!("Bash"));
+    }
+
+    #[tokio::test]
+    async fn a_decision_for_a_request_that_is_not_pending_is_refused() {
+        let mut harness = Harness::start();
+        harness
+            .cmds
+            .as_ref()
+            .expect("sender")
+            .send(AgentCommand::Decide {
+                request_id: "never-asked".to_string(),
+                decision: PermissionDecision::Allow {
+                    updated_input: None,
+                },
+            })
+            .expect("runner is alive");
+
+        // The runner answers with a notice rather than an approval.
+        let notice = loop {
+            match harness.events.recv().await.expect("bus") {
+                ServerMsg::Notice { text, .. } => break text,
+                _ => continue,
+            }
+        };
+        assert!(notice.contains("no longer outstanding"), "{notice}");
+
+        let id = harness.id.clone();
+        let db = harness.finish().await;
+        assert!(
+            !db.events_after(&id, 0, 100)
+                .expect("events")
+                .iter()
+                .any(|e| e.kind == "permission_decision"),
+            "nothing may be recorded as approved"
+        );
+    }
+
+    // -- the SIGTERM -> SIGKILL escalation -----------------------------------
+
+    /// A group leader that ignores SIGTERM, so only the escalation ends it.
+    fn stubborn_leader() -> Option<GroupLeader> {
+        use std::os::unix::process::CommandExt;
+        if !Path::new("/bin/sh").exists() {
+            return None;
+        }
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "trap '' TERM; sleep 30"]);
+        command.process_group(0);
+        command.spawn().ok().map(|child| GroupLeader { child })
+    }
+
+    #[tokio::test]
+    async fn a_group_that_ignores_sigterm_is_killed() {
+        let Some(mut leader) = stubborn_leader() else {
+            return;
+        };
+        // Give SIGTERM a moment to be installed as ignored before we send it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(leader.is_alive());
+
+        let harness = Harness::start_with(std::process::id(), leader.sweep());
+        harness
+            .msgs
+            .send(ProcessMsg::Exited(ExitInfo {
+                code: Some(0),
+                signal: None,
+                requested: true,
+            }))
+            .expect("runner is alive");
+        harness.task.await.expect("runner should finish");
+
+        assert!(
+            leader.wait_until_gone().await,
+            "a group that ignores SIGTERM must still be SIGKILLed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_that_obeys_sigterm_is_not_waited_out() {
+        let Some(mut leader) = GroupLeader::start() else {
+            return;
+        };
+        // A grace long enough that sitting it out would be obvious.
+        let harness =
+            Harness::start_with_grace(std::process::id(), leader.sweep(), Duration::from_secs(5));
+        harness
+            .msgs
+            .send(ProcessMsg::Exited(ExitInfo {
+                code: Some(0),
+                signal: None,
+                requested: true,
+            }))
+            .expect("runner is alive");
+
+        let started = std::time::Instant::now();
+        harness.task.await.expect("runner should finish");
+        assert!(
+            leader.wait_until_gone().await,
+            "SIGTERM should have ended it"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a group that dies on SIGTERM must not hold the agent open for the whole grace: {:?}",
+            started.elapsed()
+        );
+    }
+
+    // -- how long a delete is prepared to wait -------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_waits_for_the_whole_teardown_not_just_the_child_grace() {
+        let db = Db::open_in_memory().expect("db");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = agent_record("agent-slow", dir.path());
+        db.insert_agent(&record).expect("insert");
+        let sup = Supervisor::new(db.clone(), Arc::new(RwLock::new(Config::default())));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        sup.runners.write().await.insert(
+            record.id.clone(),
+            RunnerHandle {
+                tx,
+                commands: Arc::new(RwLock::new(Vec::new())),
+                generation: 1,
+            },
+        );
+
+        // A stop that needs the child's own grace and then a group teardown:
+        // longer than one grace, shorter than the deadline delete must honour.
+        let runners = sup.runners.clone();
+        let id = record.id.clone();
+        tokio::spawn(async move {
+            assert!(matches!(rx.recv().await, Some(AgentCommand::Stop)));
+            tokio::time::sleep(STOP_GRACE + Duration::from_secs(3)).await;
+            deregister(&runners, &id, 1).await;
+        });
+
+        sup.delete(&record.id, false, false).await.expect("delete");
+        assert_eq!(
+            sup.running_count().await,
+            0,
+            "delete must not tear down a worktree while the agent is still stopping"
+        );
+        assert!(
+            Supervisor::teardown_deadline() >= STOP_GRACE * 2,
+            "the deadline has to cover the child's grace and the group teardown"
+        );
+    }
+
+    // -- the permission control plane ----------------------------------------
+
+    #[tokio::test]
+    async fn relaxing_the_permission_mode_needs_an_explicit_confirmation() {
+        let db = Db::open_in_memory().expect("db");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = agent_record("agent-perm", dir.path());
+        db.insert_agent(&record).expect("insert");
+        let sup = Supervisor::new(db.clone(), Arc::new(RwLock::new(Config::default())));
+
+        let err = sup
+            .set_permission_mode(&record.id, PermissionMode::Bypass, false)
+            .await
+            .expect_err("an unconfirmed relaxation must be refused");
+        assert!(format!("{err:#}").contains("more freedom"), "{err:#}");
+        assert_eq!(
+            db.get_agent(&record.id)
+                .expect("get")
+                .expect("present")
+                .permission_mode,
+            PermissionMode::Ask,
+            "nothing may change on a refusal"
+        );
+
+        // Tightening never needs confirmation.
+        sup.set_permission_mode(&record.id, PermissionMode::Ask, false)
+            .await
+            .expect("no change is fine");
+
+        // Confirmed, it goes through — and lands in the agent's own log.
+        sup.set_permission_mode(&record.id, PermissionMode::Bypass, true)
+            .await
+            .expect("confirmed");
+        let agent = db.get_agent(&record.id).expect("get").expect("present");
+        assert_eq!(agent.permission_mode, PermissionMode::Bypass);
+        let change = db
+            .events_after(&record.id, 0, 100)
+            .expect("events")
+            .into_iter()
+            .find(|e| e.payload["subtype"] == json!("permission_mode_change"))
+            .expect("the change must be recorded in the transcript");
+        assert_eq!(change.payload["from"], json!("ask"));
+        assert_eq!(change.payload["to"], json!("bypass"));
+        assert_eq!(change.payload["relaxed"], json!(true));
+        assert_eq!(change.payload["initiator"], json!("operator"));
+    }
+
+    #[tokio::test]
+    async fn dangerous_cannot_be_applied_to_a_running_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(bin) = stub_cli(dir.path()) else {
+            return;
+        };
+        let db = Db::open_in_memory().expect("db");
+        let record = agent_record("agent-danger", dir.path());
+        db.insert_agent(&record).expect("insert");
+        let sup = Supervisor::new(
+            db.clone(),
+            Arc::new(RwLock::new(Config {
+                claude_bin: bin,
+                ..Config::default()
+            })),
+        );
+        sup.resume(&record.id).await.expect("launch");
+
+        let err = sup
+            .set_permission_mode(&record.id, PermissionMode::Dangerous, true)
+            .await
+            .expect_err("there is no runtime equivalent of the launch flag");
+        assert!(
+            format!("{err:#}").contains("only be applied at launch"),
+            "{err:#}"
+        );
+        assert_eq!(
+            db.get_agent(&record.id)
+                .expect("get")
+                .expect("present")
+                .permission_mode,
+            PermissionMode::Ask,
+            "the recorded mode must not diverge from the one in force"
+        );
+
+        sup.shutdown().await;
     }
 }

@@ -1,10 +1,39 @@
 // Shared helpers: API calls, the multiplexed socket, small DOM utilities.
 // No build step, no dependencies — plain ES modules (§7).
 
+// The per-boot session token. It arrives in the URL the server opens, is kept
+// out of the address bar afterwards, and is required on every API call and on
+// the socket upgrade. Loopback is not an authentication boundary — everything
+// on this machine can reach the server, agents included — so this is what keeps
+// the control plane out of their reach.
+const TOKEN_KEY = 'claude-web-token';
+
+function readToken() {
+  try {
+    const url = new URL(location.href);
+    const fromUrl = url.searchParams.get('t');
+    if (fromUrl) {
+      localStorage.setItem(TOKEN_KEY, fromUrl);
+      url.searchParams.delete('t');
+      history.replaceState(null, '', url.pathname + url.search + url.hash);
+      return fromUrl;
+    }
+    return localStorage.getItem(TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+export const token = readToken();
+
 export async function api(path, options = {}) {
   const response = await fetch(path, {
-    headers: { 'content-type': 'application/json' },
     ...options,
+    headers: {
+      'content-type': 'application/json',
+      'x-claude-web-token': token,
+      ...(options.headers || {}),
+    },
   });
   const text = await response.text();
   let body = null;
@@ -16,6 +45,7 @@ export async function api(path, options = {}) {
     }
   }
   if (!response.ok) {
+    if (response.status === 401) needToken();
     const err = new Error((body && body.error) || `${response.status} ${response.statusText}`);
     err.status = response.status;
     err.body = body;
@@ -48,8 +78,9 @@ export function el(tag, attrs = {}, children = []) {
   for (const [key, value] of Object.entries(attrs)) {
     if (value === null || value === undefined || value === false) continue;
     if (key === 'class') node.className = value;
+    // Deliberately no `html` escape hatch: every node in this app is built
+    // through here, and much of the content is attacker-influenced.
     else if (key === 'text') node.textContent = value;
-    else if (key === 'html') node.innerHTML = value;
     else if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
     else node.setAttribute(key, value === true ? '' : value);
   }
@@ -112,7 +143,9 @@ export class Socket {
 
   connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    this.ws = new WebSocket(`${proto}://${location.host}/ws`);
+    // A browser cannot set headers on an upgrade, so the token rides in the
+    // query string for this one request.
+    this.ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
     this.ws.addEventListener('open', () => {
       this.retry = 0;
       for (const msg of this.queue.splice(0)) this.ws.send(msg);
@@ -147,6 +180,19 @@ export class Socket {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(text);
     else this.queue.push(text);
   }
+}
+
+/// Tell the operator their link is stale, once, and stop pretending to work.
+let toldAboutToken = false;
+export function needToken() {
+  if (toldAboutToken) return;
+  toldAboutToken = true;
+  const banner = el('div', { class: 'errbox' }, [
+    el('strong', { text: 'This page has no valid session token. ' }),
+    'Open the link claude-web printed when it started — the token changes every '
+      + 'time the server restarts.',
+  ]);
+  document.querySelector('main')?.prepend(banner);
 }
 
 export function toast(text, level = 'info') {

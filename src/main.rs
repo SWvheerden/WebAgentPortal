@@ -114,10 +114,14 @@ async fn main() -> Result<()> {
         });
     }
 
+    // The token lives only here and in the URL below: never on disk, never in a
+    // log, never in a served page.
+    let token = Arc::new(web::routes::SessionToken::mint());
     let state = AppState {
         sup: sup.clone(),
         config_path,
         port,
+        token: token.clone(),
     };
     let app = web::routes::router(state);
 
@@ -125,8 +129,13 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
-    let url = format!("http://{addr}/");
-    tracing::info!(%url, "claude-web listening");
+    // The token travels in the URL the browser is opened with; the page stores
+    // it and strips it from the address bar.
+    let url = format!("http://{addr}/?t={}", token.as_str());
+    tracing::info!(port, "claude-web listening on loopback");
+    println!("\nclaude-web is at:\n\n    {url}\n");
+    println!("That link carries this run's session token. It changes on every restart,");
+    println!("and without it the API refuses the request.\n");
 
     if open_browser && let Err(err) = open::that_detached(&url) {
         tracing::warn!(?err, "could not open a browser");

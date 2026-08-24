@@ -56,6 +56,19 @@ pub fn validate_url(url: &str) -> Result<()> {
     if url.chars().any(|c| c.is_control()) {
         bail!("the clone URL contains a control character");
     }
+    // Only the transports we mean to support. `ext::` in particular is a
+    // command-execution primitive, and `file://` would let a caller reach
+    // anywhere on disk.
+    const ALLOWED: &[&str] = &["https://", "http://", "ssh://", "git://"];
+    let looks_scp = url
+        .split_once(':')
+        .is_some_and(|(head, _)| !head.contains('/') && head.contains('@'));
+    let allowed = ALLOWED.iter().any(|s| url.starts_with(s)) || looks_scp || url.starts_with('/');
+    if !allowed {
+        bail!(
+            "unsupported clone URL: use https://, ssh://, git@host:owner/repo or an absolute path"
+        );
+    }
     Ok(())
 }
 
@@ -109,17 +122,20 @@ pub async fn clone(
         .await
         .with_context(|| format!("creating {}", root.display()))?;
 
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
+        // The same config overrides every other git call gets: a clone writes
+        // a config we do not control, and `protocol.ext.allow=never` keeps an
+        // `ext::` URL from running a command.
+        .args(super::git::SAFE_CONFIG)
         .arg("clone")
         .arg("--progress")
         // `--` closes the option list: everything after it is a positional.
         .arg("--")
         .arg(url.trim())
-        .arg(&dest)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "")
-        .env("SSH_ASKPASS", "")
-        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+        .arg(&dest);
+    super::git::harden_async(&mut command);
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -194,6 +210,10 @@ mod tests {
             "",
             "   ",
             "https://example.com/x\nmore",
+            // `ext::` is a command-execution transport.
+            "ext::sh -c 'touch /tmp/pwned'",
+            "file:///etc/passwd",
+            "unknown://host/repo.git",
         ] {
             assert!(validate_url(bad).is_err(), "{bad:?} must be rejected");
         }

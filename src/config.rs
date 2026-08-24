@@ -98,6 +98,31 @@ impl Config {
     }
 }
 
+/// Resolve a caller-supplied path and require it to sit inside one of the
+/// configured repo roots.
+///
+/// Every path that reaches git, a spawn, or a clone comes from the repo picker,
+/// which only ever offers what is under a root. Nothing else is accepted:
+/// without this, `path=~/Downloads/evil` reaches `git`, and a clone `root` can
+/// write anywhere on disk. Both sides are canonicalised, so a symlink inside a
+/// root cannot be used to step outside it.
+pub fn confine_to_roots(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
+    let resolved =
+        std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
+    for root in roots {
+        let Ok(root) = std::fs::canonicalize(root) else {
+            continue;
+        };
+        if resolved == root || resolved.starts_with(&root) {
+            return Ok(resolved);
+        }
+    }
+    anyhow::bail!(
+        "{} is outside the configured repo roots",
+        resolved.display()
+    )
+}
+
 /// Expand a leading `~` using `$HOME`. Everything else is passed through.
 pub fn expand_tilde(raw: &str) -> PathBuf {
     expand_tilde_with(raw, home_dir())
@@ -263,5 +288,49 @@ pinned_cli_version = "2.1.241"
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "branch_prefix = \"--upload-pack=x\"\n").expect("write");
         assert!(Config::load_or_create(&path).is_err());
+    }
+
+    #[test]
+    fn paths_outside_the_configured_roots_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("Code");
+        let repo = root.join("thing");
+        let outside = dir.path().join("Downloads").join("evil");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        let roots = vec![root.clone()];
+
+        assert!(confine_to_roots(&repo, &roots).is_ok());
+        assert!(
+            confine_to_roots(&root, &roots).is_ok(),
+            "a root itself is fine"
+        );
+        assert!(
+            confine_to_roots(&repo.join("nested"), &roots).is_err(),
+            "must exist"
+        );
+        let err = confine_to_roots(&outside, &roots).expect_err("must be refused");
+        assert!(format!("{err:#}").contains("outside the configured repo roots"));
+
+        // A sibling whose name merely starts with the root's is not inside it.
+        let sibling = dir.path().join("Code-evil");
+        std::fs::create_dir_all(&sibling).expect("mkdir");
+        assert!(confine_to_roots(&sibling, &roots).is_err());
+
+        // Neither is a symlink that points out of the root.
+        #[cfg(unix)]
+        {
+            let link = root.join("escape");
+            std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+            assert!(
+                confine_to_roots(&link, &roots).is_err(),
+                "a symlink out of the root must not smuggle a path back in"
+            );
+        }
+
+        assert!(
+            confine_to_roots(&repo, &[]).is_err(),
+            "no roots means nothing is allowed"
+        );
     }
 }

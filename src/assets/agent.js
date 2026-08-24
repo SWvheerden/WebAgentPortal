@@ -38,12 +38,27 @@ function toolResults(message) {
   return Array.isArray(content) ? content.filter((b) => b.type === 'tool_result') : [];
 }
 
-function pretty(value) {
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
+// Tool input and results are written by the model. Two rules: never hide any
+// of it behind a horizontal scroll (see app.css), and never render more than
+// this without saying so.
+const MAX_SHOWN = 4000;
+
+function pretty(value, limit = MAX_SHOWN) {
+  let text;
+  if (typeof value === 'string') {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value, null, 2);
+    } catch {
+      text = String(value);
+    }
+    // JSON.stringify escapes newlines inside strings, which turns a multi-line
+    // shell command into one very long line. Show the real lines.
+    text = text.replace(/\\n/g, '\n').replace(/\\t/g, '  ');
   }
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n… ${text.length - limit} more characters not shown`;
 }
 
 function renderEvent(event) {
@@ -100,10 +115,24 @@ function renderEvent(event) {
       return el('div', { class: 'ev system' }, [
         el('div', { class: 'body', text: `⏸ asked to use ${p.tool_name}` }),
       ]);
-    case 'permission_decision':
-      return el('div', { class: 'ev system' }, [
-        el('div', { class: 'body', text: `${p.behavior === 'allow' ? '✓ approved' : '✕ denied'}` }),
+    case 'permission_decision': {
+      const label = { allow: '✓ approved', deny: '✕ denied', expired: '⌁ expired' }[p.behavior]
+        || p.behavior;
+      const line = el('div', { class: 'ev system' }, [
+        el('div', {
+          class: 'body',
+          text: `${label}${p.tool_name ? ` ${p.tool_name}` : ''}${p.input_modified ? ' (input edited before sending)' : ''}`,
+        }),
       ]);
+      // What was actually sent, not merely that something was approved.
+      if (p.input !== undefined && p.input !== null) {
+        line.append(el('details', { class: 'tool' }, [
+          el('summary', { text: p.input_modified ? 'input as sent (edited)' : 'input as sent' }),
+          el('pre', { text: pretty(p.input) }),
+        ]));
+      }
+      return line;
+    }
     case 'system': {
       if (p._unrecognised) {
         return el('div', { class: 'ev system' }, [
@@ -196,20 +225,29 @@ function clearPartial() {
 
 // -- approvals --------------------------------------------------------------
 
+// Tools for which "accept edits for this session" is a meaningful, bounded
+// offer. The suggestion list is written by the agent's side of the protocol, so
+// it decides nothing on its own.
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Update']);
+
 function suggestionButtons(request) {
   const buttons = [];
   const suggestions = request.permission_suggestions;
   if (!Array.isArray(suggestions)) return buttons;
+  if (!EDIT_TOOLS.has(request.tool_name)) return buttons;
   for (const suggestion of suggestions) {
     const mode = suggestion && (suggestion.mode || suggestion.permissionMode);
     if (mode === 'acceptEdits') {
       buttons.push(el('button', {
         text: 'Accept edits for this session',
         onclick: async () => {
+          if (!confirm('Auto-approve every edit for the rest of this session?')) return;
           await decide(request.request_id, 'allow');
+          // Relaxing the permission mode is an operator decision and is
+          // recorded in the agent's log as one.
           await api(`/api/agents/${state.agent.id}/permission_mode`, {
             method: 'POST',
-            body: JSON.stringify({ mode: 'acceptEdits' }),
+            body: JSON.stringify({ mode: 'acceptEdits', confirm: true }),
           }).catch((err) => toast(err.message, 'error'));
         },
       }));

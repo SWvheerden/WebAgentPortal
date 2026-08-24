@@ -155,12 +155,65 @@ fn checked_path(path: &Path) -> Result<&str> {
 // git plumbing
 // ---------------------------------------------------------------------------
 
+/// Config that must not come from the repository we are inspecting.
+///
+/// Several git config keys are command strings, and git honours the *target*
+/// directory's `.git/config`. A directory the user merely unzipped can
+/// therefore run arbitrary commands the moment the repo picker scans it or an
+/// endpoint asks for its branches. Every invocation overrides those keys with
+/// `-c`, which takes precedence over any config file.
+pub const SAFE_CONFIG: &[&str] = &[
+    "-c",
+    "core.fsmonitor=",
+    "-c",
+    "core.sshCommand=",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "core.editor=true",
+    "-c",
+    "core.askPass=",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "diff.external=",
+    "-c",
+    "uploadpack.packObjectsHook=",
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    "protocol.allow=user",
+    "--no-optional-locks",
+];
+
+/// Environment every `git` call runs with: no credential prompts, no askpass
+/// helper, no interactive ssh.
+pub fn harden(command: &mut Command) -> &mut Command {
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+}
+
+/// [`harden`] for the async clone path.
+pub fn harden_async(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+}
+
 /// Run `git` in `cwd`, returning trimmed stdout. Fails with git's stderr.
 pub fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let mut command = Command::new("git");
+    command.current_dir(cwd).args(SAFE_CONFIG).args(args);
+    let out = harden(&mut command)
         .output()
         .with_context(|| format!("running git {}", args.join(" ")))?;
     if !out.status.success() {
@@ -223,6 +276,9 @@ pub fn list_branches(repo: &Path) -> Vec<String> {
 }
 
 /// `git fetch --all --prune`. Never automatic — it is a button (§6).
+///
+/// Runs with the same credential-prompt and askpass hardening as cloning, so a
+/// remote that wants credentials fails fast instead of hanging or shelling out.
 pub fn fetch(repo: &Path) -> Result<String> {
     git(repo, &["fetch", "--all", "--prune"])
 }
@@ -860,6 +916,60 @@ mod tests {
                 .expect("list")
                 .contains("vanished"),
             "the stale registration must be pruned, not left behind"
+        );
+    }
+
+    /// Plant the config keys that turn `git` into a command runner, and check
+    /// that none of them fire on any path we take through a repository.
+    #[test]
+    fn a_poisoned_repository_config_never_executes() {
+        let Some(repo) = init_repo() else { return };
+        let root = repo
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let sentinel = root.join("PWNED");
+        let payload = root.join("payload.sh");
+        std::fs::write(
+            &payload,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", sentinel.display()),
+        )
+        .expect("write payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+
+        // Straight into .git/config, exactly as an unzipped directory would
+        // arrive. Not via `git config`, so nothing sanitises it on the way in.
+        let config = repo.path.join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).expect("read config");
+        text.push_str(&format!(
+            "\n[core]\n\tfsmonitor = {p}\n\tsshCommand = {p}\n\tpager = {p}\n\thooksPath = {dir}\n[diff]\n\texternal = {p}\n[uploadpack]\n\tpackObjectsHook = {p}\n",
+            p = payload.display(),
+            dir = root.display(),
+        ));
+        std::fs::write(&config, text).expect("write config");
+
+        // Everything an endpoint or the scanner can reach.
+        std::fs::write(repo.path.join("dirty.txt"), "x").expect("write");
+        let _ = is_git_repo(&repo.path);
+        let _ = current_branch(&repo.path);
+        let _ = is_dirty(&repo.path);
+        let _ = list_branches(&repo.path);
+        let _ = resolve_commit(&repo.path, "main");
+        let _ = safety_report(&repo.path, &repo.path, Some("main"), None);
+        let _ = fetch(&repo.path);
+        let wt = root.join("wt");
+        let _ = add_worktree(&repo.path, &wt, "sw_poisoned", Some("main"));
+        let _ = remove_worktree(&repo.path, &wt, true);
+
+        assert!(
+            !sentinel.exists(),
+            "a config key from the inspected repository executed a command"
         );
     }
 }

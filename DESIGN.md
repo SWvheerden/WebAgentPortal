@@ -191,13 +191,27 @@ catching a tool call whose shell exits immediately. They are kept because they
 cost little and occasionally win, but they are **not** a fix for backgrounded
 jobs — see the measurements below.
 
-Nothing is signalled on the strength of a group id alone. A group counts as the
-agent's only while some live member **started before the last moment we proved
-the group was ours** — which means the group has been non-empty ever since, and
+Nothing is signalled on the strength of a group id alone, and nothing is
+*adopted* on the strength of a descendant merely being in a group. The server
+does not call `setsid`, so it, its agents and — when launched from a terminal —
+the operator's shell share one session, and any process may `setpgid` itself
+into any group in its session. So a group is only ever recorded when its
+**leader** is a descendant of the CLI, pinned by that leader's pid *and* start
+time; another live agent's group is excluded outright. Without that, one agent
+could have the server SIGKILL the operator's editor by joining its group for a
+moment.
+
+A recorded group then counts as the agent's while its witness is still alive, or
+while some live member **started before the last moment we proved the group was
+ours** — which means the group has been non-empty ever since, and
 a process group id cannot be handed to something else while its group still has
-members. Pid identity is deliberately not used as proof: pids recycle too (macOS
+members. Pid identity alone is deliberately not proof: pids recycle too (macOS
 wraps at 99998, and a session of parallel agents shelling out to builds churns
-them), so a recorded pid can come back as something else entirely. Each snapshot
+them), so a recorded pid can come back as something else entirely — which is why
+the witness is pinned by start time as well. A zombie never counts as the group
+being alive, and the whole-second granularity of `ps` is *subtracted* from the
+proof window, never added, so a process that genuinely started after the last
+proof can never carry it. Each snapshot
 re-proves what it can and moves that timestamp forward, which is what keeps a
 `npm run dev` reachable after it has forked workers and lost its original
 parent.
@@ -220,7 +234,7 @@ over-signalling:
 | …when the CLI **crashes** (SIGKILL to the CLI) | swept |
 | …when the **server shuts down** | swept |
 | A job backgrounded with `&` inside a tool call (`sleep 1201 &`, `bash -c "sleep 1117 &"`) | **not swept** — 0 of 4 controlled trials, and at best 1 of 8 overall |
-| An unrelated process of the user's, on any path | never signalled, ~10 trials |
+| An unrelated process of the user's, on any path | never signalled, ~10 trials (see the ownership rules below for what makes this hold against a *hostile* agent, which those trials did not test) |
 
 The first three are the case this machinery exists for: a `cargo build`, an
 `npm run dev`, anything still holding the worktree open at the moment the agent
@@ -331,9 +345,32 @@ The branch survives Delete by default.
 
 ## 7. Web interface
 
-Loopback only (`127.0.0.1:7717`), no auth for now; the OS is the security boundary.
-Auth arrives when it binds to a non-loopback interface — mandatory, given the agents
-execute arbitrary code.
+Loopback only (`127.0.0.1:7717`), and a per-boot session token on every data
+route — see **Authentication** below. The OS is not a sufficient boundary here:
+the agents run on this machine too, and they are the principal the permission
+modes exist to constrain. A non-loopback binding would need real multi-user auth
+on top, and remains out of scope.
+
+### Authentication
+
+Loopback binding is not an authentication boundary. Everything on the machine
+can reach the port — including the agents, which are the principal §5's
+permission modes exist to constrain. An agent that gets one Bash call executed
+could otherwise `POST /api/agents/<id>/permission_mode {"mode":"bypass"}` and
+never be asked for approval again.
+
+So the server mints a random 256-bit token at startup, prints it in the URL it
+opens, and requires it on every `/api/*` request and on the `/ws` upgrade
+(header, or query string for the upgrade, which browsers cannot add headers to).
+The pages and their assets stay reachable without it so the browser can
+bootstrap; they contain no data. The token is never written to disk, never
+logged, and never embedded in a served page — it exists only in this process's
+memory and in the URL the operator's browser was opened with, so a local process
+cannot read it. It changes on every restart.
+
+Relaxing an agent's permission mode is additionally a confirmed action, and the
+change is written into that agent's own event log with its initiator, so it
+appears in the transcript rather than silently.
 
 ### Host and Origin
 
@@ -342,6 +379,27 @@ Loopback binding alone does not survive DNS rebinding: a page served from
 the browser is concerned. Every request is therefore checked for a loopback
 `Host` header on the port actually being served, and any request carrying a
 foreign `Origin` — WebSocket upgrades included — is refused with 403.
+
+An **absent** `Origin` is not evidence of anything: a cross-origin no-cors GET
+(`<img src>`, `<script src>`, a navigation) sends none, and its `Host` is
+loopback because that is what the URL says. Data routes therefore also require
+`Sec-Fetch-Site` to be `same-origin`/`none` where the browser sends it, and the
+session token above regardless.
+
+### Paths and subprocesses
+
+Every caller-supplied path — the clone root, a spawn's repository, each
+`--add-dir` — is canonicalised and required to sit inside a configured repo
+root. Canonicalising is what makes it real: a symlink inside a root would
+otherwise step outside it.
+
+`git` honours the configuration of the directory it runs in, and several config
+keys are command strings (`core.fsmonitor`, `core.sshCommand`, `core.pager`,
+`diff.external`, …). A directory the user merely unzipped could therefore run
+commands the moment the repo picker scanned it. Every `git` invocation overrides
+those keys with `-c`, disables hooks and optional locks, and pins
+`protocol.ext.allow=never`; clone URLs are restricted to https/ssh/git and
+absolute paths.
 
 ### Endpoints
 ```

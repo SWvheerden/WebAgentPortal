@@ -507,6 +507,27 @@ pub fn commands_from_initialize(payload: &Value) -> Vec<SlashCommand> {
         .collect()
 }
 
+/// Reject a value that would reach the CLI as its own argument and could be
+/// mistaken for a flag, or that is not a plausible single token.
+///
+/// `--model` and `--effort` are caller-supplied and sit next to flags on the
+/// command line, so they get the same treatment as a git ref.
+pub fn validate_cli_value(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{field} cannot be empty");
+    }
+    if value.starts_with('-') {
+        anyhow::bail!("`{value}` starts with `-`, which the CLI would read as an option");
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        anyhow::bail!("{field} may not contain whitespace or control characters");
+    }
+    if value.len() > 64 {
+        anyhow::bail!("{field} is implausibly long");
+    }
+    Ok(())
+}
+
 /// Build the launch argument list for a child process.
 ///
 /// Kept separate from spawning so it can be asserted on in tests.
@@ -945,5 +966,22 @@ mod tests {
         assert_eq!(v, json!({"a": 1, "b": 2}));
         let v = with_fields(json!("scalar"), &[("b", json!(2))]);
         assert_eq!(v, json!({"value": "scalar", "b": 2}));
+    }
+
+    #[test]
+    fn option_shaped_model_and_effort_are_rejected() {
+        for bad in [
+            "--dangerously-skip-permissions",
+            "-x",
+            "",
+            "with space",
+            "line\nbreak",
+            &"x".repeat(65),
+        ] {
+            assert!(validate_cli_value("model", bad).is_err(), "{bad:?}");
+        }
+        for good in ["opus", "claude-sonnet-4-5", "high", "v1.2"] {
+            assert!(validate_cli_value("model", good).is_ok(), "{good:?}");
+        }
     }
 }
