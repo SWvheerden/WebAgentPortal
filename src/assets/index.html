@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>claude-web</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <header class="top">
+    <h1>claude-web</h1>
+    <span class="muted small" id="conn">connecting…</span>
+    <span class="spacer"></span>
+    <button id="toggle-spawn" class="primary">New agent</button>
+    <button id="toggle-clone">Clone repo</button>
+    <button id="toggle-settings">Settings</button>
+  </header>
+
+  <main>
+    <section class="panel hidden" id="spawn-panel">
+      <h2>New agent</h2>
+      <div class="row">
+        <div class="field" style="flex: 2 1 320px">
+          <label>Repository</label>
+          <div class="repo-list" id="repo-list"></div>
+          <div class="small muted" id="repo-errors"></div>
+        </div>
+        <div class="field" style="flex: 3 1 360px">
+          <div class="field">
+            <label for="task-name">Task name</label>
+            <input id="task-name" placeholder="Fix the parser">
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="base-ref">Base ref (current HEAD by default)</label>
+              <select id="base-ref"></select>
+            </div>
+            <div class="field" style="flex: 0 0 auto; align-self: end">
+              <button id="fetch-btn" title="git fetch --all --prune">Fetch</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>Branch</label>
+            <input id="branch-preview" readonly>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="model">Model</label>
+              <input id="model" placeholder="opus">
+            </div>
+            <div class="field">
+              <label for="permission-mode">Permissions</label>
+              <select id="permission-mode">
+                <option value="ask">Ask me</option>
+                <option value="acceptEdits">Accept edits</option>
+                <option value="bypass">Bypass</option>
+                <option value="dangerous">Dangerously skip all</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label for="first-message">First message (optional)</label>
+            <textarea id="first-message" rows="3"></textarea>
+          </div>
+          <details>
+            <summary class="muted small">Advanced</summary>
+            <div class="row" style="margin-top: 8px">
+              <div class="field">
+                <label for="effort">Effort</label>
+                <input id="effort" placeholder="(default)">
+              </div>
+              <div class="field">
+                <label for="budget">Max budget (USD)</label>
+                <input id="budget" type="number" step="0.01" placeholder="(none)">
+              </div>
+            </div>
+            <div class="field">
+              <label for="add-dirs">Extra directories (--add-dir, one per line)</label>
+              <textarea id="add-dirs" rows="2"></textarea>
+            </div>
+            <div class="field inline">
+              <input type="checkbox" id="in-place">
+              <label for="in-place" style="margin:0">Work in the main checkout instead of a worktree</label>
+            </div>
+          </details>
+          <div id="spawn-warnings"></div>
+          <button id="spawn-btn" class="primary">Spawn agent</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel hidden" id="clone-panel">
+      <h2>Clone a repository</h2>
+      <div class="row">
+        <div class="field"><label for="clone-url">URL</label><input id="clone-url" placeholder="git@github.com:owner/repo.git"></div>
+        <div class="field"><label for="clone-folder">Folder</label><input id="clone-folder" placeholder="repo"></div>
+        <div class="field"><label for="clone-root">Into root</label><select id="clone-root"></select></div>
+      </div>
+      <button id="clone-btn" class="primary">Clone</button>
+      <pre class="small muted" id="clone-log"></pre>
+      <p class="small muted">No credentials are stored. Cloning uses your ssh-agent or git credential helper; prompts are disabled so a private repo fails fast rather than hanging.</p>
+    </section>
+
+    <section class="panel hidden" id="settings-panel">
+      <h2>Settings</h2>
+      <div class="row">
+        <div class="field"><label for="cfg-roots">Repo roots (one per line)</label><textarea id="cfg-roots" rows="3"></textarea></div>
+        <div class="field">
+          <div class="field"><label for="cfg-prefix">Branch prefix</label><input id="cfg-prefix"></div>
+          <div class="field"><label for="cfg-max">Max agents (soft cap)</label><input id="cfg-max" type="number"></div>
+        </div>
+        <div class="field">
+          <div class="field"><label for="cfg-model">Default model</label><input id="cfg-model"></div>
+          <div class="field"><label for="cfg-bin">claude binary</label><input id="cfg-bin"></div>
+        </div>
+        <div class="field">
+          <div class="field"><label for="cfg-mode">Default permissions</label>
+            <select id="cfg-mode">
+              <option value="ask">Ask me</option>
+              <option value="acceptEdits">Accept edits</option>
+              <option value="bypass">Bypass</option>
+              <option value="dangerous">Dangerously skip all</option>
+            </select>
+          </div>
+          <div class="field"><label for="cfg-pin">Pinned CLI version</label><input id="cfg-pin"></div>
+        </div>
+      </div>
+      <div class="field inline"><input type="checkbox" id="cfg-open"><label for="cfg-open" style="margin:0">Open a browser on startup</label></div>
+      <button id="cfg-save" class="primary">Save</button>
+      <span class="small muted">Port changes take effect on restart.</span>
+    </section>
+
+    <section class="panel">
+      <h2>Agents <span class="muted" id="agent-count"></span></h2>
+      <div class="cards" id="cards"></div>
+      <p class="muted small" id="empty">No agents yet. Spawn one above.</p>
+    </section>
+  </main>
+
+  <script type="module" src="/assets/dashboard.js"></script>
+</body>
+</html>

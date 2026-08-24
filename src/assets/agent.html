@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agent · claude-web</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <header class="top">
+    <a href="/">← agents</a>
+    <h1 id="agent-name">…</h1>
+    <span id="agent-status"></span>
+    <span class="spacer"></span>
+    <span class="muted small" id="agent-meta"></span>
+    <button id="btn-interrupt">Interrupt</button>
+    <button id="btn-stop">Stop</button>
+    <button id="btn-resume">Resume</button>
+  </header>
+
+  <main class="detail-main">
+    <div id="approvals"></div>
+    <div class="transcript" id="transcript"></div>
+    <button id="load-earlier" class="small">Load earlier</button>
+
+    <div class="composer">
+      <div class="autocomplete hidden" id="autocomplete"></div>
+      <textarea id="input" placeholder="Message the agent — Enter to send, Shift+Enter for a newline. Type / for commands."></textarea>
+      <button id="send" class="primary">Send</button>
+    </div>
+    <div class="queued" id="queued"></div>
+    <p class="small muted">
+      Trivially safe tool calls are auto-approved by the CLI and never appear as approvals —
+      the transcript is the audit trail, the approval queue is not.
+    </p>
+  </main>
+
+  <script type="module" src="/assets/agent.js"></script>
+</body>
+</html>
