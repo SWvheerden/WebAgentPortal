@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::db::{AgentRecord, Db, now_ms};
 use crate::repo::git;
 
-use super::process::{self, Action, ChildHandle, ExitInfo, ProcessMsg, SpawnConfig};
+use super::process::{self, Action, ChildHandle, ExitInfo, ProcessMsg, SpawnConfig, Sweep};
 use super::protocol::{
     self, EventKind, LaunchArgs, PermissionDecision, PermissionRequest, SlashCommand,
 };
@@ -391,6 +391,30 @@ impl Supervisor {
             },
         };
 
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let commands = Arc::new(RwLock::new(Vec::new()));
+
+        // Claim the registry slot before anything else happens. Checking
+        // `is_running` and inserting separately would let two concurrent
+        // resumes both pass the check and start two children on one session id;
+        // claiming first also means nothing below this line runs twice, so a
+        // losing resume changes no state at all before it bails.
+        {
+            let mut runners = self.runners.write().await;
+            if runners.contains_key(&record.id) {
+                bail!("agent {} is already running", record.slug);
+            }
+            runners.insert(
+                record.id.clone(),
+                RunnerHandle {
+                    tx: cmd_tx,
+                    commands: commands.clone(),
+                    generation,
+                },
+            );
+        }
+
         // Approvals left outstanding by an earlier process died with it: their
         // request ids mean nothing to the new child, so close them before it
         // starts rather than showing the operator a card that can never be
@@ -409,20 +433,11 @@ impl Supervisor {
             });
         }
 
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-
-        // The registry slot is claimed and the child spawned under one lock.
-        // Checking `is_running` and inserting separately would let two
-        // concurrent resumes both pass the check and start two children on one
-        // session id.
-        let mut runners = self.runners.write().await;
-        if runners.contains_key(&record.id) {
-            bail!("agent {} is already running", record.slug);
-        }
         let (child, msgs) = match process::spawn(&spawn_config) {
             Ok(pair) => pair,
             Err(err) => {
-                drop(runners);
+                // Give the slot back, or the agent could never be launched again.
+                deregister(&self.runners, &record.id, generation).await;
                 let text = format!("{err:#}");
                 let id = record.id.clone();
                 let text_for_db = text.clone();
@@ -444,18 +459,6 @@ impl Supervisor {
             }
         };
 
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let commands = Arc::new(RwLock::new(Vec::new()));
-        runners.insert(
-            record.id.clone(),
-            RunnerHandle {
-                tx: cmd_tx,
-                commands: commands.clone(),
-                generation,
-            },
-        );
-        drop(runners);
-
         let mut runner = Runner {
             id: record.id.clone(),
             db: self.db.clone(),
@@ -472,6 +475,8 @@ impl Supervisor {
             commands,
             stop_requested: false,
             last_stderr: None,
+            sweep: Arc::new(std::sync::Mutex::new(Sweep::default())),
+            grace: STOP_GRACE,
             recently_sent: std::collections::VecDeque::new(),
         };
 
@@ -679,6 +684,13 @@ impl Supervisor {
         Ok(())
     }
 
+    /// How long a caller may have to wait for an agent to finish dying: the
+    /// child's own SIGTERM→SIGKILL grace, then the runner's teardown of any
+    /// process groups its tool calls left running.
+    pub fn teardown_deadline() -> Duration {
+        STOP_GRACE * 2 + Duration::from_secs(1)
+    }
+
     async fn await_stop(&self, id: &str, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
         while self.is_running(id).await {
@@ -695,12 +707,18 @@ impl Supervisor {
         for id in &ids {
             self.stop(id).await.ok();
         }
-        let deadline = tokio::time::Instant::now() + STOP_GRACE + Duration::from_secs(1);
+        // Wait for every runner to finish, not merely for the children to die:
+        // a runner is still tearing down the process groups its tool calls left
+        // running, and returning here would drop the runtime and cancel that.
+        let deadline = tokio::time::Instant::now() + Self::teardown_deadline();
         loop {
             if self.running_count().await == 0 || tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if self.running_count().await > 0 {
+            tracing::warn!("shutting down with agents still finishing their teardown");
         }
         self.db.run(|db| db.mark_all_stopped()).await.ok();
     }
@@ -865,6 +883,15 @@ struct Runner {
     commands: Arc<RwLock<Vec<SlashCommand>>>,
     stop_requested: bool,
     last_stderr: Option<String>,
+    /// Process groups started by this agent's tool calls, accumulated as the
+    /// session runs. Shared with the refresher tasks. `claude` puts each Bash
+    /// tool call in a new group, and by the time the CLI is gone its
+    /// descendants have reparented to init — so the list has to be built while
+    /// the agent is alive, not looked up when it dies.
+    sweep: Arc<std::sync::Mutex<Sweep>>,
+    /// How long a process group gets between SIGTERM and SIGKILL. A field so
+    /// tests can drive the escalation without waiting out the real grace.
+    grace: Duration,
     /// Messages we wrote to stdin and already persisted. The CLI echoes user
     /// lines back on stdout; without this the transcript shows them twice.
     recently_sent: std::collections::VecDeque<String>,
@@ -895,7 +922,7 @@ impl Runner {
                     None => {
                         self.cmd_closed = true;
                         self.stop_requested = true;
-                        self.child.stop(STOP_GRACE);
+                        self.child.stop(STOP_GRACE, self.sweep_snapshot());
                     }
                 },
             }
@@ -986,11 +1013,95 @@ impl Runner {
         });
     }
 
+    /// Read the accumulated sweep. The lock is never held across an await.
+    fn sweep_snapshot(&self) -> Sweep {
+        match self.sweep.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Snapshot the process tree and fold it into what we already know.
+    ///
+    /// Scheduled off the runner loop so a `ps` never delays event handling. The
+    /// small delay lets a tool call's process actually exist: `claude`
+    /// announces the call before its child is up.
+    fn refresh_sweep(&self, delay: Duration) {
+        let pid = self.child.pid as i32;
+        if pid <= 0 {
+            return;
+        }
+        let shared = self.sweep.clone();
+        tokio::spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let Ok(found) = tokio::task::spawn_blocking(move || process::snapshot_sweep(pid)).await
+            else {
+                return;
+            };
+            if found.is_empty() {
+                return;
+            }
+            match shared.lock() {
+                Ok(mut guard) => guard.merge(found),
+                Err(poisoned) => poisoned.into_inner().merge(found),
+            }
+        });
+    }
+
+    /// SIGTERM, grace, SIGKILL for the process groups this agent's tool calls
+    /// started. Returns the groups it acted on, for the exit record.
+    ///
+    /// This runs on **every** exit path — an operator Stop, a crash, a budget
+    /// exhaustion, a non-zero exit — and it is awaited, so `run()` does not
+    /// return (and the agent is not deregistered) until the escalation has had
+    /// its chance. Shutdown waits on exactly that.
+    async fn tear_down_groups(&mut self) -> Vec<i32> {
+        let sweep = self.sweep_snapshot();
+        if sweep.is_empty() {
+            return Vec::new();
+        }
+        let probe = sweep.clone();
+        let alive = tokio::task::spawn_blocking(move || process::surviving_groups(&probe))
+            .await
+            .unwrap_or_default();
+        if alive.is_empty() {
+            return Vec::new();
+        }
+
+        tracing::info!(agent = %self.id, groups = ?alive, "terminating process groups left by tool calls");
+        self.child
+            .signal_groups(&alive, nix::sys::signal::Signal::SIGTERM);
+        tokio::time::sleep(self.grace).await;
+
+        let probe = sweep;
+        let stubborn = tokio::task::spawn_blocking(move || process::surviving_groups(&probe))
+            .await
+            .unwrap_or_default();
+        if !stubborn.is_empty() {
+            tracing::warn!(agent = %self.id, groups = ?stubborn, "process groups ignored SIGTERM; sending SIGKILL");
+            self.child
+                .signal_groups(&stubborn, nix::sys::signal::Signal::SIGKILL);
+        }
+        alive
+    }
+
     async fn on_action(&mut self, action: Action) {
         match action {
             Action::Persist { kind, payload } => {
                 if kind == EventKind::User && self.is_echo(&payload) {
                     return;
+                }
+                match kind {
+                    // A tool call is starting: give its process a moment to
+                    // exist, then look for the group it was put in.
+                    EventKind::ToolUse => self.refresh_sweep(Duration::from_millis(250)),
+                    // A tool call returned, or the turn ended. Anything still
+                    // running was left behind deliberately — a dev server, a
+                    // build — and is exactly what has to be caught.
+                    EventKind::ToolResult | EventKind::Result => self.refresh_sweep(Duration::ZERO),
+                    _ => {}
                 }
                 if kind == EventKind::Stderr {
                     self.last_stderr = payload
@@ -1072,7 +1183,7 @@ impl Runner {
             }
             AgentCommand::Stop => {
                 self.stop_requested = true;
-                self.child.stop(STOP_GRACE);
+                self.child.stop(STOP_GRACE, self.sweep_snapshot());
             }
         }
     }
@@ -1208,6 +1319,11 @@ impl Runner {
             .await
             .ok();
 
+        // Whatever the agent's tool calls left running is torn down here, not
+        // in the Stop path: a crash, a budget exhaustion or a non-zero exit
+        // leaks the same process groups as an ignored Stop would.
+        let swept = self.tear_down_groups().await;
+
         self.persist(
             EventKind::System,
             json!({
@@ -1216,6 +1332,7 @@ impl Runner {
                 "code": info.code,
                 "signal": info.signal,
                 "requested": requested,
+                "swept_groups": swept,
             }),
         )
         .await;
@@ -1283,13 +1400,17 @@ mod tests {
 
     impl Harness {
         fn start() -> Self {
+            Self::start_with(0, Sweep::default())
+        }
+
+        fn start_with(pid: u32, sweep: Sweep) -> Self {
             let db = Db::open_in_memory().expect("db");
             let dir = std::env::temp_dir();
             let record = agent_record("agent-1", &dir);
             db.insert_agent(&record).expect("insert");
 
             let (bus, events) = broadcast::channel(256);
-            let (child, stdin, stops) = ChildHandle::detached();
+            let (child, stdin, stops) = ChildHandle::detached_with_pid(pid);
             let (msg_tx, msg_rx) = mpsc::unbounded_channel();
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -1309,6 +1430,8 @@ mod tests {
                 commands: Arc::new(RwLock::new(Vec::new())),
                 stop_requested: false,
                 last_stderr: None,
+                sweep: Arc::new(std::sync::Mutex::new(sweep)),
+                grace: Duration::from_millis(20),
                 recently_sent: std::collections::VecDeque::new(),
             };
 
@@ -1642,5 +1765,175 @@ mod tests {
             .await
             .expect_err("bypass never reaches the approval queue");
         assert!(format!("{err:#}").contains("bypass"), "{err:#}");
+    }
+
+    // -- teardown on every exit path, and shutdown waiting for it ------------
+
+    /// A real, throwaway process in a process group of its own — the shape a
+    /// Bash tool call leaves behind. No `claude`, no network, no ports.
+    struct GroupLeader {
+        child: std::process::Child,
+    }
+
+    impl GroupLeader {
+        fn start() -> Option<Self> {
+            use std::os::unix::process::CommandExt;
+            if !Path::new("/bin/sh").exists() {
+                return None;
+            }
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", "sleep 30"]);
+            command.process_group(0);
+            command.spawn().ok().map(|child| Self { child })
+        }
+
+        fn pid(&self) -> i32 {
+            self.child.id() as i32
+        }
+
+        /// `process_group(0)` makes the child its own group leader, so the
+        /// group id is the pid.
+        fn sweep(&self) -> Sweep {
+            Sweep {
+                pids: vec![self.pid()],
+                groups: vec![self.pid()],
+            }
+        }
+
+        fn is_alive(&self) -> bool {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.pid()), None).is_ok()
+        }
+
+        /// Wait for the process to be reaped, bounded so a failure is a failure
+        /// rather than a hang.
+        async fn wait_until_gone(&mut self) -> bool {
+            for _ in 0..400 {
+                // A zombie is still "alive" to kill(2) until it is waited on.
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    return true;
+                }
+                if !self.is_alive() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        }
+    }
+
+    impl Drop for GroupLeader {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_exits_on_its_own_still_gets_its_tool_groups_swept() {
+        let Some(mut leader) = GroupLeader::start() else {
+            return;
+        };
+        assert!(
+            leader.is_alive(),
+            "the stand-in tool process should be running"
+        );
+
+        // The runner knows about the group (it was snapshotted while the agent
+        // ran) and the CLI now dies on its own — a crash, not a Stop.
+        let harness = Harness::start_with(std::process::id(), leader.sweep());
+        let id = harness.id.clone();
+        harness
+            .msgs
+            .send(ProcessMsg::Exited(ExitInfo {
+                code: Some(9),
+                signal: None,
+                requested: false,
+            }))
+            .expect("runner is alive");
+        harness.task.await.expect("runner should finish");
+
+        assert!(
+            leader.wait_until_gone().await,
+            "a process group left by a tool call must be torn down even when the CLI was never Stopped"
+        );
+
+        // The teardown is recorded in the agent's own log, not just in tracing.
+        let exit = harness
+            .db
+            .events_after(&id, 0, 100)
+            .expect("events")
+            .into_iter()
+            .find(|e| e.payload["subtype"] == json!("process_exit"))
+            .expect("an exit event");
+        assert_eq!(
+            exit.payload["requested"],
+            json!(false),
+            "not an operator Stop"
+        );
+        assert_eq!(
+            exit.payload["swept_groups"],
+            json!([leader.pid()]),
+            "the swept groups belong in the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_teardown_finishes_before_the_runner_reports_itself_done() {
+        let Some(mut leader) = GroupLeader::start() else {
+            return;
+        };
+        let harness = Harness::start_with(std::process::id(), leader.sweep());
+        harness
+            .msgs
+            .send(ProcessMsg::Exited(ExitInfo {
+                code: Some(0),
+                signal: None,
+                requested: true,
+            }))
+            .expect("runner is alive");
+
+        // The ordering shutdown depends on: run() returning means the teardown
+        // is done, which means deregistration means running_count() == 0.
+        harness.task.await.expect("runner should finish");
+        assert!(
+            matches!(leader.child.try_wait(), Ok(Some(_))) || !leader.is_alive(),
+            "the group must already be gone by the time the runner reports done"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_return_until_every_runner_has_finished() {
+        let db = Db::open_in_memory().expect("db");
+        let sup = Supervisor::new(db, Arc::new(RwLock::new(Config::default())));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        sup.runners.write().await.insert(
+            "a".to_string(),
+            RunnerHandle {
+                tx,
+                commands: Arc::new(RwLock::new(Vec::new())),
+                generation: 7,
+            },
+        );
+
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runners = sup.runners.clone();
+        let flag = finished.clone();
+        tokio::spawn(async move {
+            // The Stop that shutdown() sends.
+            assert!(matches!(rx.recv().await, Some(AgentCommand::Stop)));
+            // Stand-in for the teardown: signal, grace, escalate.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            deregister(&runners, "a", 7).await;
+        });
+
+        sup.shutdown().await;
+        assert!(
+            finished.load(std::sync::atomic::Ordering::Acquire),
+            "shutdown must not return while a runner is still tearing down"
+        );
+        assert_eq!(sup.running_count().await, 0);
     }
 }

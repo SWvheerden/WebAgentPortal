@@ -285,8 +285,10 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
         // The checkout may already be gone; drop the registration either way,
         // but keep git's own words on why it refused.
         let original = format!("{err:#}");
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("git refused to remove the worktree ({original}), and"))?;
+        // The checkout directory may already be gone — that is not a failure,
+        // and it must not stop us pruning the stale registration git is still
+        // holding.
+        std::fs::remove_dir_all(path).ok();
         git(repo, &["worktree", "prune"])
             .with_context(|| format!("git refused to remove the worktree ({original}), and"))?;
         return Ok(());
@@ -829,5 +831,34 @@ mod tests {
         // Forcing does remove it, and says nothing misleading on success.
         remove_worktree(&repo.path, &wt, true).expect("force remove");
         assert!(!wt.exists());
+    }
+
+    #[test]
+    fn forcing_a_worktree_whose_directory_is_already_gone_still_prunes() {
+        let Some(repo) = init_repo() else { return };
+        let root = repo
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let wt = worktree_path(&root, "repo", "vanished");
+        add_worktree(&repo.path, &wt, "sw_vanished", Some("main")).expect("add worktree");
+
+        // Something removed the directory behind git's back.
+        std::fs::remove_dir_all(&wt).expect("remove directory");
+        assert!(
+            git(&repo.path, &["worktree", "list"])
+                .expect("list")
+                .contains("vanished"),
+            "git should still be holding the registration"
+        );
+
+        remove_worktree(&repo.path, &wt, true).expect("force remove");
+        assert!(
+            !git(&repo.path, &["worktree", "list"])
+                .expect("list")
+                .contains("vanished"),
+            "the stale registration must be pruned, not left behind"
+        );
     }
 }

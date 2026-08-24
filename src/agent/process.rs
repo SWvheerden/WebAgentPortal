@@ -22,6 +22,11 @@ use super::protocol::{
 };
 use super::state::Transition;
 
+/// How long stdout is drained after the child exits, before the exit is
+/// reported. Bounded because a process the CLI left running inherits its stdout
+/// pipe and would otherwise hold it open indefinitely.
+const DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// One consequence of a line of CLI output.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -266,7 +271,7 @@ impl ChildHandle {
     /// `setsid`, anything already reparented to pid 1 before the snapshot. It is
     /// in neither the CLI's group nor its subtree, and macOS has no cgroup
     /// equivalent to catch it. See DESIGN.md §4.
-    pub fn stop(&self, grace: std::time::Duration) {
+    pub fn stop(&self, grace: std::time::Duration, known: Sweep) {
         self.stop_requests.fetch_add(1, Ordering::AcqRel);
         if self.has_exited() {
             return;
@@ -274,11 +279,14 @@ impl ChildHandle {
         let pid = self.pid;
         let exited = self.exited.clone();
         tokio::spawn(async move {
-            // Reading /the process table shells out; keep it off the runtime.
-            let sweep = tokio::task::spawn_blocking(move || sweep_for(pid as i32))
+            // The tree is snapshotted before anything is signalled: SIGTERM to
+            // the CLI tears it down and there would be nothing left to walk.
+            // Reading the process table shells out, so keep it off the runtime.
+            let mut sweep = tokio::task::spawn_blocking(move || snapshot_sweep(pid as i32))
                 .await
                 .unwrap_or_default();
-            if !sweep.groups.is_empty() {
+            sweep.merge(known);
+            if !sweep.is_empty() {
                 tracing::info!(
                     pid,
                     groups = ?sweep.groups,
@@ -287,42 +295,52 @@ impl ChildHandle {
             }
 
             signal_group(pid, nix::sys::signal::Signal::SIGTERM);
-            for group in &sweep.groups {
-                signal_group_id(*group, nix::sys::signal::Signal::SIGTERM);
-            }
+            signal_groups(&sweep.groups, nix::sys::signal::Signal::SIGTERM);
 
+            // The CLI's own escalation has to happen here rather than in the
+            // runner: if it ignores SIGTERM the runner is still waiting for an
+            // exit that has not come.
             tokio::time::sleep(grace).await;
-
             if !exited.load(Ordering::Acquire) {
                 tracing::warn!(pid, "child ignored SIGTERM; sending SIGKILL");
                 signal_group(pid, nix::sys::signal::Signal::SIGKILL);
             }
-            if sweep.groups.is_empty() {
-                return;
-            }
-            // Only kill a group that still holds one of the processes we
-            // recorded, so a pid recycled into that group id in the meantime is
-            // not caught in the blast.
-            let survivors = tokio::task::spawn_blocking(move || surviving_groups(&sweep))
-                .await
-                .unwrap_or_default();
-            for group in survivors {
-                tracing::warn!(group, "process group ignored SIGTERM; sending SIGKILL");
-                signal_group_id(group, nix::sys::signal::Signal::SIGKILL);
-            }
+            // The groups are escalated by the runner's teardown, which runs on
+            // every exit path and, unlike this task, is awaited before the
+            // server is allowed to finish shutting down.
         });
+    }
+
+    /// Signal process groups on this child's behalf.
+    ///
+    /// A detached test handle (pid 0) decides what it *would* signal but never
+    /// signals: pid 0 means "our own process group" to `killpg`.
+    pub fn signal_groups(&self, groups: &[i32], sig: nix::sys::signal::Signal) {
+        if self.pid == 0 {
+            tracing::debug!(?groups, ?sig, "detached handle: not signalling");
+            return;
+        }
+        signal_groups(groups, sig);
     }
 
     /// A handle with no process behind it, for testing the supervisor without
     /// spawning anything. It reports as already exited, so no signal is ever
     /// sent — signalling pid 0 would hit our own process group.
+    /// A handle with no process of its own behind it, for testing the
+    /// supervisor without spawning a CLI. It reports as already exited.
+    ///
+    /// pid 0 means "signal nothing" — `killpg(0)` would hit our own process
+    /// group. A test that wants the group signalling to actually happen passes
+    /// a real pid; it is only ever used as the root of a tree walk and as a
+    /// `killpg` target for groups already filtered to what the caller
+    /// recorded.
     #[cfg(test)]
-    pub fn detached() -> (Self, mpsc::UnboundedReceiver<Value>, Arc<AtomicUsize>) {
+    pub fn detached_with_pid(pid: u32) -> (Self, mpsc::UnboundedReceiver<Value>, Arc<AtomicUsize>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let stop_requests = Arc::new(AtomicUsize::new(0));
         (
             Self {
-                pid: 0,
+                pid,
                 stdin: tx,
                 exited: Arc::new(AtomicBool::new(true)),
                 stop_requests: stop_requests.clone(),
@@ -406,6 +424,58 @@ pub fn sweep_targets(table: &[ProcEntry], root_pid: i32, own_pid: i32, own_pgid:
     Sweep { pids, groups }
 }
 
+impl Sweep {
+    /// Fold a newer snapshot in. Groups are accumulated over the agent's life
+    /// rather than replaced, because a tool call that has already returned can
+    /// still have left something running, and by the time the CLI dies its
+    /// descendants have reparented to init and can no longer be found by
+    /// walking the tree.
+    pub fn merge(&mut self, other: Sweep) {
+        for pid in other.pids {
+            if !self.pids.contains(&pid) {
+                self.pids.push(pid);
+            }
+        }
+        for group in other.groups {
+            if !self.groups.contains(&group) {
+                self.groups.push(group);
+            }
+        }
+        // Bounded, so a long session cannot grow this without limit. The oldest
+        // entries go first: they are the least likely to still be running.
+        const MAX_PIDS: usize = 512;
+        const MAX_GROUPS: usize = 64;
+        if self.pids.len() > MAX_PIDS {
+            self.pids.drain(..self.pids.len() - MAX_PIDS);
+        }
+        if self.groups.len() > MAX_GROUPS {
+            self.groups.drain(..self.groups.len() - MAX_GROUPS);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+}
+
+/// Of the groups we recorded, which still hold one of the processes we saw?
+///
+/// Pure, so the "is it still alive" decision can be tested against a synthetic
+/// table. Matching on a recorded pid as well as the group id means a pid
+/// recycled into that group id in the meantime is not caught in the blast.
+pub fn groups_to_kill(sweep: &Sweep, table: &[ProcEntry]) -> Vec<i32> {
+    sweep
+        .groups
+        .iter()
+        .copied()
+        .filter(|group| {
+            table
+                .iter()
+                .any(|e| e.pgid == *group && sweep.pids.contains(&e.pid))
+        })
+        .collect()
+}
+
 /// Read the process table. Blocking: call from `spawn_blocking`.
 pub fn process_table() -> Vec<ProcEntry> {
     let output = match std::process::Command::new("ps")
@@ -442,25 +512,27 @@ pub fn parse_process_table(text: &str) -> Vec<ProcEntry> {
 }
 
 /// The live sweep: snapshot the table and work out what to signal.
-fn sweep_for(root_pid: i32) -> Sweep {
+///
+/// Blocking: call from `spawn_blocking`.
+pub fn snapshot_sweep(root_pid: i32) -> Sweep {
+    if root_pid <= 0 {
+        return Sweep::default();
+    }
     let own_pid = std::process::id() as i32;
     let own_pgid = nix::unistd::getpgrp().as_raw();
     sweep_targets(&process_table(), root_pid, own_pid, own_pgid)
 }
 
-/// Of the groups we signalled, which still hold a process we recorded?
-fn surviving_groups(sweep: &Sweep) -> Vec<i32> {
-    let table = process_table();
-    sweep
-        .groups
-        .iter()
-        .copied()
-        .filter(|group| {
-            table
-                .iter()
-                .any(|e| e.pgid == *group && sweep.pids.contains(&e.pid))
-        })
-        .collect()
+/// [`groups_to_kill`] against the live process table. Blocking.
+pub fn surviving_groups(sweep: &Sweep) -> Vec<i32> {
+    groups_to_kill(sweep, &process_table())
+}
+
+/// Signal a set of process groups. Blocking only in the sense that signals are.
+pub fn signal_groups(groups: &[i32], sig: nix::sys::signal::Signal) {
+    for group in groups {
+        signal_group_id(*group, sig);
+    }
 }
 
 /// Signal a process group by group id, ignoring "already gone".
@@ -583,13 +655,20 @@ pub fn spawn(config: &SpawnConfig) -> Result<(ChildHandle, mpsc::UnboundedReceiv
         }
     });
 
-    // Exit monitor: drains stdout first so the exit is the last message.
+    // Exit monitor.
+    //
+    // The child is reaped as soon as it exits, and stdout is drained only for a
+    // bounded moment afterwards. Waiting for stdout to reach EOF first would
+    // hang forever whenever a tool call leaves a process holding the CLI's
+    // stdout pipe open — a backgrounded build inherits that pipe — and the
+    // agent would sit in `Idle` for as long as that process lived, never
+    // reporting the exit and never becoming resumable.
     let exited = Arc::new(AtomicBool::new(false));
     let exit_flag = exited.clone();
     tokio::spawn(async move {
-        let _ = stdout_task.await;
         let status = child.wait().await;
         exit_flag.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(DRAIN_AFTER_EXIT, stdout_task).await;
         let info = match status {
             Ok(status) => ExitInfo {
                 code: status.code(),
@@ -989,5 +1068,127 @@ mod tests {
             parse_process_table(text),
             vec![entry(1, 0, 1), entry(3, 1, 3)]
         );
+    }
+
+    #[test]
+    fn only_groups_that_still_hold_a_recorded_process_are_killed() {
+        let sweep = Sweep {
+            pids: vec![300, 310, 400],
+            groups: vec![300, 400],
+        };
+        // Group 300 still has one of the processes we recorded; group 400's
+        // has gone.
+        let table = vec![entry(1, 0, 1), entry(310, 1, 300), entry(999, 1, 400)];
+        assert_eq!(groups_to_kill(&sweep, &table), vec![300]);
+
+        // Everything gone: nothing to kill.
+        assert!(groups_to_kill(&sweep, &[entry(1, 0, 1)]).is_empty());
+
+        // A group id recycled by a process we never saw is not ours to signal.
+        let recycled = vec![entry(1, 0, 1), entry(4242, 1, 400)];
+        assert!(groups_to_kill(&sweep, &recycled).is_empty());
+    }
+
+    #[test]
+    fn sweeps_accumulate_across_tool_calls_and_stay_bounded() {
+        let mut sweep = Sweep::default();
+        assert!(sweep.is_empty());
+        sweep.merge(Sweep {
+            pids: vec![300],
+            groups: vec![300],
+        });
+        sweep.merge(Sweep {
+            pids: vec![400],
+            groups: vec![400],
+        });
+        // A later snapshot no longer sees the first tool call, but something it
+        // started may still be running, so the group is kept.
+        assert_eq!(sweep.groups, vec![300, 400]);
+        assert_eq!(sweep.pids, vec![300, 400]);
+        assert!(!sweep.is_empty());
+
+        // Duplicates do not accumulate.
+        sweep.merge(Sweep {
+            pids: vec![300, 400],
+            groups: vec![300, 400],
+        });
+        assert_eq!(sweep.groups, vec![300, 400]);
+
+        // A long session cannot grow the list without limit.
+        for i in 0..500 {
+            sweep.merge(Sweep {
+                pids: vec![10_000 + i],
+                groups: vec![10_000 + i],
+            });
+        }
+        assert!(sweep.groups.len() <= 64, "{}", sweep.groups.len());
+        assert!(sweep.pids.len() <= 512, "{}", sweep.pids.len());
+        assert!(
+            sweep.groups.contains(&10_499),
+            "the newest groups are the ones kept"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_of_a_nonsense_pid_is_empty_not_a_walk_of_everything() {
+        assert_eq!(snapshot_sweep(0), Sweep::default());
+        assert_eq!(snapshot_sweep(-1), Sweep::default());
+    }
+
+    /// A stub that backgrounds a process inheriting its stdout and then exits —
+    /// the shape of `claude` running a tool call that leaves a build behind.
+    /// No `claude`, no network, no ports.
+    fn stub_that_leaves_a_process_holding_stdout(dir: &Path) -> Option<String> {
+        if !Path::new("/bin/sh").exists() {
+            return None;
+        }
+        let path = dir.join("leaky-cli");
+        // `sleep` inherits stdout, so the pipe stays open after the stub exits
+        // — for far longer than any reasonable wait for the exit.
+        std::fs::write(&path, "#!/bin/sh\nsleep 30 &\nexit 7\n").ok()?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok()?;
+        Some(path.to_string_lossy().to_string())
+    }
+
+    #[tokio::test]
+    async fn an_exit_is_reported_even_when_a_grandchild_holds_the_stdout_pipe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(bin) = stub_that_leaves_a_process_holding_stdout(dir.path()) else {
+            return;
+        };
+        let config = SpawnConfig {
+            claude_bin: bin,
+            cwd: dir.path().to_path_buf(),
+            args: LaunchArgs {
+                session_id: "s".into(),
+                resume: false,
+                permission_mode: crate::agent::state::PermissionMode::Ask,
+                model: None,
+                effort: None,
+                max_budget_usd: None,
+                add_dirs: Vec::new(),
+            },
+        };
+        let (handle, mut msgs) = spawn(&config).expect("spawn");
+
+        // Bounded so a regression fails the test instead of hanging it. The
+        // grandchild holds the pipe for 30s; the drain window is 500ms, so a
+        // working exit path reports in well under a second.
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match msgs.recv().await {
+                    Some(ProcessMsg::Exited(info)) => return Some(info),
+                    Some(ProcessMsg::Action(_)) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("the exit must be reported, not wait on a pipe a grandchild holds open");
+        assert_eq!(exit.map(|e| e.code), Some(Some(7)));
+
+        // Tidy up the grandchild: it is still in the stub's process group.
+        signal_group(handle.pid, nix::sys::signal::Signal::SIGKILL);
     }
 }

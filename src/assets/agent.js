@@ -1,13 +1,13 @@
 // Agent detail: transcript, approvals, composer, slash commands.
 import { api, el, statusEl, fmtCost, Socket, toast } from '/assets/common.js';
+import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
 const $ = (id) => document.getElementById(id);
 
 const state = {
   agent: null,
-  cursor: 0,
-  earliest: null,
+  transcript: new Transcript(),
   commands: [],
   pending: new Map(),
   partial: null,
@@ -134,21 +134,38 @@ function atBottom() {
   return node.scrollHeight - node.scrollTop - node.clientHeight < 60;
 }
 
-function appendEvents(events, prepend = false) {
+/// Put a node where its seq belongs. Appending is the common case and stays
+/// O(1); an event that arrives out of order — a live frame during a catch-up
+/// walk, or an older page — slots into place instead of being dropped.
+function insertBySeq(host, node, seq) {
+  let cursor = host.lastElementChild;
+  while (cursor && Number(cursor.dataset.seq) > seq) {
+    cursor = cursor.previousElementSibling;
+  }
+  if (cursor) cursor.after(node);
+  else host.prepend(node);
+}
+
+// Render whatever is new. Duplicates are dropped by the transcript, so replay
+// and the live stream can overlap freely.
+function appendEvents(events) {
   const host = $('transcript');
   const stick = atBottom();
-  // Replay and the live stream overlap: an event persisted between the replay
-  // query and the socket catching up arrives twice. The cursor is the filter.
-  if (!prepend) events = events.filter((e) => e.seq > state.cursor);
-  if (!events.length) return;
-  const nodes = events.map(renderEvent).filter(Boolean);
-  if (prepend) host.prepend(...nodes);
-  else host.append(...nodes);
-  for (const event of events) {
-    if (!prepend) state.cursor = Math.max(state.cursor, event.seq);
-    if (state.earliest === null || event.seq < state.earliest) state.earliest = event.seq;
+  const fresh = state.transcript.accept(events);
+  if (!fresh.length) return;
+  for (const event of fresh) {
+    const node = renderEvent(event);
+    if (!node) continue;
+    node.dataset.seq = event.seq;
+    insertBySeq(host, node, event.seq);
   }
-  if (!prepend && stick) host.scrollTop = host.scrollHeight;
+  updateLoadEarlier();
+  if (stick) host.scrollTop = host.scrollHeight;
+}
+
+function updateLoadEarlier() {
+  const earliest = state.transcript.earliest;
+  $('load-earlier').classList.toggle('hidden', earliest === null || earliest <= 1);
 }
 
 // Live typing from --include-partial-messages. Never persisted, so it is
@@ -328,13 +345,11 @@ function send() {
 const socket = new Socket();
 
 async function loadEarlier() {
-  if (state.earliest === null || state.earliest <= 1) return;
-  const after = Math.max(0, state.earliest - 201);
+  const earliest = state.transcript.earliest;
+  if (earliest === null || earliest <= 1) return;
+  const after = Math.max(0, earliest - 201);
   const data = await api(`/api/agents/${state.agent.id}/events?after=${after}&limit=200`);
-  const older = data.events.filter((e) => e.seq < state.earliest);
-  if (!older.length) return;
-  appendEvents(older, true);
-  $('load-earlier').classList.toggle('hidden', state.earliest <= 1);
+  appendEvents(data.events);
 }
 
 async function main() {
@@ -396,30 +411,30 @@ async function main() {
     }
   });
 
-  // Subscribe with the cursor we hold, so a reconnect replays only the delta.
-  const subscribe = () => socket.send({
+  // Subscribe with the contiguous cursor: everything at or below it is
+  // accounted for. It never runs ahead of a gap, so a reconnect mid-walk picks
+  // up exactly where the walk had got to.
+  const subscribe = (after) => socket.send({
     type: 'subscribe',
     agent_id: state.agent.id,
-    after_seq: state.cursor || null,
+    after_seq: after === undefined ? state.transcript.replayFrom || null : after,
   });
-  socket.onopen = subscribe;
+  socket.onopen = () => subscribe();
   subscribe();
 
   socket
     .on('replay', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
-      if (state.earliest === null) state.earliest = msg.after + 1;
-      const before = state.cursor;
+      state.transcript.seed(msg.after);
       appendEvents(msg.events);
       state.pending = new Map((msg.pending_permissions || []).map((r) => [r.request_id, r]));
       renderApprovals();
-      $('load-earlier').classList.toggle('hidden', (state.earliest || 1) <= 1);
-      // A replay page is capped. If the head is further on, ask for the next
-      // page from the cursor we now hold, or the events between this page and
-      // the live stream would be lost for good.
-      if (msg.has_more && msg.cursor > before) {
-        socket.send({ type: 'subscribe', agent_id: state.agent.id, after_seq: msg.cursor });
-      }
+      // A replay page is capped. Walk forward from the page's own cursor until
+      // the server stops saying there is more. The walk deliberately ignores
+      // the render state: a live event arriving mid-walk must not end it, or
+      // everything between here and the head is lost for good.
+      const next = nextWalkCursor(msg);
+      if (next !== null) subscribe(next);
     })
     .on('event', (msg) => {
       if (msg.agent_id !== state.agent.id) return;

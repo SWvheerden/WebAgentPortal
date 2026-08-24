@@ -167,7 +167,7 @@ cwd = work_path
 **No auto-restart.** An unexpected exit surfaces `Failed` with exit code and last stderr,
 and offers one-click Resume. Silent respawn duplicates side effects.
 
-### What a Stop can and cannot reach
+### What a stop can and cannot reach
 
 The child is spawned in its own process group, so `killpg` reaps it and anything
 that stays in that group. That is not enough on its own: **`claude` runs each
@@ -176,28 +176,40 @@ started by a tool call is invisible to `killpg` on the CLI's group. Verified
 live against `claude` 2.1.241 — the CLI led group *N*, its Bash descendant led
 group *M*, unrelated to *N*.
 
-So a stop first snapshots the process tree under the CLI (`ps -axo
-pid,ppid,pgid`, walked breadth-first with a visited set), collects the distinct
-process groups of those descendants, and signals each of them alongside the
-CLI's own group: SIGTERM, then SIGKILL after the same 5s grace, and only to
-groups that still hold a process from the snapshot. The snapshot is taken
-**before** the first signal, because SIGTERM to the CLI destroys the tree we
-would otherwise walk. The whole sweep runs in `spawn_blocking`, and pid 1, the
-server's own pid and the server's own process group are never signalled.
+So the supervisor keeps a running list of those groups instead of trying to find
+them after the fact. The process tree under the CLI is snapshotted (`ps -axo
+pid,ppid,pgid`, walked breadth-first with a visited set, in `spawn_blocking`)
+shortly after each tool call starts and again when it returns or the turn ends;
+the distinct process groups found are accumulated over the session, bounded, and
+never replaced — a tool call that has already returned can still have left
+something running.
+
+Teardown then runs on **every** exit path, not only an operator Stop: a crash, a
+budget exhaustion, a non-zero exit. It SIGTERMs each recorded group that still
+holds a process from the snapshot, waits the 5s grace, and SIGKILLs whatever is
+left. It is awaited inside the runner, so the agent is not deregistered — and
+the server is not allowed to finish shutting down — until it has completed.
+Without that, shutdown returned as soon as the CLI died and the escalation was
+cancelled with the runtime. pid 1, the server's own pid and the server's own
+process group are never signalled, and a group is only signalled while it still
+holds a process we recorded, so a recycled group id is not caught in the blast.
 
 **Residual limitation, not fixed and not fixable here.** A process the agent
-*deliberately detaches* — `nohup … &`, `setsid`, anything already reparented to
-pid 1 before the snapshot — is in neither the CLI's process group nor its
-subtree. Nothing in the tree connects it back to the agent, and macOS has no
-cgroup or PID-namespace equivalent to catch it, so it survives both Stop and
-server shutdown. Confirmed live: a `nohup sleep 941 &` started by a tool call
-outlives both. What *is* handled is the case that actually breaks things — a
-still-running descendant holding the worktree open — and when a worktree removal
-is refused anyway, git's own stderr is surfaced to the operator with the path
-and a "delete anyway" hint rather than a generic failure.
+*detaches* — `nohup … &`, `setsid`, anything reparented to pid 1 before a
+snapshot sees it — is in neither the CLI's process group nor its subtree at any
+point we look. Nothing connects it back to the agent, and macOS has no cgroup or
+PID-namespace equivalent to catch it, so it survives both Stop and server
+shutdown. Confirmed live: a `nohup sleep 941 &` started by a tool call outlives
+both. The same applies to anything that starts and detaches entirely between two
+snapshots, and to a server killed with SIGKILL, which runs no teardown at all.
+When a worktree removal is refused because something is still holding it, git's
+own stderr is surfaced to the operator with the path and a "delete anyway" hint
+rather than a generic failure.
 
 ### Shutdown
-SIGTERM every child → 5s → SIGKILL stragglers. All marked `Stopped` so Resume works next boot.
+SIGTERM every child → 5s → SIGKILL stragglers, then the same escalation for any
+process group the children's tool calls left running, awaited before the server
+exits. All agents are marked `Stopped` so Resume works next boot.
 
 ### Concurrency
 Soft cap, default **8**. Beyond it the spawn button warns; it does not block.
@@ -311,6 +323,16 @@ Server→client: `event`, `status`, `permission_request`, `partial`, `clone_prog
 Cursor-based. The client holds its last-seen `seq`; on reconnect it sends the cursor and
 receives only the delta. A fresh load gets the **last 500 events** with "load earlier".
 Same query either way: `WHERE seq > ?`.
+
+A page is capped at 500, so the reply carries `has_more`, and a client
+reconnecting from an old cursor walks forward page by page until the server
+stops saying there is more. That walk is driven purely by the server's replies:
+the cursor it holds for rendering is a separate thing, because live events
+advance it too and using it as the walk's termination test loses everything
+between the page in flight and the head. Events are keyed by `seq` and inserted
+in order, so replay and the live stream may overlap freely, and the cursor the
+client reconnects with is the highest *contiguous* seq it holds — it never runs
+ahead of a gap.
 
 ### Frontend
 **No build step.** Hand-written HTML/CSS/vanilla ES modules embedded via `rust-embed`.

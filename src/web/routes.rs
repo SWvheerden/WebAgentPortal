@@ -772,4 +772,114 @@ mod tests {
             StatusCode::FORBIDDEN
         );
     }
+
+    /// Drive the real `transcript.js` through the interleaving that broke the
+    /// catch-up walk: a live event arriving between replay pages.
+    ///
+    /// There is no JS test harness in this repo (no build step, by design), so
+    /// the walk's cursor and termination logic was factored into
+    /// `assets/transcript.js` — free of the DOM and the socket — and is
+    /// exercised here through `node`. The test skips itself when `node` is not
+    /// installed; it is not needed to build or run the server.
+    #[test]
+    fn the_catch_up_walk_leaves_no_hole_when_live_events_interleave() {
+        let module =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/assets/transcript.js");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = dir.path().join("walk.mjs");
+        let source = format!(
+            r#"
+import {{ Transcript, nextWalkCursor }} from "{module}";
+
+const HEAD = 3000;
+const PAGE = 500;
+const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
+
+// A stand-in server holding events 1..HEAD, paginated exactly like ws::replay.
+const page = (after) => {{
+  const events = [];
+  for (let seq = after + 1; seq <= Math.min(after + PAGE, HEAD); seq += 1) {{
+    events.push({{ seq, kind: "assistant", payload: {{}} }});
+  }}
+  const cursor = events.length ? events[events.length - 1].seq : after;
+  return {{ after, cursor, events, has_more: cursor < HEAD }};
+}};
+
+const transcript = new Transcript();
+const rendered = [];
+const render = (events) => {{ for (const e of transcript.accept(events)) rendered.push(e.seq); }};
+
+// Reconnect from an old cursor while the agent is still working.
+let cursor = 100;
+transcript.seed(cursor);
+let pages = 0;
+let liveInjected = false;
+for (;;) {{
+  const reply = page(cursor);
+  pages += 1;
+  render(reply.events);
+
+  // The bus delivers a live event that outruns the page cursor, exactly as the
+  // reviewer described. It must not end the walk.
+  if (!liveInjected) {{
+    liveInjected = true;
+    render([{{ seq: 3001, kind: "assistant", payload: {{}} }}]);
+    assert(transcript.max === 3001, "the live event should be recorded");
+    assert(transcript.replayFrom === 600, "a gap must hold the reconnect cursor back");
+  }}
+
+  const next = nextWalkCursor(reply);
+  if (next === null) break;
+  cursor = next;
+  assert(pages < 50, "the walk must terminate");
+}}
+
+// Every event between the old cursor and the head arrived, exactly once.
+const expected = [];
+for (let seq = 101; seq <= HEAD; seq += 1) expected.push(seq);
+expected.push(3001);
+const sorted = [...rendered].sort((a, b) => a - b);
+assert(new Set(rendered).size === rendered.length, "no event may render twice");
+assert(
+  JSON.stringify(sorted) === JSON.stringify(expected),
+  "a hole was left in the transcript: got " + sorted.length + " of " + expected.length
+);
+assert(transcript.replayFrom === 3001, "the cursor should catch up: " + transcript.replayFrom);
+assert(!transcript.hasGap, "no gap should remain");
+
+// Replay and the live stream overlapping is not a double render.
+const before = rendered.length;
+render([{{ seq: 3001, kind: "assistant", payload: {{}} }}]);
+assert(rendered.length === before, "a duplicate seq must be dropped");
+
+// A fresh view starts at the tail and does not chase what it never asked for.
+const fresh = new Transcript();
+fresh.seed(2500);
+render([]);
+assert(fresh.replayFrom === 2500, "a fresh view must not walk back to zero");
+fresh.accept([{{ seq: 2501, kind: "system", payload: {{}} }}]);
+assert(fresh.replayFrom === 2501, "and advances from there");
+
+// An empty page never loops, whatever the server claims.
+assert(nextWalkCursor({{ has_more: true, events: [], cursor: 10 }}) === null, "empty page must stop");
+assert(nextWalkCursor({{ has_more: false, events: [{{ seq: 1 }}], cursor: 1 }}) === null, "done means done");
+console.log("ok");
+"#,
+            module = module.display()
+        );
+        std::fs::write(&driver, source).expect("write driver");
+
+        let output = match std::process::Command::new("node").arg(&driver).output() {
+            Ok(output) => output,
+            // No node installed: the module is still covered by the server-side
+            // has_more tests, and nothing in the build depends on node.
+            Err(_) => return,
+        };
+        assert!(
+            output.status.success(),
+            "transcript walk failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
