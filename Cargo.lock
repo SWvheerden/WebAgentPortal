@@ -252,6 +252,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
+ "getrandom 0.4.3",
  "mime_guess",
  "nix",
  "open",

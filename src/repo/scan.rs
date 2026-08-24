@@ -19,6 +19,10 @@ pub struct RepoEntry {
     pub is_git: bool,
     pub branch: Option<String>,
     pub dirty: bool,
+    /// Set when the repository's own git config declares commands, so it was
+    /// not inspected. Spawning into it is refused for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
     /// This tool's own last-used timestamp, not the filesystem's.
     pub last_used_at: Option<i64>,
 }
@@ -73,15 +77,19 @@ fn scan_root(root: &Path, usage: &HashMap<String, i64>) -> std::io::Result<Vec<R
             continue;
         }
         let is_git = git::is_git_repo(&path);
+        // One guarded pass per repository: a repository whose config declares
+        // commands is reported, not run.
+        let meta = if is_git {
+            git::repo_metadata(&path)
+        } else {
+            git::RepoMeta::default()
+        };
         let path_str = path.to_string_lossy().to_string();
         out.push(RepoEntry {
             name,
-            branch: if is_git {
-                git::current_branch(&path)
-            } else {
-                None
-            },
-            dirty: is_git && git::is_dirty(&path),
+            branch: meta.branch,
+            dirty: meta.dirty,
+            refused: meta.refused,
             is_git,
             last_used_at: usage.get(&path_str).copied(),
             path: path_str,
@@ -129,6 +137,7 @@ mod tests {
             is_git: true,
             branch: Some("main".to_string()),
             dirty: false,
+            refused: None,
             last_used_at,
         }
     }

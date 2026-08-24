@@ -129,16 +129,43 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
-    // The token travels in the URL the browser is opened with; the page stores
-    // it and strips it from the address bar.
+    // The token travels in the URL the browser is opened with; the page keeps
+    // it in sessionStorage and strips it from the address bar.
     let url = format!("http://{addr}/?t={}", token.as_str());
     tracing::info!(port, "claude-web listening on loopback");
-    println!("\nclaude-web is at:\n\n    {url}\n");
-    println!("That link carries this run's session token. It changes on every restart,");
-    println!("and without it the API refuses the request.\n");
 
-    if open_browser && let Err(err) = open::that_detached(&url) {
-        tracing::warn!(?err, "could not open a browser");
+    // Printed only to a terminal. Redirecting stdout to a file is the ordinary
+    // way to run this as a background service, and that would put the token in
+    // that file.
+    let handoff = write_handoff(&url);
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        println!("\nclaude-web is at:\n\n    {url}\n");
+        println!("That link carries this run's session token. It changes on every restart,");
+        println!("and without it the API refuses the request.\n");
+    } else {
+        println!("claude-web is listening on http://{addr}/");
+        match &handoff {
+            Some(path) => println!(
+                "This run's session token is in {} (mode 0600) — open the link it contains.",
+                path.display()
+            ),
+            None => println!(
+                "Run with a terminal attached to be shown the link carrying the session token."
+            ),
+        }
+    }
+
+    if open_browser {
+        // Open a private local file that redirects, rather than passing the
+        // tokened URL to `open`: a command line is readable by every process on
+        // the machine, if only for a moment.
+        let target = handoff
+            .clone()
+            .map(|p| format!("file://{}", p.display()))
+            .unwrap_or_else(|| url.clone());
+        if let Err(err) = open::that_detached(&target) {
+            tracing::warn!(?err, "could not open a browser");
+        }
     }
 
     let shutdown_sup = sup.clone();
@@ -154,6 +181,28 @@ async fn main() -> Result<()> {
     // A second pass, in case anything started during the drain.
     sup.shutdown().await;
     Ok(())
+}
+
+/// Write the tokened URL to a private file for the browser to be pointed at.
+///
+/// Mode 0600, so it is no more exposed than the browser profile that will hold
+/// the token anyway — and unlike a command line, not readable by every process.
+fn write_handoff(url: &str) -> Option<PathBuf> {
+    let path = config::state_dir().join("session-url.html");
+    std::fs::create_dir_all(config::state_dir()).ok()?;
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\">\
+         <meta http-equiv=\"refresh\" content=\"0; url={url}\">\
+         <title>claude-web</title>\
+         <p>Opening <a href=\"{url}\">claude-web</a>…"
+    );
+    std::fs::write(&path, body).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok()?;
+    }
+    Some(path)
 }
 
 async fn wait_for_signal() {

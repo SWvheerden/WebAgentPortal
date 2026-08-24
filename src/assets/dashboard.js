@@ -136,6 +136,15 @@ function repoRow(repo) {
   ];
   if (repo.branch) badges.push(el('span', { class: 'badge', text: repo.branch }));
   if (repo.dirty) badges.push(el('span', { class: 'badge dirty', text: 'dirty' }));
+  // Its own git config declares commands, so nothing was run in it — and
+  // spawning there is refused for the same reason.
+  if (repo.refused) {
+    badges.push(el('span', {
+      class: 'badge dirty',
+      text: 'not inspected',
+      title: repo.refused,
+    }));
+  }
   return el(
     'div',
     {
@@ -159,6 +168,10 @@ function renderRepos() {
 }
 
 async function selectRepo(repo) {
+  if (repo.refused) {
+    toast(repo.refused, 'error');
+    return;
+  }
   state.selectedRepo = repo;
   renderRepos();
   if (!$('task-name').value.trim()) $('task-name').value = repo.name;

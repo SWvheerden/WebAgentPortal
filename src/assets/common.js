@@ -4,8 +4,13 @@
 // The per-boot session token. It arrives in the URL the server opens, is kept
 // out of the address bar afterwards, and is required on every API call and on
 // the socket upgrade. Loopback is not an authentication boundary — everything
-// on this machine can reach the server, agents included — so this is what keeps
-// the control plane out of their reach.
+// on this machine can reach the server, agents included — so this raises the
+// bar in front of the control plane.
+//
+// sessionStorage, not localStorage: it is scoped to this tab and does not
+// outlive the browser session, which shortens the window in which the token
+// sits in the browser profile on disk. It cannot be made unreadable to a
+// process running as the same user; see DESIGN §7.
 const TOKEN_KEY = 'claude-web-token';
 
 function readToken() {
@@ -13,12 +18,12 @@ function readToken() {
     const url = new URL(location.href);
     const fromUrl = url.searchParams.get('t');
     if (fromUrl) {
-      localStorage.setItem(TOKEN_KEY, fromUrl);
+      sessionStorage.setItem(TOKEN_KEY, fromUrl);
       url.searchParams.delete('t');
       history.replaceState(null, '', url.pathname + url.search + url.hash);
       return fromUrl;
     }
-    return localStorage.getItem(TOKEN_KEY) || '';
+    return sessionStorage.getItem(TOKEN_KEY) || '';
   } catch {
     return '';
   }

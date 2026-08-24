@@ -1821,4 +1821,30 @@ mod tests {
         assert!(table[1].zombie, "Z means a zombie");
         assert!(!table[2].zombie);
     }
+
+    #[test]
+    fn a_zombie_cannot_carry_the_continuity_proof() {
+        // The witness has gone; the only process left in the group predates the
+        // proof but has itself exited and not been reaped. A zombie holds
+        // nothing and cannot be signalled, so it must not keep the group alive
+        // in the continuity branch either.
+        let sweep = Sweep {
+            groups: vec![GroupRecord {
+                pgid: 300,
+                first_seen_ms: NOW - 60_000,
+                witness_pid: 300,
+                witness_started_ms: NOW - 61_000,
+                proven_ms: NOW - 60_000,
+            }],
+        };
+        let only_zombie = vec![entry(1, 0, 1), zombie(4242, 1, 300, 120)];
+        assert!(
+            groups_to_kill(&sweep, &only_zombie, NOW).is_empty(),
+            "a zombie must not satisfy the continuity test"
+        );
+
+        // A live process of the same age does.
+        let alive = vec![entry(1, 0, 1), aged(4242, 1, 300, 120)];
+        assert_eq!(groups_to_kill(&sweep, &alive, NOW), vec![300]);
+    }
 }

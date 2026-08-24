@@ -185,8 +185,214 @@ pub const SAFE_CONFIG: &[&str] = &[
     "protocol.ext.allow=never",
     "-c",
     "protocol.allow=user",
+    "-c",
+    "core.gitProxy=",
+    "-c",
+    "core.alternateRefsCommand=",
+    "-c",
+    "sequence.editor=true",
     "--no-optional-locks",
 ];
+
+/// The last component of a config key, lowercased.
+fn key_leaf(key: &str) -> &str {
+    key.rsplit('.').next().unwrap_or(key)
+}
+
+/// Config keys whose values git runs, and the value that provably disarms
+/// each. `*` matches one component, so `filter.*.clean` covers a driver of any
+/// name — which a fixed `-c` list cannot, because the name is the attacker's to
+/// choose.
+///
+/// The disarming value is per key and was checked against git 2.52, not
+/// assumed: blanking `core.hooksPath` would *re-enable* the repository's own
+/// `.git/hooks`, and blanking a pager or editor is not the same as pointing it
+/// at something inert. `remote.*.uploadpack` and `remote.*.receivepack` are
+/// deliberately absent — measured, `-c` does **not** override them, so a
+/// repository declaring one is refused instead.
+const EXECUTED_KEYS: &[(&str, &str)] = &[
+    ("core.fsmonitor", ""),
+    ("core.sshcommand", ""),
+    ("core.pager", "cat"),
+    ("core.editor", "true"),
+    ("core.askpass", ""),
+    ("core.gitproxy", ""),
+    ("core.alternaterefscommand", ""),
+    ("core.hookspath", "/dev/null"),
+    ("credential.helper", ""),
+    ("credential.*.helper", ""),
+    ("diff.external", ""),
+    ("diff.*.command", ""),
+    ("diff.*.textconv", ""),
+    ("merge.*.driver", ""),
+    ("mergetool.*.cmd", ""),
+    ("mergetool.*.path", ""),
+    ("difftool.*.cmd", ""),
+    ("difftool.*.path", ""),
+    ("filter.*.clean", ""),
+    ("filter.*.smudge", ""),
+    ("filter.*.process", ""),
+    ("uploadpack.packobjectshook", ""),
+    ("sequence.editor", "true"),
+    ("gpg.program", "true"),
+    ("gpg.*.program", "true"),
+    ("browser.*.cmd", ""),
+    ("guitool.*.cmd", ""),
+    ("trailer.*.command", ""),
+    ("submodule.*.update", ""),
+    ("init.templatedir", ""),
+    ("imap.tunnel", ""),
+    ("pager.*", "cat"),
+    ("alias.*", ""),
+];
+
+/// Words that end the name of a key git is likely to execute.
+///
+/// This is the catch-all half. Two rounds of this were an allowlist of specific
+/// dangerous keys and both were incomplete — `core.fsmonitor` was covered while
+/// `filter.*.clean` was not — so anything matching this that is *not* a shape
+/// we know how to disarm makes the repository refuse inspection outright,
+/// rather than being run in the hope that it is harmless.
+const COMMAND_LEAVES: &[&str] = &[
+    "askpass",
+    "clean",
+    "cmd",
+    "command",
+    "driver",
+    "editor",
+    "external",
+    "fsmonitor",
+    "helper",
+    "hook",
+    "hookspath",
+    "pager",
+    "process",
+    "program",
+    "run",
+    "script",
+    "smudge",
+    "sshcommand",
+    "templatedir",
+    "textconv",
+    "tunnel",
+    "uploadpack",
+    "receivepack",
+    "vcs",
+];
+
+fn matches_shape(key: &str, shape: &str) -> bool {
+    let key: Vec<&str> = key.split('.').collect();
+    let shape: Vec<&str> = shape.split('.').collect();
+    if key.len() != shape.len() {
+        return false;
+    }
+    key.iter()
+        .zip(shape.iter())
+        .all(|(k, s)| *s == "*" || s == k)
+}
+
+/// Does git execute this config value, as far as we can tell?
+fn is_command_valued(key: &str, value: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let value = value.trim();
+    // git's own escape hatches: an alias or submodule update starting with `!`
+    // is a shell command, and `ext::` is a transport that runs one.
+    if value.starts_with('!') || value.starts_with("ext::") {
+        return true;
+    }
+    if value.is_empty() {
+        return false;
+    }
+    disarm_value(&key).is_some() || COMMAND_LEAVES.contains(&key_leaf(&key))
+}
+
+/// The value that disarms this key, if we know one. `None` means we cannot make
+/// it provably inert, and the repository is refused rather than run.
+fn disarm_value(key: &str) -> Option<&'static str> {
+    let key = key.to_ascii_lowercase();
+    EXECUTED_KEYS
+        .iter()
+        .find(|(shape, _)| matches_shape(&key, shape))
+        .map(|(_, disarmed)| *disarmed)
+}
+
+/// What a repository's own config forces us to do before touching it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RepoGuard {
+    /// `-c key=` pairs disarming every command-valued key the repository
+    /// declares, by the exact names it declares them under.
+    pub overrides: Vec<String>,
+    /// Keys that execute something and that blanking would not disarm. A
+    /// repository declaring one of these is not touched at all.
+    pub refusals: Vec<String>,
+}
+
+impl RepoGuard {
+    /// Build the guard from a repository's local config.
+    ///
+    /// `git config --local --list` reads the config and nothing else — no
+    /// working tree, so no filter driver runs — which is what makes it safe to
+    /// ask the repository about itself before working in it.
+    pub fn read(repo: &Path) -> Self {
+        let Ok(listing) = git_raw(repo, &[], &["config", "--local", "--list", "-z"]) else {
+            // Not a repository, or a config git itself will not read.
+            return Self::default();
+        };
+        Self::from_listing(&listing)
+    }
+
+    /// Parse `git config --list -z` output: NUL-separated records, each
+    /// `key\nvalue` (a valueless key has no newline).
+    pub fn from_listing(listing: &str) -> Self {
+        let mut guard = Self::default();
+        for record in listing.split('\0').filter(|r| !r.is_empty()) {
+            let (key, value) = match record.split_once('\n') {
+                Some((key, value)) => (key, value),
+                None => (record, ""),
+            };
+            if !is_command_valued(key, value) {
+                continue;
+            }
+            if let Some(inert) = disarm_value(key) {
+                let disarmed = format!("{}={inert}", key.to_ascii_lowercase());
+                if !guard.overrides.iter().any(|o| o == &disarmed) {
+                    guard.overrides.push(disarmed);
+                }
+            } else {
+                let refusal = format!("{key} = {value}");
+                if !guard.refusals.contains(&refusal) {
+                    guard.refusals.push(refusal);
+                }
+            }
+        }
+        guard
+    }
+
+    /// The `-c key=` arguments, ready to splice into an argv.
+    pub fn args(&self) -> Vec<&str> {
+        let mut args = Vec::with_capacity(self.overrides.len() * 2);
+        for override_ in &self.overrides {
+            args.push("-c");
+            args.push(override_.as_str());
+        }
+        args
+    }
+
+    /// Refuse to touch a repository whose config runs something we cannot
+    /// disarm. Failing closed is the point: the operator is told which key,
+    /// rather than the command being run on their behalf.
+    pub fn check(&self, repo: &Path) -> Result<()> {
+        if self.refusals.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "{} declares git config that runs commands ({}); claude-web will not inspect or \
+             work in it. Remove those keys from its .git/config if you trust the repository.",
+            repo.display(),
+            self.refusals.join(", ")
+        )
+    }
+}
 
 /// Environment every `git` call runs with: no credential prompts, no askpass
 /// helper, no interactive ssh.
@@ -209,10 +415,18 @@ pub fn harden_async(command: &mut tokio::process::Command) -> &mut tokio::proces
         .env("GIT_OPTIONAL_LOCKS", "0")
 }
 
-/// Run `git` in `cwd`, returning trimmed stdout. Fails with git's stderr.
-pub fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+/// Run `git` in `cwd` with the fixed hardening plus `extra`, returning trimmed
+/// stdout.
+///
+/// The low-level runner: it does not consult the repository's own config, so
+/// [`RepoGuard::read`] can use it without recursion.
+fn git_raw(cwd: &Path, extra: &[&str], args: &[&str]) -> Result<String> {
     let mut command = Command::new("git");
-    command.current_dir(cwd).args(SAFE_CONFIG).args(args);
+    command
+        .current_dir(cwd)
+        .args(SAFE_CONFIG)
+        .args(extra)
+        .args(args);
     let out = harden(&mut command)
         .output()
         .with_context(|| format!("running git {}", args.join(" ")))?;
@@ -225,6 +439,14 @@ pub fn git(cwd: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// Run `git` in `cwd`, disarming whatever that repository's config declares
+/// first — and refusing outright if it declares something we cannot disarm.
+pub fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+    let guard = RepoGuard::read(cwd);
+    guard.check(cwd)?;
+    git_raw(cwd, &guard.args(), args)
 }
 
 /// Run `git`, returning `None` instead of an error when it fails.
@@ -260,6 +482,41 @@ pub fn is_dirty(repo: &Path) -> bool {
     git_opt(repo, &["status", "--porcelain"]).is_some_and(|s| !s.trim().is_empty())
 }
 
+/// What the picker needs to know about one repository.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RepoMeta {
+    pub branch: Option<String>,
+    pub dirty: bool,
+    /// Why the repository was not inspected, when its own config forbade it.
+    pub refused: Option<String>,
+}
+
+/// Read a repository's branch and dirtiness in one pass.
+///
+/// The scanner runs this over every directory under every root, so the guard is
+/// built once here rather than once per git call — and a repository that
+/// refuses inspection is reported as such instead of being run.
+pub fn repo_metadata(repo: &Path) -> RepoMeta {
+    let guard = RepoGuard::read(repo);
+    if let Err(err) = guard.check(repo) {
+        return RepoMeta {
+            refused: Some(format!("{err}")),
+            ..Default::default()
+        };
+    }
+    let extra = guard.args();
+    let branch = git_raw(repo, &extra, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .filter(|name| !name.is_empty() && name != "HEAD");
+    let dirty =
+        git_raw(repo, &extra, &["status", "--porcelain"]).is_ok_and(|s| !s.trim().is_empty());
+    RepoMeta {
+        branch,
+        dirty,
+        refused: None,
+    }
+}
+
 /// Local branches, for the base-ref dropdown. Current branch first.
 pub fn list_branches(repo: &Path) -> Vec<String> {
     let mut branches = git_opt(
@@ -280,7 +537,13 @@ pub fn list_branches(repo: &Path) -> Vec<String> {
 /// Runs with the same credential-prompt and askpass hardening as cloning, so a
 /// remote that wants credentials fails fast instead of hanging or shelling out.
 pub fn fetch(repo: &Path) -> Result<String> {
-    git(repo, &["fetch", "--all", "--prune"])
+    // `--upload-pack` on the command line is the only thing that overrides a
+    // remote's `uploadpack` key — `-c` does not, measured — so it is pinned
+    // here as well as being a refusal in the guard.
+    git(
+        repo,
+        &["fetch", "--all", "--prune", "--upload-pack=git-upload-pack"],
+    )
 }
 
 /// Validate a ref and resolve it to a commit object id.
@@ -919,8 +1182,10 @@ mod tests {
         );
     }
 
-    /// Plant the config keys that turn `git` into a command runner, and check
-    /// that none of them fire on any path we take through a repository.
+    /// Plant every class of config key that turns `git` into a command runner —
+    /// including a clean/smudge filter driver, which `git status` runs when it
+    /// has to re-hash a working-tree file, and which no fixed `-c` list covers
+    /// because the driver's name is the attacker's to choose.
     #[test]
     fn a_poisoned_repository_config_never_executes() {
         let Some(repo) = init_repo() else { return };
@@ -943,23 +1208,41 @@ mod tests {
                 .expect("chmod");
         }
 
+        // A file the filter applies to, committed before the driver is planted.
+        std::fs::write(repo.path.join("a.txt"), "hello\n").expect("write");
+        std::fs::write(repo.path.join(".gitattributes"), "a.txt filter=evil\n")
+            .expect("write attributes");
+        git(&repo.path, &["add", "."]).expect("add");
+        git(&repo.path, &["commit", "-q", "-m", "with attributes"]).expect("commit");
+
         // Straight into .git/config, exactly as an unzipped directory would
         // arrive. Not via `git config`, so nothing sanitises it on the way in.
         let config = repo.path.join(".git").join("config");
         let mut text = std::fs::read_to_string(&config).expect("read config");
         text.push_str(&format!(
-            "\n[core]\n\tfsmonitor = {p}\n\tsshCommand = {p}\n\tpager = {p}\n\thooksPath = {dir}\n[diff]\n\texternal = {p}\n[uploadpack]\n\tpackObjectsHook = {p}\n",
+            "\n[core]\n\tfsmonitor = {p}\n\tsshCommand = {p}\n\tpager = {p}\n\thooksPath = {dir}\n\tgitProxy = {p}\n\
+             \n[filter \"evil\"]\n\tclean = {p}\n\tsmudge = {p}\n\
+             \n[diff]\n\texternal = {p}\n\
+             \n[uploadpack]\n\tpackObjectsHook = {p}\n\
+             \n[remote \"origin\"]\n\turl = {dir}\n\
+             \n[alias]\n\tpwn = !{p}\n",
             p = payload.display(),
             dir = root.display(),
         ));
         std::fs::write(&config, text).expect("write config");
 
+        // Same size, stale timestamp: git cannot decide from stat data alone
+        // and has to re-hash the file — which is what runs the clean filter.
+        std::fs::write(repo.path.join("a.txt"), "HELLO\n").expect("modify");
+        let stale = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let _ = filetime(&repo.path.join("a.txt"), stale);
+
         // Everything an endpoint or the scanner can reach.
-        std::fs::write(repo.path.join("dirty.txt"), "x").expect("write");
         let _ = is_git_repo(&repo.path);
         let _ = current_branch(&repo.path);
         let _ = is_dirty(&repo.path);
         let _ = list_branches(&repo.path);
+        let _ = repo_metadata(&repo.path);
         let _ = resolve_commit(&repo.path, "main");
         let _ = safety_report(&repo.path, &repo.path, Some("main"), None);
         let _ = fetch(&repo.path);
@@ -971,5 +1254,174 @@ mod tests {
             !sentinel.exists(),
             "a config key from the inspected repository executed a command"
         );
+
+        // And the disarming is real, not incidental: the guard names each key.
+        let guard = RepoGuard::read(&repo.path);
+        for key in [
+            "core.fsmonitor=",
+            "core.sshcommand=",
+            "core.gitproxy=",
+            "core.hookspath=/dev/null",
+            "core.pager=cat",
+            "filter.evil.clean=",
+            "filter.evil.smudge=",
+            "diff.external=",
+            "uploadpack.packobjectshook=",
+            "alias.pwn=",
+        ] {
+            assert!(
+                guard.overrides.iter().any(|o| o == key),
+                "{key} should have been disarmed: {:?}",
+                guard.overrides
+            );
+        }
+        assert!(guard.refusals.is_empty(), "{:?}", guard.refusals);
+    }
+
+    /// Set a file's modification time, so git cannot trust its cached stat data.
+    fn filetime(path: &Path, when: std::time::SystemTime) -> std::io::Result<()> {
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+        file.set_modified(when)
+    }
+
+    #[test]
+    fn a_repository_declaring_a_command_we_cannot_disarm_is_refused() {
+        let Some(repo) = init_repo() else { return };
+        let config = repo.path.join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).expect("read config");
+        // A namespace we know nothing about, with a command-shaped key. There
+        // is no `-c` override that makes this provably inert, so the repository
+        // is not touched at all.
+        text.push_str("\n[sometool \"x\"]\n\tcommand = /tmp/payload.sh\n");
+        std::fs::write(&config, text).expect("write config");
+
+        let guard = RepoGuard::read(&repo.path);
+        assert!(
+            guard.refusals.iter().any(|r| r.contains("sometool")),
+            "{:?}",
+            guard.refusals
+        );
+
+        let err = git(&repo.path, &["status", "--porcelain"]).expect_err("must refuse");
+        assert!(format!("{err:#}").contains("runs commands"), "{err:#}");
+
+        // The scanner reports it rather than running it.
+        let meta = repo_metadata(&repo.path);
+        assert!(meta.refused.is_some());
+        assert_eq!(meta.branch, None);
+        assert!(!meta.dirty);
+    }
+
+    #[test]
+    fn a_remote_upload_pack_command_is_refused_before_fetch_runs() {
+        let Some(repo) = init_repo() else { return };
+        let root = repo
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let sentinel = root.join("UPLOADPACK_PWNED");
+        let payload = root.join("up.sh");
+        std::fs::write(
+            &payload,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", sentinel.display()),
+        )
+        .expect("write payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let config = repo.path.join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).expect("read config");
+        text.push_str(&format!(
+            "\n[remote \"origin\"]\n\turl = {}\n\tuploadpack = {}\n",
+            repo.path.display(),
+            payload.display()
+        ));
+        std::fs::write(&config, text).expect("write config");
+
+        let err = fetch(&repo.path).expect_err("must refuse");
+        assert!(format!("{err:#}").contains("runs commands"), "{err:#}");
+        assert!(
+            !sentinel.exists(),
+            "a remote's upload-pack command must never run"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_repository_is_neither_disarmed_nor_refused() {
+        let Some(repo) = init_repo() else { return };
+        let guard = RepoGuard::read(&repo.path);
+        assert!(guard.refusals.is_empty(), "{:?}", guard.refusals);
+        assert!(guard.overrides.is_empty(), "{:?}", guard.overrides);
+        assert_eq!(current_branch(&repo.path).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn the_config_classifier_knows_commands_from_data() {
+        let listing = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{k}\n{v}\0"))
+                .collect::<String>()
+        };
+
+        // Ordinary configuration is left alone.
+        let guard = RepoGuard::from_listing(&listing(&[
+            ("core.repositoryformatversion", "0"),
+            ("core.filemode", "true"),
+            ("remote.origin.url", "https://example.com/x.git"),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            ("branch.main.remote", "origin"),
+            ("user.email", "someone@example.com"),
+            ("http.proxy", "http://proxy.example:3128"),
+            ("submodule.lib.url", "https://example.com/lib.git"),
+        ]));
+        assert_eq!(guard, RepoGuard::default());
+
+        // Command-valued keys are disarmed by their own names, whatever the
+        // attacker called the driver — and with the value that actually makes
+        // each inert, which for hooks is not the empty string.
+        let guard = RepoGuard::from_listing(&listing(&[
+            ("filter.WeIrD-name.clean", "/tmp/x.sh"),
+            ("core.gitProxy", "/tmp/x.sh"),
+            ("core.hooksPath", "/tmp/hooks"),
+            ("submodule.lib.update", "!/tmp/x.sh"),
+        ]));
+        assert!(guard.refusals.is_empty(), "{:?}", guard.refusals);
+        assert_eq!(
+            guard.overrides,
+            vec![
+                "filter.weird-name.clean=",
+                "core.gitproxy=",
+                "core.hookspath=/dev/null",
+                "submodule.lib.update=",
+            ]
+        );
+        assert_eq!(guard.args().len(), 8, "two argv entries per override");
+
+        // `-c` does not override a remote's upload-pack, so it is a refusal.
+        let guard = RepoGuard::from_listing(&listing(&[
+            ("remote.upstream.uploadpack", "/tmp/x.sh"),
+            ("remote.upstream.receivepack", "/tmp/x.sh"),
+        ]));
+        assert!(guard.overrides.is_empty(), "{:?}", guard.overrides);
+        assert_eq!(guard.refusals.len(), 2, "{:?}", guard.refusals);
+
+        // Anything command-shaped in a namespace we do not understand refuses.
+        for (key, value) in [
+            ("weirdtool.x.command", "/tmp/x.sh"),
+            ("nonsense.pager", "/tmp/x.sh"),
+            ("whatever.key", "!/tmp/x.sh"),
+            ("some.url", "ext::sh -c whatever"),
+        ] {
+            let guard = RepoGuard::from_listing(&listing(&[(key, value)]));
+            assert!(
+                !guard.refusals.is_empty(),
+                "{key} = {value} should refuse, got {guard:?}"
+            );
+        }
     }
 }

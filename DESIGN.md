@@ -359,14 +359,26 @@ permission modes exist to constrain. An agent that gets one Bash call executed
 could otherwise `POST /api/agents/<id>/permission_mode {"mode":"bypass"}` and
 never be asked for approval again.
 
-So the server mints a random 256-bit token at startup, prints it in the URL it
-opens, and requires it on every `/api/*` request and on the `/ws` upgrade
-(header, or query string for the upgrade, which browsers cannot add headers to).
-The pages and their assets stay reachable without it so the browser can
-bootstrap; they contain no data. The token is never written to disk, never
-logged, and never embedded in a served page — it exists only in this process's
-memory and in the URL the operator's browser was opened with, so a local process
-cannot read it. It changes on every restart.
+So the server mints a random 256-bit token at startup and requires it on every
+`/api/*` request and on the `/ws` upgrade (a header, or the query string for the
+upgrade alone, which browsers cannot add headers to). The pages and their assets
+stay reachable without it so the browser can bootstrap; they contain no data. It
+changes on every restart.
+
+**What that achieves, and what it does not.** It stops anything that has not
+been handed the token — a drive-by cross-origin request, and any local process
+that does not go looking. It does **not** put the token out of reach of a
+determined process running as the same user, and nothing can: the browser holds
+it in a profile directory that is on disk and not privileged, so
+`strings …/Local\ Storage/…` recovers it. The exposures the server itself
+controls are kept small — never logged through `tracing`, never embedded in a
+served page, printed only when stdout is a terminal (redirecting to a log file
+would otherwise write it there), handed to the browser through a private 0600
+file rather than a command line that every process can read, and held in
+`sessionStorage` rather than `localStorage` so it does not outlive the browser
+session. Treat this as raising the bar in front of the control plane, not as
+closing it: an agent that goes looking in the browser profile can still recover
+the token.
 
 Relaxing an agent's permission mode is additionally a confirmed action, and the
 change is written into that agent's own event log with its initiator, so it
@@ -393,13 +405,27 @@ Every caller-supplied path — the clone root, a spawn's repository, each
 root. Canonicalising is what makes it real: a symlink inside a root would
 otherwise step outside it.
 
-`git` honours the configuration of the directory it runs in, and several config
-keys are command strings (`core.fsmonitor`, `core.sshCommand`, `core.pager`,
-`diff.external`, …). A directory the user merely unzipped could therefore run
-commands the moment the repo picker scanned it. Every `git` invocation overrides
-those keys with `-c`, disables hooks and optional locks, and pins
-`protocol.ext.allow=never`; clone URLs are restricted to https/ssh/git and
-absolute paths.
+`git` honours the configuration of the directory it runs in, and many config
+keys are command strings. A directory the user merely unzipped can therefore run
+commands the moment the repo picker scans it — `git status` re-hashes files whose
+stat data it cannot trust, and re-hashing runs the repository's own clean filter.
+
+A fixed list of dangerous keys was tried twice and was incomplete both times:
+the second attempt covered `core.fsmonitor` but not `filter.<name>.clean`, whose
+name the attacker chooses. So before touching a repository, its **own** local
+config is read (`git config --local --list`, which reads no working tree and so
+runs no filter) and every command-valued key it declares is disarmed by that
+exact name, with the value that actually makes each inert — `/dev/null` for
+`core.hooksPath`, since blanking that would re-enable the repository's hooks.
+Anything command-shaped that we cannot prove inert makes the repository refuse
+inspection outright, named in the message: `remote.<n>.uploadpack` is one of
+those, because `-c` does not override it (measured — only the `--upload-pack`
+argument does, which `fetch` also passes). The picker shows such a repository as
+"not inspected" and spawning into it is refused.
+
+The residual is the honest one: a key that git executes, whose name matches none
+of the shapes we know and does not end in a command-ish word, would still run.
+Clone URLs are restricted to https/ssh and absolute paths.
 
 ### Endpoints
 ```

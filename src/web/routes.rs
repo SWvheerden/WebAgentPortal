@@ -45,19 +45,31 @@ pub struct AppState {
 /// enough for an agent to `POST /api/agents/<id>/permission_mode {"mode":
 /// "bypass"}` and never be asked again.
 ///
-/// The token is never written to disk, never logged, and never embedded in a
-/// served page; it exists only in this process's memory and in the URL the
-/// operator's browser was opened with.
+/// **What this does and does not achieve.** It stops anything that has not been
+/// handed the token: a drive-by cross-origin request, and any local process
+/// that does not go looking for it. It does **not** make the token unreachable
+/// to a determined process running as the same user, and nothing can: the
+/// browser holds it in its profile, which is on disk and not privileged;
+/// starting the browser puts the URL in another process's argv for a moment;
+/// and a server run as `claude-web > log` writes it to that log. So this raises
+/// the bar rather than closing the hole. The exposures the server itself
+/// controls are kept small — the token is never logged through `tracing`, never
+/// embedded in a served page, printed only to a terminal, and passed to the
+/// browser through a private file rather than a command line — but an agent
+/// that goes looking in the browser profile can still recover it.
 pub struct SessionToken(String);
 
 impl SessionToken {
     pub fn mint() -> Self {
-        // Two v4 UUIDs: 256 bits from the OS random source.
-        Self(format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        ))
+        // 32 bytes straight from the OS: 256 bits, unlike two v4 UUIDs, which
+        // carry 244 because 12 bits are fixed for version and variant.
+        let mut bytes = [0u8; 32];
+        if getrandom::fill(&mut bytes).is_err() {
+            // The OS random source is not optional. Refusing to start beats
+            // serving with a predictable token.
+            panic!("the operating system random source is unavailable");
+        }
+        Self(bytes.iter().map(|b| format!("{b:02x}")).collect())
     }
 
     pub fn as_str(&self) -> &str {
@@ -229,8 +241,12 @@ pub fn fetch_site_allowed(site: Option<&str>) -> bool {
     }
 }
 
-/// The token a request carries, from the header or — for the socket upgrade,
+/// The token a request carries: the header, or — only for the socket upgrade,
 /// where a browser cannot set headers — the query string.
+///
+/// The query form is confined to `/ws` deliberately. Query strings end up in
+/// logs, shell history and referrers, which is the kind of exposure the token
+/// is trying to avoid.
 fn token_of(req: &Request) -> Option<String> {
     if let Some(value) = req
         .headers()
@@ -238,6 +254,9 @@ fn token_of(req: &Request) -> Option<String> {
         .and_then(|v| v.to_str().ok())
     {
         return Some(value.trim().to_string());
+    }
+    if req.uri().path() != "/ws" {
+        return None;
     }
     let query = req.uri().query()?;
     query.split('&').find_map(|pair| {
