@@ -178,33 +178,54 @@ group *M*, unrelated to *N*.
 
 So the supervisor keeps a running list of those groups instead of trying to find
 them after the fact. The process tree under the CLI is snapshotted (`ps -axo
-pid,ppid,pgid`, walked breadth-first with a visited set, in `spawn_blocking`)
-shortly after each tool call starts and again when it returns or the turn ends;
-the distinct process groups found are accumulated over the session, bounded, and
-never replaced — a tool call that has already returned can still have left
-something running.
+pid,ppid,pgid,etime`, walked breadth-first with a visited set, in
+`spawn_blocking`) several times in the first quarter-second of each tool call,
+again when it returns or the turn ends, and every couple of seconds while the
+agent is otherwise busy and there is something to keep track of. The early
+samples are what catch a `&` job: it stays in the tool shell's process group,
+and that shell is a descendant of the CLI only for as long as it lives, which
+for `sleep … & echo done` is a few milliseconds. A single sample at 25ms missed
+that case in testing; a short cascade caught it every time. The groups found are accumulated over the
+session; a group is dropped only once nothing of it is left, never because it is
+old, because a group recorded early and still running is precisely the one worth
+keeping.
+
+Nothing is signalled on the strength of a group id alone. A group counts as the
+agent's only while some live member **started before the last moment we proved
+the group was ours** — which means the group has been non-empty ever since, and
+a process group id cannot be handed to something else while its group still has
+members. Pid identity is deliberately not used as proof: pids recycle too (macOS
+wraps at 99998, and a session of parallel agents shelling out to builds churns
+them), so a recorded pid can come back as something else entirely. Each snapshot
+re-proves what it can and moves that timestamp forward, which is what keeps a
+`npm run dev` reachable after it has forked workers and lost its original
+parent.
 
 Teardown then runs on **every** exit path, not only an operator Stop: a crash, a
-budget exhaustion, a non-zero exit. It SIGTERMs each recorded group that still
-holds a process from the snapshot, waits the 5s grace, and SIGKILLs whatever is
-left. It is awaited inside the runner, so the agent is not deregistered — and
-the server is not allowed to finish shutting down — until it has completed.
-Without that, shutdown returned as soon as the CLI died and the escalation was
-cancelled with the runtime. pid 1, the server's own pid and the server's own
-process group are never signalled, and a group is only signalled while it still
-holds a process we recorded, so a recycled group id is not caught in the blast.
+budget exhaustion, a non-zero exit. It SIGTERMs each group that still passes that
+test, waits the 5s grace, and SIGKILLs whatever is left. It is awaited inside the
+runner, so the agent is not deregistered — and the server is not allowed to
+finish shutting down — until it has completed. Without that, shutdown returned as
+soon as the CLI died and the escalation was cancelled with the runtime. pid 1,
+the server's own pid and the server's own process group are never signalled.
 
-**Residual limitation, not fixed and not fixable here.** A process the agent
-*detaches* — `nohup … &`, `setsid`, anything reparented to pid 1 before a
-snapshot sees it — is in neither the CLI's process group nor its subtree at any
-point we look. Nothing connects it back to the agent, and macOS has no cgroup or
-PID-namespace equivalent to catch it, so it survives both Stop and server
-shutdown. Confirmed live: a `nohup sleep 941 &` started by a tool call outlives
-both. The same applies to anything that starts and detaches entirely between two
-snapshots, and to a server killed with SIGKILL, which runs no teardown at all.
-When a worktree removal is refused because something is still holding it, git's
-own stderr is surfaced to the operator with the path and a "delete anyway" hint
-rather than a generic failure.
+**Residual limitation.** A process that leaves the CLI's subtree before any
+snapshot sees it is out of reach: nothing connects it back to the agent, and
+macOS has no cgroup or PID-namespace equivalent to catch it. This needs no
+deliberate detaching — a plain `&` in a tool call that returns quickly reparents
+to init just as fast as `nohup` does. The early snapshot exists precisely for
+this case and closes most of it, because a `&` job in a non-interactive shell
+stays in that shell's process group, and the shell is still a descendant of the
+CLI for as long as the tool call runs. What remains uncatchable is a process that
+both starts *and* is orphaned inside the gap between two samples — sampling can
+never make that impossible, only unlikely — one that calls `setsid` for itself,
+and anything at all when the server is killed with SIGKILL, which runs no
+teardown. The conservative ownership test above also
+means a group whose every live member is younger than our last proof is left
+alone: leaving a build running is a nuisance, signalling the user's editor is
+not. When a worktree removal is then refused because something is still holding
+it, git's own stderr is surfaced to the operator with the path and a "delete
+anyway" hint rather than a generic failure.
 
 ### Shutdown
 SIGTERM every child → 5s → SIGKILL stragglers, then the same escalation for any

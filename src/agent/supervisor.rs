@@ -475,7 +475,8 @@ impl Supervisor {
             commands,
             stop_requested: false,
             last_stderr: None,
-            sweep: Arc::new(std::sync::Mutex::new(Sweep::default())),
+            sweep: Arc::new(RwLock::new(Sweep::default())),
+            last_refresh: std::time::Instant::now(),
             grace: STOP_GRACE,
             recently_sent: std::collections::VecDeque::new(),
         };
@@ -611,8 +612,7 @@ impl Supervisor {
 
         if self.is_running(id).await {
             self.stop(id).await.ok();
-            self.await_stop(id, STOP_GRACE + Duration::from_secs(1))
-                .await;
+            self.await_stop(id, Self::teardown_deadline()).await;
         }
 
         let report = safety_for(&record).await;
@@ -888,7 +888,10 @@ struct Runner {
     /// tool call in a new group, and by the time the CLI is gone its
     /// descendants have reparented to init — so the list has to be built while
     /// the agent is alive, not looked up when it dies.
-    sweep: Arc<std::sync::Mutex<Sweep>>,
+    sweep: Arc<RwLock<Sweep>>,
+    /// When the sweep was last refreshed, so activity can keep the ownership
+    /// proof fresh without a `ps` per event.
+    last_refresh: std::time::Instant,
     /// How long a process group gets between SIGTERM and SIGKILL. A field so
     /// tests can drive the escalation without waiting out the real grace.
     grace: Duration,
@@ -922,7 +925,8 @@ impl Runner {
                     None => {
                         self.cmd_closed = true;
                         self.stop_requested = true;
-                        self.child.stop(STOP_GRACE, self.sweep_snapshot());
+                        let known = self.sweep_snapshot().await;
+                        self.child.stop(STOP_GRACE, known);
                     }
                 },
             }
@@ -1013,19 +1017,19 @@ impl Runner {
         });
     }
 
-    /// Read the accumulated sweep. The lock is never held across an await.
-    fn sweep_snapshot(&self) -> Sweep {
-        match self.sweep.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+    /// Read the accumulated sweep.
+    async fn sweep_snapshot(&self) -> Sweep {
+        self.sweep.read().await.clone()
     }
 
-    /// Snapshot the process tree and fold it into what we already know.
+    /// Run a snapshot cycle and fold the result into what we already know.
     ///
-    /// Scheduled off the runner loop so a `ps` never delays event handling. The
-    /// small delay lets a tool call's process actually exist: `claude`
-    /// announces the call before its child is up.
+    /// Scheduled off the runner loop so a `ps` never delays event handling.
+    /// Two snapshots follow each tool call starting, because the shape we are
+    /// chasing changes within milliseconds: an early one catches a `&` job
+    /// while it is still in the tool shell's process group and the shell is
+    /// still a descendant of the CLI, and a later one catches a process that
+    /// took a moment to come up.
     fn refresh_sweep(&self, delay: Duration) {
         let pid = self.child.pid as i32;
         if pid <= 0 {
@@ -1036,16 +1040,14 @@ impl Runner {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            let Ok(found) = tokio::task::spawn_blocking(move || process::snapshot_sweep(pid)).await
-            else {
-                return;
-            };
-            if found.is_empty() {
-                return;
-            }
-            match shared.lock() {
-                Ok(mut guard) => guard.merge(found),
-                Err(poisoned) => poisoned.into_inner().merge(found),
+            // Held across the cycle so two refreshes cannot interleave and undo
+            // each other's pruning.
+            let mut guard = shared.write().await;
+            let known = guard.clone();
+            if let Ok(updated) =
+                tokio::task::spawn_blocking(move || process::refresh_sweep(known, pid)).await
+            {
+                *guard = updated;
             }
         });
     }
@@ -1058,7 +1060,7 @@ impl Runner {
     /// return (and the agent is not deregistered) until the escalation has had
     /// its chance. Shutdown waits on exactly that.
     async fn tear_down_groups(&mut self) -> Vec<i32> {
-        let sweep = self.sweep_snapshot();
+        let sweep = self.sweep_snapshot().await;
         if sweep.is_empty() {
             return Vec::new();
         }
@@ -1066,6 +1068,12 @@ impl Runner {
         let alive = tokio::task::spawn_blocking(move || process::surviving_groups(&probe))
             .await
             .unwrap_or_default();
+        tracing::debug!(
+            agent = %self.id,
+            known = ?sweep.group_ids(),
+            ?alive,
+            "tearing down tool-call process groups"
+        );
         if alive.is_empty() {
             return Vec::new();
         }
@@ -1073,18 +1081,51 @@ impl Runner {
         tracing::info!(agent = %self.id, groups = ?alive, "terminating process groups left by tool calls");
         self.child
             .signal_groups(&alive, nix::sys::signal::Signal::SIGTERM);
-        tokio::time::sleep(self.grace).await;
 
-        let probe = sweep;
-        let stubborn = tokio::task::spawn_blocking(move || process::surviving_groups(&probe))
-            .await
-            .unwrap_or_default();
-        if !stubborn.is_empty() {
-            tracing::warn!(agent = %self.id, groups = ?stubborn, "process groups ignored SIGTERM; sending SIGKILL");
-            self.child
-                .signal_groups(&stubborn, nix::sys::signal::Signal::SIGKILL);
+        // Poll rather than sleeping out the whole grace: a group that dies on
+        // SIGTERM — nearly all of them — should not hold the agent open, and
+        // hold the operator's Resume with it, for five seconds.
+        let poll = Duration::from_millis(250).min(self.grace);
+        let deadline = tokio::time::Instant::now() + self.grace;
+        loop {
+            tokio::time::sleep(poll).await;
+            let probe = sweep.clone();
+            let left = tokio::task::spawn_blocking(move || process::surviving_groups(&probe))
+                .await
+                .unwrap_or_default();
+            if left.is_empty() {
+                return alive;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(agent = %self.id, groups = ?left, "process groups ignored SIGTERM; sending SIGKILL");
+                self.child
+                    .signal_groups(&left, nix::sys::signal::Signal::SIGKILL);
+                return alive;
+            }
         }
-        alive
+    }
+
+    /// Keep the ownership proof fresh while the agent is doing anything.
+    ///
+    /// A group is only provably ours while something in it predates our last
+    /// proof, so a long-lived process that forks workers and then loses its
+    /// parent stays reachable only if the proof keeps moving. Throttled, and
+    /// skipped entirely until there is something to keep proof of.
+    fn refresh_on_activity(&mut self) {
+        const EVERY: Duration = Duration::from_secs(2);
+        if self.last_refresh.elapsed() < EVERY {
+            return;
+        }
+        let tracking = self
+            .sweep
+            .try_read()
+            .map(|sweep| !sweep.is_empty())
+            .unwrap_or(false);
+        if !tracking {
+            return;
+        }
+        self.last_refresh = std::time::Instant::now();
+        self.refresh_sweep(Duration::ZERO);
     }
 
     async fn on_action(&mut self, action: Action) {
@@ -1093,10 +1134,17 @@ impl Runner {
                 if kind == EventKind::User && self.is_echo(&payload) {
                     return;
                 }
+                self.refresh_on_activity();
                 match kind {
-                    // A tool call is starting: give its process a moment to
-                    // exist, then look for the group it was put in.
-                    EventKind::ToolUse => self.refresh_sweep(Duration::from_millis(250)),
+                    // A tool call is starting. Look twice: once almost
+                    // immediately, which is what catches a `&` job before its
+                    // shell exits and it reparents to init, and once after it
+                    // has had a moment to come up.
+                    EventKind::ToolUse => {
+                        for ms in [0, 8, 20, 45, 90, 250] {
+                            self.refresh_sweep(Duration::from_millis(ms));
+                        }
+                    }
                     // A tool call returned, or the turn ended. Anything still
                     // running was left behind deliberately — a dev server, a
                     // build — and is exactly what has to be caught.
@@ -1183,7 +1231,8 @@ impl Runner {
             }
             AgentCommand::Stop => {
                 self.stop_requested = true;
-                self.child.stop(STOP_GRACE, self.sweep_snapshot());
+                let known = self.sweep_snapshot().await;
+                self.child.stop(STOP_GRACE, known);
             }
         }
     }
@@ -1430,7 +1479,8 @@ mod tests {
                 commands: Arc::new(RwLock::new(Vec::new())),
                 stop_requested: false,
                 last_stderr: None,
-                sweep: Arc::new(std::sync::Mutex::new(sweep)),
+                sweep: Arc::new(RwLock::new(sweep)),
+                last_refresh: std::time::Instant::now(),
                 grace: Duration::from_millis(20),
                 recently_sent: std::collections::VecDeque::new(),
             };
@@ -1792,11 +1842,15 @@ mod tests {
         }
 
         /// `process_group(0)` makes the child its own group leader, so the
-        /// group id is the pid.
+        /// group id is the pid. Recorded as seen just now, exactly as a live
+        /// snapshot would have.
         fn sweep(&self) -> Sweep {
             Sweep {
-                pids: vec![self.pid()],
-                groups: vec![self.pid()],
+                groups: vec![crate::agent::process::GroupRecord {
+                    pgid: self.pid(),
+                    first_seen_ms: crate::db::now_ms(),
+                    proven_ms: crate::db::now_ms(),
+                }],
             }
         }
 
