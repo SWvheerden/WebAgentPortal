@@ -91,6 +91,22 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 .errbox { border: 1px solid var(--err); color: var(--err); border-radius: 4px; padding: 6px 8px; margin: 8px 0; white-space: pre-wrap; }
 
 /* agent cards */
+/* Rate-limit meters. Fixed row order, so a window appearing or resetting does
+   not make the panel jump around. */
+.meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.meter { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+.meter .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 11px; }
+.meter .head .pct { font-size: 15px; }
+.meter .bar { height: 6px; margin: 6px 0 4px; border-radius: 3px; background: var(--bg); border: 1px solid var(--line); overflow: hidden; }
+.meter .bar > span { display: block; height: 100%; background: var(--accent); transition: width .3s ease; }
+.meter.warn .bar > span { background: var(--warn); }
+.meter.warn .pct { color: var(--warn); }
+.meter.err .bar > span { background: var(--err); }
+.meter.err .pct { color: var(--err); }
+.meter .foot { color: var(--dim); font-size: 11px; }
+/* A refused request is not a footnote: outline the whole panel. */
+.panel.warn-tint { border-color: var(--err); }
+
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
 .card h3 { margin: 0 0 4px; font-size: 13px; }

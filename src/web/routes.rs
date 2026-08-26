@@ -162,6 +162,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/repos/fetch", post(fetch_repo))
         .route("/api/repos/clone", post(clone_repo))
         .route("/api/agents", get(list_agents).post(spawn_agent))
+        .route("/api/rate_limit", get(get_rate_limit))
         .route("/api/agents/{id}", get(get_agent).delete(delete_agent))
         .route("/api/agents/{id}/events", get(get_events))
         .route("/api/agents/{id}/message", post(post_message))
@@ -552,6 +553,12 @@ async fn clone_repo(
 async fn list_agents(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let agents = state.sup.list().await?;
     Ok(Json(json!({ "agents": agents })))
+}
+
+/// The last rate-limit snapshot, so a page loaded between two events still has
+/// numbers to show. `null` until some agent's CLI reports one.
+async fn get_rate_limit(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "rate_limit": state.sup.rate_limit().await }))
 }
 
 async fn get_agent(
@@ -945,6 +952,7 @@ mod tests {
             ("GET", "/api/health"),
             ("GET", "/api/repos"),
             ("GET", "/api/agents"),
+            ("GET", "/api/rate_limit"),
             ("GET", "/api/config"),
             ("PUT", "/api/config"),
             ("POST", "/api/agents"),

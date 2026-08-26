@@ -5,6 +5,8 @@
 //! unrecognised `type` becomes [`CliEvent::Unknown`] rather than an error, so a
 //! protocol change surfaces in the UI instead of killing the reader.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -216,6 +218,124 @@ impl ControlResponseLine {
     }
 }
 
+/// A `rate_limit_event`: the account's usage against its windows. The CLI emits
+/// one whenever the numbers change, which in practice is once per API request.
+///
+/// The envelope is snake_case but `rate_limit_info` is camelCase — that is the
+/// CLI's shape, not a typo. Unknown keys are kept in `extra` so a field added
+/// upstream reaches the UI without a parser change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitLine {
+    pub rate_limit_info: RateLimitInfo,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Usage against the rate-limit windows. Only `status` is guaranteed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitInfo {
+    /// `allowed`, `allowed_warning` or `rejected`.
+    pub status: String,
+    /// Unix **seconds** (not millis) at which the governing window resets.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+    /// Which window is governing: `five_hour`, `seven_day`, `overage`, …
+    #[serde(default)]
+    pub rate_limit_type: Option<String>,
+    /// Fraction of the governing window used, 0.0–1.0.
+    #[serde(default)]
+    pub utilization: Option<f64>,
+    #[serde(default)]
+    pub is_using_overage: Option<bool>,
+    /// Per-window usage, keyed `five_hour` / `seven_day` /
+    /// `seven_day_overage_included`. Absent on accounts that do not report it.
+    #[serde(default)]
+    pub unified_windows: BTreeMap<String, RateLimitWindow>,
+    /// Everything else the CLI sent: `overageStatus`, `errorCode`, and whatever
+    /// is added next.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// One window's usage. Both fields are required in the CLI's schema but
+/// optional here: a window the CLI reports oddly should cost that one meter,
+/// not turn the whole event into an unrecognised line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitWindow {
+    /// Fraction used, 0.0–1.0.
+    #[serde(default)]
+    pub utilization: Option<f64>,
+    /// Unix seconds.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+}
+
+/// A `tool_progress` line. The CLI emits one every 30s for any tool still
+/// running (`heartbeat`), and one per retry when a subagent's API call fails.
+///
+/// The `bash_progress`-derived variant carries incremental output, but the CLI
+/// gates that behind `CLAUDE_CODE_REMOTE`/`CLAUDE_CODE_CONTAINER_ID`, so a
+/// local child never sends it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolProgressLine {
+    /// Synthetic on a heartbeat: `<real tool_use_id>-heartbeat-<n>`. It never
+    /// matches a `tool_use` block, so it is not a key to look tools up by.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    /// The tool the heartbeat is about for a top-level call, and the enclosing
+    /// Agent call for one inside a subagent — *not* a plain "is nested" flag.
+    #[serde(default)]
+    pub parent_tool_use_id: Option<String>,
+    #[serde(default)]
+    pub elapsed_time_seconds: Option<u64>,
+    #[serde(default)]
+    pub heartbeat: Option<bool>,
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    /// Present only while a subagent's API call is being retried.
+    #[serde(default)]
+    pub subagent_retry: Option<SubagentRetry>,
+}
+
+/// A subagent whose API call failed and is being retried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubagentRetry {
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    #[serde(default)]
+    pub retry_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub error_status: Option<i64>,
+    #[serde(default)]
+    pub error_category: Option<String>,
+}
+
+impl SubagentRetry {
+    /// "subagent Explore retrying (2/3) after HTTP 529" — the operator-facing
+    /// line. `subagent_type` comes from the enclosing event.
+    pub fn describe(&self, subagent_type: Option<&str>) -> String {
+        let who = subagent_type.unwrap_or("subagent");
+        let mut text = format!("subagent {who} is retrying");
+        if let (Some(n), Some(max)) = (self.attempt, self.max_retries) {
+            text.push_str(&format!(" ({n}/{max})"));
+        }
+        match (self.error_status, self.error_category.as_deref()) {
+            (Some(code), _) => text.push_str(&format!(" after HTTP {code}")),
+            (None, Some(cat)) => text.push_str(&format!(" after {cat}")),
+            (None, None) => {}
+        }
+        text
+    }
+}
+
 /// A recognised line from the CLI's stdout.
 #[derive(Debug, Clone)]
 pub enum CliEvent {
@@ -227,6 +347,10 @@ pub enum CliEvent {
     StreamEvent(Value),
     ControlRequest(ControlRequestLine),
     ControlResponse(ControlResponseLine),
+    /// Account usage against the rate-limit windows.
+    RateLimit(RateLimitLine),
+    /// A tool is still running, or a subagent is retrying.
+    ToolProgress(Box<ToolProgressLine>),
     /// A line we could not classify. `reason` explains why; `kind` is the
     /// reported `type` (or `"<invalid json>"`).
     Unknown {
@@ -245,6 +369,8 @@ impl CliEvent {
             CliEvent::StreamEvent(_) => "stream_event",
             CliEvent::ControlRequest(_) => "control_request",
             CliEvent::ControlResponse(_) => "control_response",
+            CliEvent::RateLimit(_) => "rate_limit_event",
+            CliEvent::ToolProgress(_) => "tool_progress",
             CliEvent::Unknown { kind, .. } => kind,
         }
     }
@@ -304,6 +430,8 @@ pub fn parse_line(line: &str) -> ParsedLine {
         "stream_event" => CliEvent::StreamEvent(raw.clone()),
         "control_request" => typed::<ControlRequestLine>(&raw, CliEvent::ControlRequest),
         "control_response" => typed::<ControlResponseLine>(&raw, CliEvent::ControlResponse),
+        "rate_limit_event" => typed::<RateLimitLine>(&raw, CliEvent::RateLimit),
+        "tool_progress" => typed::<ToolProgressLine>(&raw, |l| CliEvent::ToolProgress(Box::new(l))),
         "" => CliEvent::Unknown {
             kind: "<no type>".to_string(),
             reason: "line has no `type` field".to_string(),
@@ -642,6 +770,91 @@ mod tests {
         assert_eq!(uses[0].name, "Bash");
         assert_eq!(uses[0].id.as_deref(), Some("tu_1"));
         assert_eq!(uses[0].label(), "Bash: cargo test");
+    }
+
+    /// Captured verbatim from `claude` 2.1.246 over `--output-format
+    /// stream-json`. Note the camelCase inside `rate_limit_info`.
+    #[test]
+    fn parses_a_rate_limit_event() {
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1787745600,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.02,"resetsAt":1787745600},"seven_day":{"utilization":0.03,"resetsAt":1788217200}}},"uuid":"ba58a7cc","session_id":"1044"}"#;
+        let parsed = parse_line(line);
+        let CliEvent::RateLimit(rl) = parsed.event else {
+            panic!("expected rate_limit_event, got {:?}", parsed.event);
+        };
+        let info = rl.rate_limit_info;
+        assert_eq!(info.status, "allowed");
+        assert_eq!(info.rate_limit_type.as_deref(), Some("five_hour"));
+        assert_eq!(info.resets_at, Some(1787745600));
+        assert_eq!(info.is_using_overage, Some(false));
+        assert_eq!(info.unified_windows["five_hour"].utilization, Some(0.02));
+        assert_eq!(
+            info.unified_windows["seven_day"].resets_at,
+            Some(1788217200)
+        );
+        // Fields we do not model are carried, not dropped.
+        assert_eq!(info.extra["overageStatus"], json!("rejected"));
+    }
+
+    /// The account-wide minimum: `status` alone. Everything else is optional in
+    /// the CLI's own schema, so nothing else may be required here either.
+    #[test]
+    fn a_rate_limit_event_needs_only_a_status() {
+        let parsed =
+            parse_line(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}"#);
+        let CliEvent::RateLimit(rl) = parsed.event else {
+            panic!("expected rate_limit_event");
+        };
+        assert_eq!(rl.rate_limit_info.status, "rejected");
+        assert!(rl.rate_limit_info.unified_windows.is_empty());
+    }
+
+    /// Captured verbatim from `claude` 2.1.246. Note both ids: the heartbeat's
+    /// own is synthetic, and the parent is the tool actually running.
+    #[test]
+    fn parses_a_tool_progress_heartbeat() {
+        let line = r#"{"type":"tool_progress","tool_use_id":"toolu_01XdGRi8MNS3Jmfje1yPLXPv-heartbeat-0","tool_name":"Bash","parent_tool_use_id":"toolu_01XdGRi8MNS3Jmfje1yPLXPv","elapsed_time_seconds":30,"heartbeat":true,"session_id":"688e8f88","uuid":"5250c582"}"#;
+        let CliEvent::ToolProgress(prog) = parse_line(line).event else {
+            panic!("expected tool_progress");
+        };
+        assert_eq!(prog.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(prog.elapsed_time_seconds, Some(30));
+        assert_eq!(prog.heartbeat, Some(true));
+        assert_eq!(
+            prog.parent_tool_use_id.as_deref(),
+            Some("toolu_01XdGRi8MNS3Jmfje1yPLXPv")
+        );
+        assert!(prog.subagent_retry.is_none());
+    }
+
+    #[test]
+    fn parses_a_subagent_retry_and_describes_it() {
+        let line = r#"{"type":"tool_progress","tool_use_id":"tu_9","tool_name":"Task","parent_tool_use_id":null,"elapsed_time_seconds":0,"subagent_type":"Explore","subagent_retry":{"agent_id":"a1","attempt":2,"max_retries":3,"retry_delay_ms":1000,"error_status":529,"error_category":"overloaded"},"uuid":"u","session_id":"s"}"#;
+        let CliEvent::ToolProgress(prog) = parse_line(line).event else {
+            panic!("expected tool_progress");
+        };
+        let retry = prog.subagent_retry.as_ref().expect("retry");
+        assert_eq!(
+            retry.describe(prog.subagent_type.as_deref()),
+            "subagent Explore is retrying (2/3) after HTTP 529"
+        );
+    }
+
+    /// A `null` `error_status` is in the CLI's schema, so the description must
+    /// fall back to the category rather than printing "HTTP null".
+    #[test]
+    fn a_retry_without_a_status_code_names_the_category() {
+        let retry = SubagentRetry {
+            agent_id: None,
+            attempt: None,
+            max_retries: None,
+            retry_delay_ms: None,
+            error_status: None,
+            error_category: Some("timeout".into()),
+        };
+        assert_eq!(
+            retry.describe(None),
+            "subagent subagent is retrying after timeout"
+        );
     }
 
     #[test]

@@ -27,6 +27,9 @@ These are load-bearing — several contradict what the published docs imply.
 | F9 | The `initialize` control request returns the **full command list** with `name`, `description`, `argumentHint`. | `control_response` inspected. |
 | F10 | `init` advertises `capabilities: [interrupt_receipt_v1, interrupt_cancel_queued_v1, msg_lifecycle_v1]`. | Observed on every launch. |
 | F11 | On-disk transcripts (`~/.claude/projects/*/*.jsonl`) are **documented as an unstable internal format**. Not a store we may read. | Official docs. |
+| F13 | The CLI emits a **`rate_limit_event`** whenever the account's usage changes, in practice once per API request. `rate_limit_info` is camelCase inside a snake_case envelope: `status` (`allowed`｜`allowed_warning`｜`rejected`), and optionally `resetsAt` (unix **seconds**), `rateLimitType`, `utilization`, `isUsingOverage` and `unifiedWindows` (`five_hour`, `seven_day`, `seven_day_overage_included`, each `{utilization, resetsAt}`). Present since at least 2.1.241. | Captured from 2.1.241 and 2.1.246; shape cross-checked against the CLI's own schema. |
+| F14 | The CLI emits a **`tool_progress`** every 30s for any tool still running (`heartbeat: true`), carrying `tool_name`, `elapsed_time_seconds`, and two ids that are not what they look like: `tool_use_id` is **synthetic** (`<real tool_use_id>-heartbeat-<n>`, so it matches no `tool_use` block) and `parent_tool_use_id` is the **tool actually running**, not a nesting flag. A variant with no heartbeat carries `subagent_retry` while a subagent's API call is being retried. The `bash_progress`-derived variant, which would carry incremental output, is gated behind `CLAUDE_CODE_REMOTE`/`CLAUDE_CODE_CONTAINER_ID`, so a local child never sends it. | Captured from 2.1.246: a 95s foreground `Bash` yielded `toolu_01Xd…-heartbeat-0` with `parent_tool_use_id` = `toolu_01Xd…`. 30s interval read from the CLI's own timer. |
+| F14a | The Agent tool is **exempt** from heartbeats, and a tool running *inside* a subagent was not observed to emit `tool_progress` on the parent's stream at all — so a long subagent is invisible to this signal from both directions. Stated as an observation, not a guarantee. | A delegated 40s `Bash` inside a `general-purpose` subagent produced no `tool_progress`; the exemption is explicit in the CLI's heartbeat timer. |
 | F12 | Remote Control (`claude remote-control`) is a persistent server, ≤32 concurrent sessions, outbound-only, but **scoped to one directory** and requiring a full-scope subscription login. Compatibility with `-p` is **undocumented and untested** (testing would create a real session on the account). | `claude remote-control --help` + docs. |
 
 ### Risk register
@@ -35,6 +38,10 @@ These are load-bearing — several contradict what the published docs imply.
   stability guarantee. Mitigation: pin a known-good CLI version in config, assert on
   `system/init` at startup, log-and-surface unrecognised event types rather than crashing,
   and keep every raw event in the DB so nothing is lost to a parser gap.
+  That fallback is a safety net, not a resting place: an event type seen in practice gets a
+  parser arm. `rate_limit_event` and `tool_progress` (F13, F14) are gauges rather than
+  transcript entries, so both are handled without a row in `events` and without a toast —
+  persisting a 30s heartbeat buries the transcript it is meant to annotate.
 - **F4 means the approval UI is not a complete audit trail.** Some tool calls execute without
   ever asking. The transcript shows them; the approval queue does not.
 
@@ -466,13 +473,19 @@ POST /api/agents                spawn
 POST /api/agents/:id/{interrupt|stop|resume|rename}
 DEL  /api/agents/:id            with ?force=
 GET  /api/agents/:id/events?after=<seq>
+GET  /api/rate_limit            last usage snapshot (null until one arrives)
 GET  /api/config, PUT /api/config
 WS   /ws                        multiplexed, {agent_id, ...}-tagged envelope
 ```
 
 One WebSocket serves both dashboard and detail views: one reconnect path, one schema.
 Client→server: `send_message`, `permission_decision`, `interrupt`, `subscribe{agent_id, after_seq}`.
-Server→client: `event`, `status`, `permission_request`, `partial`, `clone_progress`.
+Server→client: `event`, `status`, `permission_request`, `partial`, `clone_progress`,
+`rate_limit`.
+
+`rate_limit` carries no `agent_id`: every agent's CLI reports the same account, so the last
+snapshot to arrive is the truth for all of them. The supervisor keeps it so a page loaded
+between two API calls has numbers to show, which is what `GET /api/rate_limit` serves.
 
 ### Replay
 Cursor-based. The client holds its last-seen `seq`; on reconnect it sends the cursor and
@@ -494,6 +507,13 @@ ahead of a gap.
 `cargo build` yields one self-contained binary; no npm, no bundler. Terminal-styled
 monospace transcript pane — structured events underneath (tool calls as collapsible
 blocks), terminal look on top.
+
+### Usage panel
+The dashboard shows one meter per rate-limit window — session (5 hours), week (7 days), and
+the overage-included week where the account reports it — each with its utilization and when
+it resets. Hidden entirely until a `rate_limit_event` has arrived, amber past 60% and red
+past 90%. An account that reports no per-window breakdown still names a governing window,
+which is shown instead of an empty panel.
 
 ### Spawn form
 Repo picker (§6) · task name (auto-filled from folder, editable) · branch name preview ·

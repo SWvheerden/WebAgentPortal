@@ -18,7 +18,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use super::protocol::{
-    self, CliEvent, EventKind, LaunchArgs, PermissionRequest, SlashCommand, tool_uses,
+    self, CliEvent, EventKind, LaunchArgs, PermissionRequest, RateLimitInfo, SlashCommand,
+    ToolProgressLine, tool_uses,
 };
 use super::state::Transition;
 
@@ -67,8 +68,37 @@ pub enum Action {
     },
     /// The session id the CLI reported.
     SessionId(String),
+    /// Account usage against the rate-limit windows. Account-wide, not this
+    /// agent's: the last one to arrive is the truth for every agent.
+    RateLimit(Box<RateLimitInfo>),
+    /// Something the operator should see as a toast, with no transcript entry
+    /// of its own — a subagent retrying, say.
+    Notice { level: String, text: String },
     /// A line we could not classify — logged and surfaced, never fatal.
     Unrecognised { kind: String, reason: String },
+}
+
+/// The tool a heartbeat is about, given the heartbeat's own `tool_use_id`.
+///
+/// The CLI mints that id as `<real tool_use_id>-heartbeat-<n>`, so it never
+/// matches a `tool_use` block on its own. `None` when the id is not in that
+/// shape, which is the signal that this reasoning does not apply.
+fn heartbeat_origin(tool_use_id: &str) -> Option<&str> {
+    let (origin, counter) = tool_use_id.rsplit_once("-heartbeat-")?;
+    (!origin.is_empty() && !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()))
+        .then_some(origin)
+}
+
+/// `90` → `"1m30s"`. Heartbeats arrive every 30s, so minutes matter quickly.
+fn fmt_elapsed(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let (m, s) = (seconds / 60, seconds % 60);
+    if m < 60 {
+        return format!("{m}m{s:02}s");
+    }
+    format!("{}h{:02}m", m / 60, m % 60)
 }
 
 /// Turns CLI output lines into [`Action`]s. Holds only the small amount of
@@ -76,7 +106,17 @@ pub enum Action {
 #[derive(Debug, Default)]
 pub struct Dispatcher {
     saw_init: bool,
+    /// `tool_use_id` → the label shown while that tool runs, so a heartbeat can
+    /// say "Bash: cargo test — 60s" instead of the bare tool name. Tool ids do
+    /// not outlive their turn, so this is cleared at every `result`.
+    tool_labels: HashMap<String, String>,
 }
+
+/// How many in-flight tool labels to remember before dropping the lot. A bound
+/// rather than a cache: a turn wide enough to hit it loses labels, not
+/// heartbeats — an unmatched heartbeat still reports progress, just under the
+/// bare tool name.
+const MAX_TRACKED_TOOLS: usize = 64;
 
 impl Dispatcher {
     pub fn new() -> Self {
@@ -87,6 +127,28 @@ impl Dispatcher {
     /// assertion from the risk register.
     pub fn saw_init(&self) -> bool {
         self.saw_init
+    }
+
+    /// The `Working` label for a heartbeat: the running tool's own label when we
+    /// still have it, the bare tool name otherwise, with the elapsed time
+    /// appended.
+    ///
+    /// `None` when the line carries no elapsed time, which would make the label
+    /// a step backwards from whatever is already showing.
+    fn progress_label(&self, prog: &ToolProgressLine) -> Option<String> {
+        let elapsed = prog.elapsed_time_seconds?;
+        let id = prog.tool_use_id.as_deref();
+        // A heartbeat's own id is synthetic; the tool it is about is
+        // `heartbeat_origin`, falling back to the parent for anything else.
+        let origin = id
+            .and_then(heartbeat_origin)
+            .or(prog.parent_tool_use_id.as_deref());
+        let base = origin
+            .or(id)
+            .and_then(|id| self.tool_labels.get(id))
+            .cloned()
+            .or_else(|| prog.tool_name.clone())?;
+        Some(format!("{base} — {}", fmt_elapsed(elapsed)))
     }
 
     /// Interpret one line of stdout.
@@ -120,7 +182,14 @@ impl Dispatcher {
                     payload: raw,
                 });
                 for use_ in tool_uses(&msg) {
-                    out.push(Action::StatusDetail(Some(use_.label())));
+                    let label = use_.label();
+                    if let Some(id) = use_.id.clone() {
+                        if self.tool_labels.len() >= MAX_TRACKED_TOOLS {
+                            self.tool_labels.clear();
+                        }
+                        self.tool_labels.insert(id, label.clone());
+                    }
+                    out.push(Action::StatusDetail(Some(label)));
                     out.push(Action::Persist {
                         kind: EventKind::ToolUse,
                         payload: json!({
@@ -147,6 +216,7 @@ impl Dispatcher {
                 if let Some(cost) = res.total_cost_usd {
                     out.push(Action::Cost(cost));
                 }
+                self.tool_labels.clear();
                 out.push(Action::StatusDetail(None));
                 out.push(Action::Transition(Transition::TurnEnded));
             }
@@ -186,6 +256,23 @@ impl Dispatcher {
                         payload: res.payload().cloned().unwrap_or(Value::Null),
                         is_error: res.is_error(),
                     });
+                }
+            }
+            CliEvent::RateLimit(line) => {
+                // Not persisted: it is a gauge, not a transcript entry, and one
+                // arrives per API request.
+                out.push(Action::RateLimit(Box::new(line.rate_limit_info)));
+            }
+            CliEvent::ToolProgress(prog) => {
+                // A retry is news; a heartbeat is only a label refresh. Neither
+                // belongs in the transcript.
+                if let Some(retry) = &prog.subagent_retry {
+                    out.push(Action::Notice {
+                        level: "warn".to_string(),
+                        text: retry.describe(prog.subagent_type.as_deref()),
+                    });
+                } else if let Some(detail) = self.progress_label(&prog) {
+                    out.push(Action::StatusDetail(Some(detail)));
                 }
             }
             CliEvent::Unknown { kind, reason } => {
@@ -1036,6 +1123,126 @@ mod tests {
         assert!(actions.contains(&Action::Cost(0.5)));
         assert!(actions.contains(&Action::StatusDetail(None)));
         assert!(actions.contains(&Action::Transition(Transition::TurnEnded)));
+    }
+
+    /// The whole point of the fix: neither event may reach the events table.
+    /// A heartbeat arrives every 30s and a rate-limit event once per API call,
+    /// so persisting them buries the transcript.
+    #[test]
+    fn progress_and_rate_limit_stay_out_of_the_transcript() {
+        let actions = dispatch(&[
+            r#"{"type":"tool_progress","tool_use_id":"toolu_1-heartbeat-0","tool_name":"Bash","parent_tool_use_id":"toolu_1","elapsed_time_seconds":30,"heartbeat":true}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
+        ]);
+        assert!(kinds(&actions).is_empty(), "got {actions:?}");
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Unrecognised { .. })),
+            "these are recognised events now, not parser gaps"
+        );
+    }
+
+    /// The ids here are the real shape, captured from `claude` 2.1.246: a
+    /// heartbeat's own `tool_use_id` is synthetic and its `parent_tool_use_id`
+    /// is the tool actually running. Matching on the raw id would never hit.
+    #[test]
+    fn a_heartbeat_keeps_the_tool_label_and_adds_the_elapsed_time() {
+        let actions = dispatch(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"type":"tool_progress","tool_use_id":"toolu_1-heartbeat-1","tool_name":"Bash","parent_tool_use_id":"toolu_1","elapsed_time_seconds":90,"heartbeat":true}"#,
+        ]);
+        assert_eq!(
+            actions.last(),
+            Some(&Action::StatusDetail(Some(
+                "Bash: cargo test — 1m30s".into()
+            )))
+        );
+    }
+
+    /// An id we cannot resolve to a recorded tool still reports progress, under
+    /// the bare tool name. This is also the shape a heartbeat would take if the
+    /// synthetic-id convention ever changed.
+    #[test]
+    fn an_unresolvable_heartbeat_still_reports_the_elapsed_time() {
+        let actions = dispatch(&[
+            r#"{"type":"tool_progress","tool_use_id":"toolu_9-heartbeat-0","tool_name":"Grep","parent_tool_use_id":"toolu_1","elapsed_time_seconds":30,"heartbeat":true}"#,
+        ]);
+        assert_eq!(
+            actions,
+            vec![Action::StatusDetail(Some("Grep — 30s".into()))]
+        );
+
+        let odd = dispatch(&[
+            r#"{"type":"tool_progress","tool_use_id":"toolu_9","tool_name":"Grep","parent_tool_use_id":null,"elapsed_time_seconds":30}"#,
+        ]);
+        assert_eq!(odd, vec![Action::StatusDetail(Some("Grep — 30s".into()))]);
+    }
+
+    /// Tool ids do not outlive their turn, so a heartbeat quoting a stale id
+    /// must fall back to the bare tool name rather than resurrect an old label.
+    #[test]
+    fn tool_labels_do_not_survive_the_turn_that_created_them() {
+        let actions = dispatch(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false}"#,
+            r#"{"type":"tool_progress","tool_use_id":"toolu_1-heartbeat-0","tool_name":"Bash","parent_tool_use_id":"toolu_1","elapsed_time_seconds":30}"#,
+        ]);
+        assert_eq!(
+            actions.last(),
+            Some(&Action::StatusDetail(Some("Bash — 30s".into())))
+        );
+    }
+
+    #[test]
+    fn heartbeat_ids_resolve_to_the_tool_they_are_about() {
+        assert_eq!(heartbeat_origin("toolu_01A-heartbeat-0"), Some("toolu_01A"));
+        assert_eq!(
+            heartbeat_origin("toolu_01A-heartbeat-17"),
+            Some("toolu_01A")
+        );
+        // Not the shape: no claim either way.
+        assert_eq!(heartbeat_origin("toolu_01A"), None);
+        assert_eq!(heartbeat_origin("toolu_01A-heartbeat-"), None);
+        assert_eq!(heartbeat_origin("toolu_01A-heartbeat-x"), None);
+        assert_eq!(heartbeat_origin("-heartbeat-0"), None);
+    }
+
+    #[test]
+    fn a_subagent_retry_becomes_a_notice_not_a_status_label() {
+        let actions = dispatch(&[
+            r#"{"type":"tool_progress","tool_use_id":"tu_9","tool_name":"Task","parent_tool_use_id":null,"elapsed_time_seconds":0,"subagent_type":"Explore","subagent_retry":{"attempt":2,"max_retries":3,"error_status":529,"error_category":"overloaded"}}"#,
+        ]);
+        assert_eq!(
+            actions,
+            vec![Action::Notice {
+                level: "warn".into(),
+                text: "subagent Explore is retrying (2/3) after HTTP 529".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_event_carries_its_windows_through() {
+        let actions = dispatch(&[
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.42,"resetsAt":1787745600}}}}"#,
+        ]);
+        let Some(Action::RateLimit(info)) =
+            actions.iter().find(|a| matches!(a, Action::RateLimit(_)))
+        else {
+            panic!("expected a rate limit action, got {actions:?}");
+        };
+        assert_eq!(info.unified_windows["five_hour"].utilization, Some(0.42));
+    }
+
+    #[test]
+    fn elapsed_times_read_as_durations() {
+        assert_eq!(fmt_elapsed(0), "0s");
+        assert_eq!(fmt_elapsed(59), "59s");
+        assert_eq!(fmt_elapsed(60), "1m00s");
+        assert_eq!(fmt_elapsed(3599), "59m59s");
+        assert_eq!(fmt_elapsed(3600), "1h00m");
+        assert_eq!(fmt_elapsed(7860), "2h11m");
     }
 
     #[test]

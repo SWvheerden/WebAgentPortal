@@ -74,7 +74,9 @@ pub fn msg_agent_id(msg: &ServerMsg) -> Option<&str> {
         | ServerMsg::AgentRemoved { agent_id } => Some(agent_id),
         ServerMsg::AgentAdded { agent } => Some(&agent.id),
         ServerMsg::Notice { agent_id, .. } => agent_id.as_deref(),
-        ServerMsg::CloneProgress { .. } | ServerMsg::CloneDone { .. } => None,
+        ServerMsg::CloneProgress { .. }
+        | ServerMsg::CloneDone { .. }
+        | ServerMsg::RateLimit { .. } => None,
     }
 }
 
@@ -400,6 +402,21 @@ mod tests {
                 agent_id: None,
                 level: "warn".into(),
                 text: "x".into()
+            }),
+            None
+        );
+        // Account-wide news belongs to no agent.
+        assert_eq!(
+            msg_agent_id(&ServerMsg::RateLimit {
+                info: Box::new(crate::agent::protocol::RateLimitInfo {
+                    status: "allowed".into(),
+                    resets_at: None,
+                    rate_limit_type: None,
+                    utilization: None,
+                    is_using_overage: None,
+                    unified_windows: Default::default(),
+                    extra: Default::default(),
+                })
             }),
             None
         );

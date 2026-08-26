@@ -21,7 +21,7 @@ use crate::repo::git;
 
 use super::process::{self, Action, ChildHandle, ExitInfo, ProcessMsg, SpawnConfig, Sweep};
 use super::protocol::{
-    self, EventKind, LaunchArgs, PermissionDecision, PermissionRequest, SlashCommand,
+    self, EventKind, LaunchArgs, PermissionDecision, PermissionRequest, RateLimitInfo, SlashCommand,
 };
 use super::state::{PermissionMode, Status, Transition};
 
@@ -83,6 +83,12 @@ pub enum ServerMsg {
         clone_id: String,
         path: Option<String>,
         error: Option<String>,
+    },
+    /// Account usage against the rate-limit windows. Account-wide rather than
+    /// per-agent: whichever agent's CLI reported it last is speaking for all of
+    /// them, so this carries no `agent_id`.
+    RateLimit {
+        info: Box<RateLimitInfo>,
     },
     /// Something worth telling the operator about: an unrecognised protocol
     /// event, a version mismatch, a failed git call.
@@ -172,6 +178,10 @@ pub struct Supervisor {
     /// agent may ever sweep another's group.
     agent_pids: Arc<RwLock<HashSet<i32>>>,
     next_generation: AtomicU64,
+    /// The last rate-limit snapshot any agent's CLI reported. Kept so a browser
+    /// that connects between two events still sees the numbers, rather than a
+    /// blank panel until the next API call.
+    rate_limit: Arc<RwLock<Option<RateLimitInfo>>>,
     bus: broadcast::Sender<ServerMsg>,
 }
 
@@ -184,12 +194,18 @@ impl Supervisor {
             runners: Arc::new(RwLock::new(HashMap::new())),
             agent_pids: Arc::new(RwLock::new(HashSet::new())),
             next_generation: AtomicU64::new(1),
+            rate_limit: Arc::new(RwLock::new(None)),
             bus,
         })
     }
 
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// The last rate-limit snapshot, for a freshly loaded page.
+    pub async fn rate_limit(&self) -> Option<RateLimitInfo> {
+        self.rate_limit.read().await.clone()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ServerMsg> {
@@ -518,6 +534,7 @@ impl Supervisor {
             last_refresh: std::time::Instant::now(),
             grace: STOP_GRACE,
             recently_sent: std::collections::VecDeque::new(),
+            rate_limit: self.rate_limit.clone(),
         };
 
         // Status starts at Starting for both a first launch and a resume.
@@ -1004,6 +1021,9 @@ struct Runner {
     /// Messages we wrote to stdin and already persisted. The CLI echoes user
     /// lines back on stdout; without this the transcript shows them twice.
     recently_sent: std::collections::VecDeque<String>,
+    /// The supervisor's rate-limit snapshot, written through on every
+    /// `rate_limit_event` this agent's CLI reports.
+    rate_limit: Arc<RwLock<Option<RateLimitInfo>>>,
 }
 
 impl Runner {
@@ -1356,6 +1376,19 @@ impl Runner {
                 });
             }
             Action::SessionId(_) => {}
+            Action::RateLimit(info) => {
+                // Last writer wins: every agent's CLI reports the same account.
+                *self.rate_limit.write().await = Some((*info).clone());
+                self.emit(ServerMsg::RateLimit { info });
+            }
+            Action::Notice { level, text } => {
+                tracing::info!(agent = %self.id, %level, %text, "agent notice");
+                self.emit(ServerMsg::Notice {
+                    agent_id: Some(self.id.clone()),
+                    level,
+                    text,
+                });
+            }
             Action::Unrecognised { kind, reason } => {
                 tracing::warn!(agent = %self.id, %kind, %reason, "unrecognised protocol event");
                 self.emit(ServerMsg::Notice {
@@ -1678,6 +1711,7 @@ mod tests {
                 last_refresh: std::time::Instant::now(),
                 grace,
                 recently_sent: std::collections::VecDeque::new(),
+                rate_limit: Arc::new(RwLock::new(None)),
             };
 
             Self {

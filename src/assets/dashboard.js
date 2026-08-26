@@ -1,4 +1,4 @@
-// Dashboard: the agent registry, the spawn form, cloning and settings.
+// Dashboard: the agent registry, account usage, the spawn form, cloning and settings.
 import { api, el, slugify, statusEl, fmtCost, fmtAgo, Socket, toast } from '/assets/common.js';
 
 const state = {
@@ -7,9 +7,91 @@ const state = {
   repos: { recent: [], all: [], errors: [] },
   selectedRepo: null,
   cloneId: null,
+  rateLimit: null,
 };
 
 const $ = (id) => document.getElementById(id);
+
+// -- rate limits ------------------------------------------------------------
+
+// Rendered in this order whichever the CLI happens to report, so the panel does
+// not reshuffle as windows come and go.
+const WINDOWS = [
+  ['five_hour', 'Session · 5 hours'],
+  ['seven_day', 'Week · 7 days'],
+  ['seven_day_overage_included', 'Week · incl. overage'],
+];
+
+// `resetsAt` is unix *seconds*, unlike every timestamp this app stores.
+function fmtResetsIn(resetsAt) {
+  if (!resetsAt) return '';
+  const secs = (resetsAt * 1000 - Date.now()) / 1000;
+  if (secs <= 0) return 'resetting';
+  if (secs < 3600) return `resets in ${Math.ceil(secs / 60)}m`;
+  const hours = Math.floor(secs / 3600);
+  if (hours < 24) {
+    const mins = Math.floor((secs % 3600) / 60);
+    return mins ? `resets in ${hours}h ${mins}m` : `resets in ${hours}h`;
+  }
+  return `resets in ${Math.round(hours / 24)}d`;
+}
+
+function meter(label, utilization, resetsAt) {
+  const pct = Math.max(0, Math.min(1, Number(utilization) || 0));
+  const level = pct >= 0.9 ? 'err' : pct >= 0.6 ? 'warn' : 'ok';
+  // Set through the CSSOM, not a style attribute: `style-src 'self'` carries no
+  // 'unsafe-inline', so a style attribute would be dropped and the bar would
+  // never fill.
+  const fill = el('span');
+  fill.style.width = `${pct * 100}%`;
+  return el('div', { class: `meter ${level}` }, [
+    el('div', { class: 'head' }, [
+      el('span', { class: 'muted', text: label }),
+      el('span', { class: 'pct', text: `${Math.round(pct * 100)}%` }),
+    ]),
+    el('div', { class: 'bar' }, [fill]),
+    el('div', { class: 'foot', text: fmtResetsIn(resetsAt) }),
+  ]);
+}
+
+function renderLimits() {
+  const info = state.rateLimit;
+  const panel = $('limits-panel');
+  if (!info) {
+    panel.classList.add('hidden');
+    return;
+  }
+  const windows = info.unifiedWindows || {};
+  const meters = WINDOWS.filter(([key]) => windows[key]?.utilization != null).map(([key, label]) =>
+    meter(label, windows[key].utilization, windows[key].resetsAt),
+  );
+  // Accounts that report no per-window breakdown still name a governing window
+  // and its utilization; show that rather than an empty panel.
+  if (!meters.length && info.utilization !== undefined && info.utilization !== null) {
+    meters.push(meter(info.rateLimitType || 'Current window', info.utilization, info.resetsAt));
+  }
+  if (!meters.length) {
+    panel.classList.add('hidden');
+    return;
+  }
+  $('limits').replaceChildren(...meters);
+
+  // Anything other than a plain "allowed" is the headline, not a footnote.
+  const notes = [];
+  if (info.status && info.status !== 'allowed') notes.push(info.status.replace(/_/g, ' '));
+  if (info.isUsingOverage) notes.push('on overage');
+  $('limits-note').textContent = notes.length ? `— ${notes.join(' · ')}` : '';
+  panel.classList.toggle('warn-tint', info.status === 'rejected');
+  panel.classList.remove('hidden');
+}
+
+// The socket only carries changes, so a page loaded between two API calls needs
+// the last snapshot from the server.
+async function loadLimits() {
+  const data = await api('/api/rate_limit').catch(() => null);
+  state.rateLimit = data ? data.rate_limit : null;
+  renderLimits();
+}
 
 // -- agents -----------------------------------------------------------------
 
@@ -333,6 +415,7 @@ async function main() {
   state.config = await api('/api/config').catch(() => null);
   fillSettings();
   await loadAgents();
+  await loadLimits();
   await loadRepos();
 
   $('toggle-spawn').onclick = () => togglePanel('spawn-panel');
@@ -391,6 +474,10 @@ async function main() {
       const agent = state.agents.get(msg.agent_id);
       toast(`${agent ? agent.name : msg.agent_id} needs approval for ${msg.request.tool_name}`, 'warn');
     })
+    .on('rate_limit', (msg) => {
+      state.rateLimit = msg.info;
+      renderLimits();
+    })
     .on('notice', (msg) => toast(msg.text, msg.level))
     .on('clone_progress', (msg) => {
       const log = $('clone-log');
@@ -407,7 +494,10 @@ async function main() {
     });
 
   // Keep relative timestamps honest without a full re-render storm.
-  setInterval(renderAgents, 30000);
+  setInterval(() => {
+    renderAgents();
+    renderLimits();
+  }, 30000);
 }
 
 main().catch((err) => toast(err.message, 'error'));
