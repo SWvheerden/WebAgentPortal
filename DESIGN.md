@@ -99,14 +99,15 @@ CREATE TABLE agents (
   work_path         TEXT NOT NULL,         -- worktree, or repo_path if in-place/non-git
   is_git            INTEGER NOT NULL,
   branch            TEXT,                  -- NULL for non-git folders
-  base_ref          TEXT,
+  base_ref          TEXT,                  -- NULL when an existing branch was reused
   uses_worktree     INTEGER NOT NULL,
+  branch_is_new     INTEGER,               -- we created `branch`, so delete may drop it
   permission_mode   TEXT NOT NULL,         -- ask | acceptEdits | bypass | dangerous
   model             TEXT,
   effort            TEXT,
   max_budget_usd    REAL,
   status            TEXT NOT NULL,
-  status_detail     TEXT,                  -- e.g. "Bash: cargo test"
+  status_detail     TEXT,                  -- e.g. "Bash: cargo test — 1m30s"
   exit_code         INTEGER,
   last_stderr       TEXT,
   cost_usd          REAL NOT NULL DEFAULT 0,
@@ -328,7 +329,28 @@ A **Recent** group (max 5) ordered by *this tool's own* `last_used_at` descendin
 `git worktree add <repo_root>/.worktrees/<repo>/<slug> -b <branch>` — outside the repos,
 under a dot-directory the scanner already skips. Each agent gets an isolated checkout, so
 concurrent agents on one repo are safe and the main checkout is never touched.
-A **"work in the main checkout instead"** toggle opts into in-place `checkout -b`.
+A **Workspace** control on the spawn form chooses between that and the main checkout, where
+the equivalent is `checkout -b`.
+
+### Reusing an existing branch
+A **Branch** control chooses between creating `<prefix><slug>` and checking out a branch
+that already exists — `git worktree add -- <path> <branch>` or `git checkout <branch> --`.
+
+Three rules keep reuse from becoming a way to damage someone else's work:
+
+- **The name must already be a local branch.** Checked against `list_branches` by
+  membership before any git command runs, so the reuse path can never *create* a branch —
+  and an option-shaped name never reaches git at all.
+- **No base ref.** A reused branch has its own head; a start point would move it. The
+  request's `base_ref` is dropped rather than applied, and stored as `NULL`, so the
+  delete-time check reports the branch's whole unpushed history — none of which this agent
+  created.
+- **The branch is never deleted with the agent.** `branch_is_new` records who created it;
+  a reused branch is kept on delete whatever the request or the `force` flag says.
+
+git's own refusals are surfaced, not forced past: a branch already checked out elsewhere
+("`main` is already used by worktree at …") and a switch that would clobber uncommitted
+changes both fail the spawn. Two checkouts of one branch is not isolation.
 
 > **Warned in the UI:** a new worktree checks out from HEAD, so **uncommitted changes in the
 > main checkout are invisible to the agent.** Spawning against a dirty repo shows a warning.

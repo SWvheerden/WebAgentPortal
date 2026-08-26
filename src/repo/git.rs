@@ -673,6 +673,39 @@ pub fn add_worktree(repo: &Path, path: &Path, branch: &str, base_ref: Option<&st
     Ok(())
 }
 
+/// `git worktree add -- <path> <branch>`: a worktree on a branch that already
+/// exists, rather than a fresh one.
+///
+/// No `-b`, and no base ref — the branch has its own head, and passing a start
+/// point would silently move it. git refuses when the branch is already checked
+/// out in another worktree or in the main checkout, and that refusal is the
+/// intended behaviour: two checkouts of one branch is not isolation.
+pub fn add_worktree_on_branch(repo: &Path, path: &Path, branch: &str) -> Result<()> {
+    validate_ref(branch)?;
+    if path.exists() {
+        bail!("worktree path already exists: {}", path.display());
+    }
+    let path_str = checked_path(path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    git(repo, &["worktree", "add", "--", path_str, branch])?;
+    Ok(())
+}
+
+/// `git checkout <branch> --`: move the main checkout onto an existing branch.
+///
+/// The trailing `--` closes the revision, so a branch name can never be read as
+/// a pathspec. git refuses when the checkout is dirty in a way that would be
+/// clobbered, or when the branch is checked out in a worktree — both of which
+/// we want to hear about rather than force past.
+pub fn checkout_existing_branch(repo: &Path, branch: &str) -> Result<()> {
+    validate_ref(branch)?;
+    git(repo, &["checkout", branch, "--"])?;
+    Ok(())
+}
+
 /// `git worktree remove`, then prune the administrative files.
 pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
     let path_str = checked_path(path)?;
@@ -1024,6 +1057,73 @@ mod tests {
 
         remove_worktree(&repo.path, &wt, false).expect("remove worktree");
         assert!(!wt.exists());
+    }
+
+    #[test]
+    fn a_worktree_can_be_opened_on_a_branch_that_already_exists() {
+        let Some(repo) = init_repo() else { return };
+        let root = repo
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        create_branch_in_place(&repo.path, "feature_login", Some("main")).expect("branch");
+        // Leave the main checkout off that branch, or git will refuse the add.
+        checkout_existing_branch(&repo.path, "main").expect("back to main");
+        assert!(list_branches(&repo.path).contains(&"feature_login".to_string()));
+
+        let wt = worktree_path(&root, "repo", "reuse");
+        add_worktree_on_branch(&repo.path, &wt, "feature_login").expect("add worktree");
+        assert_eq!(current_branch(&wt).as_deref(), Some("feature_login"));
+        // The branch was joined, not recreated: the history is still there.
+        assert!(wt.join("README.md").exists());
+
+        remove_worktree(&repo.path, &wt, false).expect("remove worktree");
+    }
+
+    /// Two checkouts of one branch is not isolation, and git says so. The
+    /// refusal is the feature, so it must not be forced past.
+    #[test]
+    fn a_branch_already_checked_out_cannot_be_opened_twice() {
+        let Some(repo) = init_repo() else { return };
+        let root = repo
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let wt = worktree_path(&root, "repo", "taken");
+        // `main` is checked out in the repo itself.
+        let err = add_worktree_on_branch(&repo.path, &wt, "main").expect_err("must refuse");
+        assert!(
+            format!("{err:#}").contains("already"),
+            "expected git's already-checked-out refusal, got {err:#}"
+        );
+        assert!(!wt.exists());
+    }
+
+    /// The reuse path must never create a branch. An unknown name is refused by
+    /// the membership check before it reaches git.
+    #[test]
+    fn checking_out_an_unknown_branch_creates_nothing() {
+        let Some(repo) = init_repo() else { return };
+        assert!(!list_branches(&repo.path).contains(&"invented".to_string()));
+        assert!(checkout_existing_branch(&repo.path, "invented").is_err());
+        assert_eq!(list_branches(&repo.path), vec!["main".to_string()]);
+    }
+
+    /// A ref that git would read as an option is refused before it is run, on
+    /// the reuse paths as much as on the create ones.
+    #[test]
+    fn the_reuse_paths_refuse_option_shaped_refs() {
+        let Some(repo) = init_repo() else { return };
+        let root = repo
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let wt = worktree_path(&root, "repo", "evil");
+        assert!(add_worktree_on_branch(&repo.path, &wt, "--force").is_err());
+        assert!(checkout_existing_branch(&repo.path, "--orphan").is_err());
     }
 
     #[test]

@@ -58,10 +58,11 @@ CREATE TABLE IF NOT EXISTS repo_usage (
 
 /// Additive migrations applied after [`SCHEMA`].
 ///
-/// `add_dirs` is the one column not in the design's §3 table: `--add-dir`
-/// values have to outlive the process or a resume after a server restart
-/// silently drops them. It is added, never required, so an older database
-/// opens unchanged.
+/// `add_dirs` is not in the design's §3 table: `--add-dir` values have to
+/// outlive the process or a resume after a server restart silently drops
+/// them. `branch_is_new` records whether we created the agent's
+/// branch, which decides whether deleting the agent may delete it. Both are
+/// added, never required, so an older database opens unchanged.
 fn migrate(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(agents)")?;
     let existing: Vec<String> = stmt
@@ -70,6 +71,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !existing.iter().any(|c| c == "add_dirs") {
         conn.execute("ALTER TABLE agents ADD COLUMN add_dirs TEXT", [])
             .context("adding the add_dirs column")?;
+    }
+    // Every agent that predates the column created its own branch — reuse did
+    // not exist — so a NULL reads as `true`, not as the safer-looking `false`.
+    if !existing.iter().any(|c| c == "branch_is_new") {
+        conn.execute("ALTER TABLE agents ADD COLUMN branch_is_new INTEGER", [])
+            .context("adding the branch_is_new column")?;
     }
     Ok(())
 }
@@ -94,6 +101,11 @@ pub struct AgentRecord {
     pub branch: Option<String>,
     pub base_ref: Option<String>,
     pub uses_worktree: bool,
+    /// We created `branch` for this agent, so deleting the agent may delete it.
+    /// False when the agent was pointed at a branch that already existed, which
+    /// is not ours to destroy.
+    #[serde(default = "default_true")]
+    pub branch_is_new: bool,
     pub permission_mode: PermissionMode,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -108,6 +120,10 @@ pub struct AgentRecord {
     pub cost_usd: f64,
     pub created_at: i64,
     pub last_active_at: i64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A row of the `events` table.
@@ -182,9 +198,9 @@ impl Db {
                 "INSERT INTO agents (id, name, slug, repo_path, work_path, is_git, branch,
                      base_ref, uses_worktree, permission_mode, model, effort, max_budget_usd,
                      status, status_detail, exit_code, last_stderr, cost_usd, created_at,
-                     last_active_at, add_dirs)
+                     last_active_at, add_dirs, branch_is_new)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18, ?19, ?20, ?21)",
+                     ?17, ?18, ?19, ?20, ?21, ?22)",
                 params![
                     a.id,
                     a.name,
@@ -207,6 +223,7 @@ impl Db {
                     a.created_at,
                     a.last_active_at,
                     serde_json::to_string(&a.add_dirs).unwrap_or_else(|_| "[]".to_string()),
+                    a.branch_is_new as i64,
                 ],
             )
             .context("inserting agent")?;
@@ -499,7 +516,7 @@ impl Db {
 
 const AGENT_COLUMNS: &str = "id, name, slug, repo_path, work_path, is_git, branch, base_ref, \
      uses_worktree, permission_mode, model, effort, max_budget_usd, status, status_detail, \
-     exit_code, last_stderr, cost_usd, created_at, last_active_at, add_dirs";
+     exit_code, last_stderr, cost_usd, created_at, last_active_at, add_dirs, branch_is_new";
 
 fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let mode: String = row.get(9)?;
@@ -530,6 +547,10 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
             .get::<_, Option<String>>(20)?
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default(),
+        branch_is_new: row
+            .get::<_, Option<i64>>(21)?
+            .map(|v| v != 0)
+            .unwrap_or(true),
     })
 }
 
@@ -560,6 +581,7 @@ mod tests {
             branch: Some("sw_fix_the_parser".to_string()),
             base_ref: Some("main".to_string()),
             uses_worktree: true,
+            branch_is_new: true,
             permission_mode: PermissionMode::Ask,
             model: Some("opus".to_string()),
             effort: None,

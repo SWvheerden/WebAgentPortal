@@ -117,6 +117,11 @@ pub struct SpawnRequest {
     /// Work in the main checkout instead of an isolated worktree (§6).
     #[serde(default)]
     pub in_place: bool,
+    /// Check out this existing branch instead of creating a new one (§6). The
+    /// name must already be a local branch; anything else is refused rather
+    /// than created.
+    #[serde(default)]
+    pub existing_branch: Option<String>,
     #[serde(default)]
     pub add_dirs: Vec<String>,
     #[serde(default)]
@@ -362,6 +367,7 @@ impl Supervisor {
             branch: prepared.branch,
             base_ref: prepared.base_ref,
             uses_worktree: prepared.uses_worktree,
+            branch_is_new: prepared.branch_is_new,
             permission_mode: req.permission_mode.unwrap_or(cfg.default_permission_mode),
             model: req
                 .model
@@ -775,7 +781,20 @@ impl Supervisor {
             }
         }
 
-        if delete_branch && let (true, Some(branch)) = (record.is_git, record.branch.clone()) {
+        // A branch we did not create is not ours to delete, whatever the
+        // request or the force flag says.
+        if delete_branch && record.is_git && !record.branch_is_new {
+            self.broadcast(ServerMsg::Notice {
+                agent_id: None,
+                level: "warn".to_string(),
+                text: format!(
+                    "Branch was kept: {} existed before this agent, so deleting the agent \
+                     does not delete it.",
+                    record.branch.as_deref().unwrap_or("the branch")
+                ),
+            });
+        } else if delete_branch && let (true, Some(branch)) = (record.is_git, record.branch.clone())
+        {
             let repo = PathBuf::from(&record.repo_path);
             let result =
                 tokio::task::spawn_blocking(move || git::delete_branch(&repo, &branch, force))
@@ -900,6 +919,7 @@ async fn safety_for(record: &AgentRecord) -> git::SafetyReport {
 }
 
 /// The workspace an agent will run in.
+#[derive(Debug)]
 struct Prepared {
     slug: String,
     branch: Option<String>,
@@ -907,6 +927,7 @@ struct Prepared {
     work_path: PathBuf,
     is_git: bool,
     uses_worktree: bool,
+    branch_is_new: bool,
 }
 
 /// Blocking: allocate names and create the worktree or in-place branch.
@@ -928,30 +949,69 @@ fn prepare_workspace(
             work_path: repo_path.to_path_buf(),
             is_git: false,
             uses_worktree: false,
+            branch_is_new: false,
         });
     }
 
     let existing: HashSet<String> = git::list_branches(repo_path).into_iter().collect();
-    let (slug, branch) = git::allocate_names(task_name, prefix, taken_slugs, &existing);
-    let base_ref = req
-        .base_ref
-        .clone()
-        .filter(|b| !b.trim().is_empty())
-        .or_else(|| git::current_branch(repo_path))
-        .unwrap_or_else(|| "HEAD".to_string());
-    // Refuse an option-shaped base ref before anything is created or stored;
-    // it would otherwise be replayed by every later delete preview.
-    git::validate_ref(&base_ref).with_context(|| format!("base ref `{base_ref}`"))?;
+    let reused = req
+        .existing_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+
+    // Reusing a branch and naming a base ref are contradictory: the branch
+    // already has a head, and a start point would move it. The base is dropped
+    // rather than silently applied, and stored as None so the delete-time
+    // safety check reports the branch's whole unpushed history — none of which
+    // this agent created.
+    let (branch, base_ref, branch_is_new) = match reused {
+        Some(name) => {
+            // Membership, not just shape: a name that is not already a branch
+            // must never reach git, or "reuse" would quietly create one.
+            if !existing.contains(name) {
+                bail!("`{name}` is not a branch of this repository");
+            }
+            (name.to_string(), None, false)
+        }
+        None => {
+            let base = req
+                .base_ref
+                .clone()
+                .filter(|b| !b.trim().is_empty())
+                .or_else(|| git::current_branch(repo_path))
+                .unwrap_or_else(|| "HEAD".to_string());
+            // Refuse an option-shaped base ref before anything is created or
+            // stored; it would otherwise be replayed by every later delete
+            // preview.
+            git::validate_ref(&base).with_context(|| format!("base ref `{base}`"))?;
+            (String::new(), Some(base), true)
+        }
+    };
+
+    // The slug names the agent and its worktree directory, so it is allocated
+    // from the task name either way — only a *new* branch takes its name from it.
+    let (slug, branch) = if branch_is_new {
+        git::allocate_names(task_name, prefix, taken_slugs, &existing)
+    } else {
+        let slug = git::unique_name(&git::slugify(task_name), |c| taken_slugs.contains(c));
+        (slug, branch)
+    };
 
     if req.in_place {
-        git::create_branch_in_place(repo_path, &branch, Some(&base_ref))?;
+        if branch_is_new {
+            git::create_branch_in_place(repo_path, &branch, base_ref.as_deref())?;
+        } else {
+            git::checkout_existing_branch(repo_path, &branch)?;
+        }
         return Ok(Prepared {
             slug,
             branch: Some(branch),
-            base_ref: Some(base_ref),
+            base_ref,
             work_path: repo_path.to_path_buf(),
             is_git: true,
             uses_worktree: false,
+            branch_is_new,
         });
     }
 
@@ -964,15 +1024,20 @@ fn prepare_workspace(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
     let work_path = git::worktree_path(&root, &repo_name, &slug);
-    git::add_worktree(repo_path, &work_path, &branch, Some(&base_ref))?;
+    if branch_is_new {
+        git::add_worktree(repo_path, &work_path, &branch, base_ref.as_deref())?;
+    } else {
+        git::add_worktree_on_branch(repo_path, &work_path, &branch)?;
+    }
 
     Ok(Prepared {
         slug,
         branch: Some(branch),
-        base_ref: Some(base_ref),
+        base_ref,
         work_path,
         is_git: true,
         uses_worktree: true,
+        branch_is_new,
     })
 }
 
@@ -1641,6 +1706,7 @@ mod tests {
             branch: None,
             base_ref: None,
             uses_worktree: false,
+            branch_is_new: true,
             permission_mode: PermissionMode::Ask,
             model: None,
             effort: None,
@@ -2417,6 +2483,139 @@ mod tests {
             Supervisor::teardown_deadline() >= STOP_GRACE * 2,
             "the deadline has to cover the child's grace and the group teardown"
         );
+    }
+
+    // -- workspace preparation ------------------------------------------------
+
+    /// A real repository on `main`, with one commit and one extra branch.
+    fn repo_with_a_spare_branch() -> Option<(tempfile::TempDir, PathBuf)> {
+        let dir = tempfile::tempdir().ok()?;
+        let path = dir.path().join("repo");
+        std::fs::create_dir_all(&path).ok()?;
+        git::git(&path, &["init", "-q", "-b", "main", "."]).ok()?;
+        git::git(&path, &["config", "user.email", "t@example.com"]).ok()?;
+        git::git(&path, &["config", "user.name", "Test"]).ok()?;
+        std::fs::write(path.join("README.md"), "hello").ok()?;
+        git::git(&path, &["add", "."]).ok()?;
+        git::git(&path, &["commit", "-q", "-m", "initial"]).ok()?;
+        git::git(&path, &["branch", "feature_login"]).ok()?;
+        Some((dir, path))
+    }
+
+    fn spawn_req(repo: &Path) -> SpawnRequest {
+        SpawnRequest {
+            repo_path: repo.to_string_lossy().to_string(),
+            task_name: "Fix the parser".to_string(),
+            base_ref: None,
+            model: None,
+            effort: None,
+            max_budget_usd: None,
+            permission_mode: None,
+            in_place: false,
+            existing_branch: None,
+            add_dirs: Vec::new(),
+            first_message: None,
+        }
+    }
+
+    #[test]
+    fn a_new_branch_is_named_from_the_task_and_owned_by_the_agent() {
+        let Some((_dir, repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let prepared = prepare_workspace(
+            &repo,
+            "Fix the parser",
+            "sw_",
+            &HashSet::new(),
+            &spawn_req(&repo),
+        )
+        .expect("prepare");
+        assert_eq!(prepared.branch.as_deref(), Some("sw_fix_the_parser"));
+        assert_eq!(prepared.base_ref.as_deref(), Some("main"));
+        assert!(prepared.uses_worktree);
+        assert!(
+            prepared.branch_is_new,
+            "a branch we created is ours to delete"
+        );
+    }
+
+    #[test]
+    fn an_existing_branch_is_joined_rather_than_recreated() {
+        let Some((_dir, repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let mut req = spawn_req(&repo);
+        req.existing_branch = Some("feature_login".to_string());
+        let prepared = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
+            .expect("prepare");
+
+        assert_eq!(prepared.branch.as_deref(), Some("feature_login"));
+        assert!(
+            !prepared.branch_is_new,
+            "a branch that predates the agent is not ours to delete"
+        );
+        // No base ref: the branch has its own head, and a start point would
+        // move it. Stored as None so the delete check stays conservative.
+        assert_eq!(prepared.base_ref, None);
+        // The slug still comes from the task name, so the agent and its
+        // worktree directory are named independently of the branch.
+        assert_eq!(prepared.slug, "fix_the_parser");
+        assert_eq!(
+            git::current_branch(&prepared.work_path).as_deref(),
+            Some("feature_login")
+        );
+    }
+
+    /// The reuse path must never create a branch, so a name that is not already
+    /// one is refused before any git command runs.
+    #[test]
+    fn reusing_a_branch_that_does_not_exist_is_refused() {
+        let Some((_dir, repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let mut req = spawn_req(&repo);
+        req.existing_branch = Some("invented".to_string());
+        let err = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
+            .expect_err("must refuse");
+        assert!(format!("{err:#}").contains("not a branch"), "{err:#}");
+        assert_eq!(git::list_branches(&repo).len(), 2, "nothing may be created");
+    }
+
+    /// A base ref is meaningless alongside a reused branch. It must be dropped,
+    /// not applied — applying it would move someone else's branch.
+    #[test]
+    fn a_base_ref_is_ignored_when_a_branch_is_reused() {
+        let Some((_dir, repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let head = git::resolve_commit(&repo, "feature_login").expect("head");
+        let mut req = spawn_req(&repo);
+        req.existing_branch = Some("feature_login".to_string());
+        req.base_ref = Some("main".to_string());
+        let prepared = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
+            .expect("prepare");
+        assert_eq!(prepared.base_ref, None);
+        assert_eq!(
+            git::resolve_commit(&repo, "feature_login").expect("head after"),
+            head,
+            "the reused branch must not have moved"
+        );
+    }
+
+    #[test]
+    fn reusing_a_branch_in_place_moves_the_main_checkout_onto_it() {
+        let Some((_dir, repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let mut req = spawn_req(&repo);
+        req.existing_branch = Some("feature_login".to_string());
+        req.in_place = true;
+        let prepared = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
+            .expect("prepare");
+        assert!(!prepared.uses_worktree);
+        assert_eq!(prepared.work_path, repo);
+        assert_eq!(git::current_branch(&repo).as_deref(), Some("feature_login"));
     }
 
     // -- the permission control plane ----------------------------------------

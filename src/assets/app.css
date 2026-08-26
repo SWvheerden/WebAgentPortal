@@ -83,6 +83,10 @@ input, select, textarea {
 #first-message { min-height: 180px; resize: vertical; }
 label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
 .field { margin-bottom: 10px; }
+/* A field that hugs its control and sits on the baseline of the row — a button
+   next to a full-width input. A class, not a style attribute: `style-src 'self'`
+   carries no 'unsafe-inline', so an inline style would be dropped. */
+.field.shrink { flex: 0 0 auto; align-self: end; }
 .row { display: flex; gap: 10px; flex-wrap: wrap; }
 .row > .field { flex: 1 1 160px; }
 .inline { display: flex; align-items: center; gap: 8px; }

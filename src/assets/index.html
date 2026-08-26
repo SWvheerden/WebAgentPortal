@@ -32,16 +32,38 @@
           </div>
           <div class="row">
             <div class="field">
-              <label for="base-ref">Base ref (current HEAD by default)</label>
-              <select id="base-ref"></select>
+              <label for="isolation">Workspace</label>
+              <select id="isolation">
+                <option value="worktree">Isolated worktree</option>
+                <option value="in-place">Main checkout</option>
+              </select>
             </div>
-            <div class="field" style="flex: 0 0 auto; align-self: end">
-              <button id="fetch-btn" title="git fetch --all --prune">Fetch</button>
+            <div class="field">
+              <label for="branch-source">Branch</label>
+              <select id="branch-source">
+                <option value="new">Create a new one</option>
+                <option value="existing">Use an existing one</option>
+              </select>
             </div>
           </div>
-          <div class="field">
-            <label>Branch</label>
-            <input id="branch-preview" readonly>
+          <div id="new-branch-fields">
+            <div class="row">
+              <div class="field">
+                <label for="base-ref">Base ref (current HEAD by default)</label>
+                <select id="base-ref"></select>
+              </div>
+              <div class="field shrink">
+                <button id="fetch-btn" title="git fetch --all --prune">Fetch</button>
+              </div>
+            </div>
+            <div class="field">
+              <label>Branch name</label>
+              <input id="branch-preview" readonly>
+            </div>
+          </div>
+          <div class="field hidden" id="existing-branch-field">
+            <label for="existing-branch">Existing branch</label>
+            <select id="existing-branch"></select>
           </div>
           <div class="row">
             <div class="field">
@@ -77,10 +99,6 @@
             <div class="field">
               <label for="add-dirs">Extra directories (--add-dir, one per line)</label>
               <textarea id="add-dirs" rows="2"></textarea>
-            </div>
-            <div class="field inline">
-              <input type="checkbox" id="in-place">
-              <label for="in-place" style="margin:0">Work in the main checkout instead of a worktree</label>
             </div>
           </details>
           <div id="spawn-warnings"></div>

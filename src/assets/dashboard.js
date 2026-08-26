@@ -6,6 +6,7 @@ const state = {
   config: null,
   repos: { recent: [], all: [], errors: [] },
   selectedRepo: null,
+  repoInfo: null,
   cloneId: null,
   rateLimit: null,
 };
@@ -185,7 +186,9 @@ async function rename(agent) {
 
 async function remove(agent) {
   if (!confirm(`Delete "${agent.name}"? The branch is kept by default.`)) return;
-  const deleteBranch = agent.branch
+  // A branch the agent did not create is not ours to destroy, so it is not
+  // even offered — the server refuses it too.
+  const deleteBranch = agent.branch && agent.branch_is_new !== false
     ? confirm(`Also delete the branch ${agent.branch}?`)
     : false;
   const qs = `?delete_branch=${deleteBranch}`;
@@ -260,27 +263,53 @@ async function selectRepo(repo) {
   updateBranchPreview();
 
   const info = await api(`/api/repos/branches?path=${encodeURIComponent(repo.path)}`).catch(() => null);
-  const select = $('base-ref');
-  select.replaceChildren();
+  state.repoInfo = info;
+  const base = $('base-ref');
+  const existing = $('existing-branch');
+  base.replaceChildren();
+  existing.replaceChildren();
   if (info && info.is_git) {
     for (const branch of info.branches) {
-      select.append(el('option', { value: branch, text: branch }));
+      base.append(el('option', { value: branch, text: branch }));
+      existing.append(el('option', { value: branch, text: branch }));
     }
-    if (info.current) select.value = info.current;
+    if (info.current) base.value = info.current;
   } else {
-    select.append(el('option', { value: '', text: '(no VCS)' }));
+    base.append(el('option', { value: '', text: '(no VCS)' }));
+    existing.append(el('option', { value: '', text: '(no VCS)' }));
   }
+  renderBranchMode();
   renderSpawnWarnings(info);
+}
+
+// A repository with no branches to pick has nothing to reuse: the choice is
+// forced back to "new" rather than left as a control that cannot be honoured.
+function renderBranchMode() {
+  const info = state.repoInfo;
+  const canReuse = !!(info && info.is_git && info.branches.length);
+  const source = $('branch-source');
+  source.disabled = !canReuse;
+  if (!canReuse) source.value = 'new';
+  const reusing = source.value === 'existing';
+  $('new-branch-fields').classList.toggle('hidden', reusing);
+  $('existing-branch-field').classList.toggle('hidden', !reusing);
 }
 
 function renderSpawnWarnings(info) {
   const host = $('spawn-warnings');
   host.replaceChildren();
   if (!info) return;
-  if (info.dirty && !$('in-place').checked) {
+  const inPlace = $('isolation').value === 'in-place';
+  if (info.dirty && !inPlace) {
     host.append(el('div', {
       class: 'warnbox small',
-      text: 'This checkout has uncommitted changes. A new worktree starts from HEAD, so those changes will be invisible to the agent.',
+      text: 'This checkout has uncommitted changes. A worktree starts from the branch head, so those changes will be invisible to the agent.',
+    }));
+  }
+  if (info.dirty && inPlace && $('branch-source').value === 'existing') {
+    host.append(el('div', {
+      class: 'warnbox small',
+      text: 'Switching the main checkout to an existing branch with uncommitted changes: git will refuse if the switch would overwrite them.',
     }));
   }
   if (!info.is_git) {
@@ -319,15 +348,19 @@ async function spawn() {
     return;
   }
   const budget = parseFloat($('budget').value);
+  const reusing = $('branch-source').value === 'existing';
   const body = {
     repo_path: state.selectedRepo.path,
     task_name: $('task-name').value.trim() || state.selectedRepo.name,
-    base_ref: $('base-ref').value || null,
+    // A reused branch has its own head; a base ref would only move it, so it is
+    // not sent at all rather than sent and ignored.
+    base_ref: reusing ? null : $('base-ref').value || null,
+    existing_branch: reusing ? $('existing-branch').value || null : null,
     model: $('model').value.trim() || null,
     effort: $('effort').value.trim() || null,
     max_budget_usd: Number.isFinite(budget) ? budget : null,
     permission_mode: $('permission-mode').value,
-    in_place: $('in-place').checked,
+    in_place: $('isolation').value === 'in-place',
     add_dirs: $('add-dirs').value.split('\n').map((s) => s.trim()).filter(Boolean),
     first_message: $('first-message').value.trim() || null,
   };
@@ -417,12 +450,19 @@ async function main() {
   await loadAgents();
   await loadLimits();
   await loadRepos();
+  // Nothing is reusable until a repository is picked, so the control starts
+  // disabled rather than offering an empty list.
+  renderBranchMode();
 
   $('toggle-spawn').onclick = () => togglePanel('spawn-panel');
   $('toggle-clone').onclick = () => togglePanel('clone-panel');
   $('toggle-settings').onclick = () => togglePanel('settings-panel');
   $('task-name').oninput = updateBranchPreview;
-  $('in-place').onchange = () => state.selectedRepo && selectRepo(state.selectedRepo);
+  $('isolation').onchange = () => renderSpawnWarnings(state.repoInfo);
+  $('branch-source').onchange = () => {
+    renderBranchMode();
+    renderSpawnWarnings(state.repoInfo);
+  };
   $('spawn-btn').onclick = spawn;
   $('clone-btn').onclick = startClone;
   $('cfg-save').onclick = saveSettings;
