@@ -78,6 +78,9 @@ input, select, textarea {
   padding: 5px 8px;
   width: 100%;
 }
+/* The first message is a prompt, not a one-line field: give it room, and let it
+   be dragged taller for a long one. */
+#first-message { min-height: 180px; resize: vertical; }
 label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
 .field { margin-bottom: 10px; }
 .row { display: flex; gap: 10px; flex-wrap: wrap; }
