@@ -95,6 +95,15 @@ pub struct MessageLine {
     pub session_id: Option<String>,
     #[serde(default)]
     pub parent_tool_use_id: Option<String>,
+    /// Set when the CLI synthesises an `assistant` line to carry an API
+    /// failure — a rate limit, say. The model did not say this, and it must not
+    /// be shown as though it had.
+    #[serde(default)]
+    pub is_api_error_message: bool,
+    /// The failure's category when `is_api_error_message` is set: `rate_limit`
+    /// and so on.
+    #[serde(default)]
+    pub error: Option<String>,
     pub message: Value,
 }
 
@@ -137,6 +146,36 @@ pub struct ResultLine {
     pub total_cost_usd: Option<f64>,
     #[serde(default)]
     pub result: Option<String>,
+    /// The HTTP status of the API call that ended the turn, when one did.
+    /// 429 is the rate limit.
+    #[serde(default)]
+    pub api_error_status: Option<u64>,
+}
+
+impl ResultLine {
+    /// How this turn failed, in words, or `None` if it did not.
+    ///
+    /// `subtype` is no help: a turn killed by a 429 still reports
+    /// `subtype: "success"`. `is_error` is the flag that means it, and
+    /// `result` carries the CLI's own wording, which is the part worth
+    /// repeating — it names the limit and when it resets.
+    pub fn failure(&self) -> Option<String> {
+        if !self.is_error {
+            return None;
+        }
+        let status = self
+            .api_error_status
+            .map(|s| format!(" (HTTP {s})"))
+            .unwrap_or_default();
+        let detail = self
+            .result
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| format!(": {t}"))
+            .unwrap_or_default();
+        Some(format!("The turn ended in an error{status}{detail}"))
+    }
 }
 
 /// A `control_request` from the CLI to us. The only subtype we act on is

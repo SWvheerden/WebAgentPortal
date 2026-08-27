@@ -100,17 +100,37 @@ function renderEvent(event) {
         ]),
       ]);
     }
-    case 'result':
+    case 'result': {
+      const cost = p.total_cost_usd != null ? ` · ${fmtCost(p.total_cost_usd)} total` : '';
+      // A turn cut short by a rate limit used to read "— turn finished · error"
+      // in the same green as a turn that did the job. It is a failure: say so,
+      // in the failure colour, with the reason the CLI gave.
+      if (p.is_error) {
+        const status = p.api_error_status ? ` (HTTP ${p.api_error_status})` : '';
+        const why = p.result ? `: ${p.result}` : '';
+        return el('div', { class: 'ev error' }, [
+          el('div', { class: 'body', text: `✕ turn ended in an error${status}${why}${cost}` }),
+        ]);
+      }
       return el('div', { class: 'ev result' }, [
-        el('div', {
-          class: 'body',
-          text: `— turn finished${p.total_cost_usd != null ? ` · ${fmtCost(p.total_cost_usd)} total` : ''}${p.is_error ? ' · error' : ''}`,
-        }),
+        el('div', { class: 'body', text: `— turn finished${cost}` }),
       ]);
+    }
     case 'stderr':
       return el('div', { class: 'ev stderr' }, [el('div', { class: 'body', text: p.text || '' })]);
-    case 'error':
-      return el('div', { class: 'ev error' }, [el('div', { class: 'body', text: pretty(p) })]);
+    case 'error': {
+      // An API failure the CLI dressed as an `assistant` line: show the text it
+      // carries, attributed to the API rather than to Claude. Anything else
+      // keeps the raw dump, which is all there is to show.
+      const text = textOf(p.message);
+      if (!text.trim()) {
+        return el('div', { class: 'ev error' }, [el('div', { class: 'body', text: pretty(p) })]);
+      }
+      return el('div', { class: 'ev error' }, [
+        el('div', { class: 'who', text: p.error ? `api error · ${p.error}` : 'api error' }),
+        el('div', { class: 'body', text }),
+      ]);
+    }
     case 'permission_request':
       return el('div', { class: 'ev system' }, [
         el('div', { class: 'body', text: `⏸ asked to use ${p.tool_name}` }),

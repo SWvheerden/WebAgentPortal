@@ -176,6 +176,21 @@ impl Dispatcher {
                     out.push(Action::Transition(Transition::Initialized));
                 }
             }
+            CliEvent::Assistant(msg) if msg.is_api_error_message => {
+                // A synthesised line carrying an API failure, not the model
+                // talking. Filed as an error so the transcript does not put
+                // "You've hit your session limit" in Claude's mouth. No toast:
+                // the `result` that closes the turn raises one, and a rate
+                // limit produces several of these per turn.
+                tracing::warn!(
+                    agent_error = msg.error.as_deref().unwrap_or("unknown"),
+                    "the CLI reported an API error"
+                );
+                out.push(Action::Persist {
+                    kind: EventKind::Error,
+                    payload: raw,
+                });
+            }
             CliEvent::Assistant(msg) => {
                 out.push(Action::Persist {
                     kind: EventKind::Assistant,
@@ -215,6 +230,16 @@ impl Dispatcher {
                 });
                 if let Some(cost) = res.total_cost_usd {
                     out.push(Action::Cost(cost));
+                }
+                // A turn killed by a rate limit ends exactly like one that
+                // finished the job: `TurnEnded`, then `Idle`. Say so, or the
+                // operator is left looking at an idle agent that quietly
+                // stopped halfway and no sign of why.
+                if let Some(text) = res.failure() {
+                    out.push(Action::Notice {
+                        level: "error".to_string(),
+                        text,
+                    });
                 }
                 self.tool_labels.clear();
                 out.push(Action::StatusDetail(None));
@@ -1092,6 +1117,59 @@ mod tests {
         assert_eq!(kinds(&actions), vec![EventKind::System]);
         assert!(actions.contains(&Action::SessionId("s1".into())));
         assert!(actions.contains(&Action::Transition(Transition::Initialized)));
+    }
+
+    /// Shapes taken verbatim from a session that hit the account's five-hour
+    /// limit mid-task.
+    #[test]
+    fn a_rate_limited_turn_is_reported_as_a_failure() {
+        let actions = dispatch(&[
+            r#"{"type":"assistant","error":"rate_limit","is_api_error_message":true,"message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"You've hit your session limit \u00b7 resets 7pm (Africa/Johannesburg)"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You've hit your session limit \u00b7 resets 7pm (Africa/Johannesburg)","total_cost_usd":89.7}"#,
+        ]);
+
+        // The model did not say this, so it is not filed as though it had.
+        assert_eq!(
+            kinds(&actions),
+            vec![EventKind::Error, EventKind::Result],
+            "an API error message belongs under `error`, not `assistant`"
+        );
+
+        // One notice for the turn, not one per synthesised message.
+        let notices: Vec<&Action> = actions
+            .iter()
+            .filter(|a| matches!(a, Action::Notice { .. }))
+            .collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let Action::Notice { level, text } = notices[0] else {
+            unreachable!()
+        };
+        assert_eq!(level, "error");
+        assert!(text.contains("HTTP 429"), "{text}");
+        assert!(
+            text.contains("resets 7pm"),
+            "the reason has to survive: {text}"
+        );
+
+        // The turn is still over, and the agent still goes idle: the process is
+        // alive and can be spoken to. Only the silence was the bug.
+        assert!(actions.contains(&Action::Transition(Transition::TurnEnded)));
+        assert!(actions.contains(&Action::Cost(89.7)));
+    }
+
+    /// `subtype` says `success` even on the 429, so nothing may key off it —
+    /// and a turn that really did succeed must stay quiet, including one whose
+    /// `result` text is a refusal like "/resume isn't available here".
+    #[test]
+    fn a_successful_turn_raises_no_notice() {
+        let actions = dispatch(&[
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"/resume isn't available in this environment.","num_turns":0}"#,
+        ]);
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Notice { .. })),
+            "{actions:?}"
+        );
+        assert_eq!(kinds(&actions), vec![EventKind::Result]);
     }
 
     #[test]

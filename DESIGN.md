@@ -31,6 +31,8 @@ These are load-bearing — several contradict what the published docs imply.
 | F13 | The CLI emits a **`rate_limit_event`** whenever the account's usage changes, in practice once per API request. `rate_limit_info` is camelCase inside a snake_case envelope: `status` (`allowed`｜`allowed_warning`｜`rejected`), and optionally `resetsAt` (unix **seconds**), `rateLimitType`, `utilization`, `isUsingOverage` and `unifiedWindows` (`five_hour`, `seven_day`, `seven_day_overage_included`, each `{utilization, resetsAt}`). Present since at least 2.1.241. | Captured from 2.1.241 and 2.1.246; shape cross-checked against the CLI's own schema. |
 | F14 | The CLI emits a **`tool_progress`** every 30s for any tool still running (`heartbeat: true`), carrying `tool_name`, `elapsed_time_seconds`, and two ids that are not what they look like: `tool_use_id` is **synthetic** (`<real tool_use_id>-heartbeat-<n>`, so it matches no `tool_use` block) and `parent_tool_use_id` is the **tool actually running**, not a nesting flag. A variant with no heartbeat carries `subagent_retry` while a subagent's API call is being retried. The `bash_progress`-derived variant, which would carry incremental output, is gated behind `CLAUDE_CODE_REMOTE`/`CLAUDE_CODE_CONTAINER_ID`, so a local child never sends it. | Captured from 2.1.246: a 95s foreground `Bash` yielded `toolu_01Xd…-heartbeat-0` with `parent_tool_use_id` = `toolu_01Xd…`. 30s interval read from the CLI's own timer. |
 | F14a | The Agent tool is **exempt** from heartbeats, and a tool running *inside* a subagent was not observed to emit `tool_progress` on the parent's stream at all — so a long subagent is invisible to this signal from both directions. Stated as an observation, not a guarantee. | A delegated 40s `Bash` inside a `general-purpose` subagent produced no `tool_progress`; the exemption is explicit in the CLI's heartbeat timer. |
+| F15 | An API failure **does not stop the turn from looking like a success**. The CLI synthesises an `assistant` line with `is_api_error_message: true`, `error: "rate_limit"` and `model: "<synthetic>"` carrying the human text, then closes the turn with a `result` whose `subtype` is still **`"success"`** while `is_error: true` and `api_error_status: 429`. So `subtype` must never be keyed off; `is_error` is the flag that means it and `result` carries the wording. The agent is genuinely `Idle` afterwards — the process is alive and can be spoken to. | A session that hit its five-hour limit mid-task on 2.1.246: two synthetic `assistant` lines, then `result` with `subtype: "success"`, `is_error: true`, `api_error_status: 429`. |
+| F16 | **Built-in TUI slash commands are not in the `initialize` list and are refused if typed.** `/resume`, `/status`, `/cost` and `/help` are absent from the 74 commands 2.1.247 advertised; sending `/resume` returns a `<synthetic>` assistant line — *"/resume isn't available in this environment."* — and a `result` with `is_error: false`. Skills, plugin and project commands do resolve (F8). | The advertised list inspected; `/resume` sent and refused. |
 | F12 | Remote Control (`claude remote-control`) is a persistent server, ≤32 concurrent sessions, outbound-only, but **scoped to one directory** and requiring a full-scope subscription login. Compatibility with `-p` is **undocumented and untested** (testing would create a real session on the account). | `claude remote-control --help` + docs. |
 
 ### Risk register
@@ -43,6 +45,13 @@ These are load-bearing — several contradict what the published docs imply.
   parser arm. `rate_limit_event` and `tool_progress` (F13, F14) are gauges rather than
   transcript entries, so both are handled without a row in `events` and without a toast —
   persisting a 30s heartbeat buries the transcript it is meant to annotate.
+- **A failed turn is indistinguishable from a finished one unless it is made so.** F15 means a
+  rate limit ends the turn through the ordinary `TurnEnded` path and leaves the agent `Idle`,
+  which is exactly what success looks like. The `result`'s `is_error` therefore raises an
+  error notice naming the status and the CLI's own wording, once per turn; the synthetic
+  `assistant` lines are filed under `error` rather than `assistant`, so the transcript never
+  puts "You've hit your session limit" in Claude's mouth. Neither changes the state machine:
+  the process really is idle and really can be spoken to.
 - **F4 means the approval UI is not a complete audit trail.** Some tool calls execute without
   ever asking. The transcript shows them; the approval queue does not.
 
@@ -180,7 +189,7 @@ an empty first message had the same bug and is fixed by the same signal.
 |---|---|
 | **Interrupt** | `control_request`/`interrupt` (F5). Cancels the in-flight turn **only**; reports `still_queued`. Separate "clear queue" action. |
 | **Stop** | SIGTERM (runs `SessionEnd` hooks, records the interrupted turn), 5s grace, then SIGKILL — to the CLI's process group *and* to every other process group found under it (see below). History and `session_id` retained. Worktree untouched. |
-| **Resume** | Respawn with `--resume <session_id>` (F7). |
+| **Resume** | Respawn with `--resume <session_id>` (F7). Restores the conversation; it does **not** restart the interrupted turn — the CLI comes up and waits, so continuing the work takes an ordinary message. `/resume` is not that message: it is a TUI command the headless CLI refuses (F16). |
 | **Delete** | Removes agent + events. Worktree safety check first — see §6. |
 | **Rename** | Display name only; slug and branch are immutable. |
 
