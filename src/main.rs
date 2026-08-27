@@ -78,6 +78,9 @@ async fn main() -> Result<()> {
     let claude_bin = cfg.claude_bin.clone();
     let pinned = cfg.pinned_cli_version.clone();
     let sup = Supervisor::new(db, Arc::new(RwLock::new(cfg)));
+    // The account's usage outlives the process; the panel should not have to
+    // wait for an agent to run before it can say anything.
+    sup.restore_rate_limit().await;
 
     // The stream-json protocol carries no stability guarantee, so check the CLI
     // version against the pinned one and say so loudly on a mismatch.
@@ -122,6 +125,7 @@ async fn main() -> Result<()> {
         config_path,
         port,
         token: token.clone(),
+        refusals: Default::default(),
     };
     let app = web::routes::router(state);
 

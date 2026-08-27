@@ -1,7 +1,9 @@
 //! REST endpoints and the embedded frontend.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxPath, Query, Request, State};
 use axum::http::{StatusCode, Uri, header};
@@ -33,6 +35,84 @@ pub struct AppState {
     pub port: u16,
     /// The per-boot token every API call and socket upgrade must carry.
     pub token: Arc<SessionToken>,
+    /// Throttle for the refusal log, so one stuck page cannot drown it.
+    pub refusals: Arc<RefusalLog>,
+}
+
+/// How long one path's refusals collapse into a single log line.
+const REFUSAL_QUIET: Duration = Duration::from_secs(60);
+
+/// A rate limiter for "refused" log lines.
+///
+/// A refusal is worth logging: it is the only sign that something on this
+/// machine is reaching for the control plane without the token. But a page
+/// whose token died — the ordinary case being a tab left open across a restart,
+/// since the token is minted per boot — retries its socket every 16s for as
+/// long as it stays open, and two such tabs bury everything else in the log.
+///
+/// So the first is logged and the rest are counted: one line a minute per path,
+/// carrying how many it stands for. Nothing is hidden — a flood still shows as
+/// a flood, in one line instead of hundreds.
+#[derive(Debug, Default)]
+pub struct RefusalLog {
+    seen: Mutex<HashMap<String, Refusal>>,
+}
+
+#[derive(Debug)]
+struct Refusal {
+    logged_at: Instant,
+    since: u64,
+}
+
+impl RefusalLog {
+    /// Record a refusal and log it if this path has been quiet long enough.
+    pub fn note(&self, path: &str) {
+        if let Some(suppressed) = self.tally(path, Instant::now()) {
+            if suppressed == 0 {
+                tracing::warn!(%path, "refused a request with no valid session token");
+            } else {
+                tracing::warn!(
+                    %path,
+                    suppressed,
+                    "repeatedly refused requests with no valid session token; a page is likely \
+                     retrying with a token from before the last restart"
+                );
+            }
+        }
+    }
+
+    /// `Some(n)` if this refusal should be logged, where `n` is how many went
+    /// unlogged since the last line for this path. `None` to stay quiet.
+    fn tally(&self, path: &str, now: Instant) -> Option<u64> {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        match seen.get_mut(path) {
+            Some(entry) if now.duration_since(entry.logged_at) < REFUSAL_QUIET => {
+                entry.since += 1;
+                None
+            }
+            Some(entry) => {
+                let suppressed = std::mem::take(&mut entry.since);
+                entry.logged_at = now;
+                Some(suppressed)
+            }
+            None => {
+                // A refused path is attacker-influenced only in so far as it
+                // must be one we route; cap the map anyway rather than let it
+                // grow for as long as the process lives.
+                if seen.len() >= 64 {
+                    seen.clear();
+                }
+                seen.insert(
+                    path.to_string(),
+                    Refusal {
+                        logged_at: now,
+                        since: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
+    }
 }
 
 /// A random token minted at startup and handed to the browser in the URL the
@@ -305,7 +385,7 @@ async fn guard_loopback(State(state): State<AppState>, req: Request, next: Next)
         }
         let presented = token_of(&req);
         if !presented.is_some_and(|t| state.token.matches(&t)) {
-            tracing::warn!(%path, "refused a request with no valid session token");
+            state.refusals.note(&path);
             return ApiError::unauthorized(
                 "This request needs the session token. Open the link claude-web printed at \
                  startup — the token changes every time the server restarts.",
@@ -337,6 +417,13 @@ fn serve_embedded(path: &str) -> Response {
                     (header::X_FRAME_OPTIONS, "DENY"),
                     (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
                     (header::REFERRER_POLICY, "no-referrer"),
+                    // The assets are compiled into the binary and their URLs
+                    // carry no content hash, so `app.js` after an upgrade is a
+                    // different file at the same address. With no directive at
+                    // all a browser is free to heuristically cache it, which
+                    // makes "reload to pick up the fix" a coin toss. They are
+                    // a few KB over loopback: always revalidate.
+                    (header::CACHE_CONTROL, "no-cache"),
                 ],
                 content.data.into_owned(),
             )
@@ -558,7 +645,15 @@ async fn list_agents(State(state): State<AppState>) -> ApiResult<Json<Value>> {
 /// The last rate-limit snapshot, so a page loaded between two events still has
 /// numbers to show. `null` until some agent's CLI reports one.
 async fn get_rate_limit(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "rate_limit": state.sup.rate_limit().await }))
+    // `captured_at` travels with it: a restored snapshot can be hours old, and
+    // a figure that stale has to be labelled rather than passed off as live.
+    match state.sup.rate_limit().await {
+        Some((captured_at, info)) => Json(json!({
+            "rate_limit": info,
+            "captured_at": captured_at,
+        })),
+        None => Json(json!({ "rate_limit": Value::Null, "captured_at": Value::Null })),
+    }
 }
 
 async fn get_agent(
@@ -895,6 +990,78 @@ mod tests {
             config_path: PathBuf::from("/dev/null"),
             port: 7717,
             token: Arc::new(SessionToken(TEST_TOKEN.to_string())),
+            refusals: Default::default(),
+        }
+    }
+
+    #[test]
+    fn refusals_collapse_to_one_line_a_minute_per_path() {
+        let log = RefusalLog::default();
+        let t0 = Instant::now();
+
+        // The first is always news.
+        assert_eq!(log.tally("/ws", t0), Some(0));
+
+        // A page retrying every 16s: 16s, 32s and 48s all land inside the
+        // minute and stay quiet.
+        for i in 1..=3 {
+            assert_eq!(
+                log.tally("/ws", t0 + Duration::from_secs(16 * i)),
+                None,
+                "retry at {}s",
+                16 * i
+            );
+        }
+
+        // The next one is past the window, so it speaks again — and says how
+        // many it stands for.
+        assert_eq!(
+            log.tally("/ws", t0 + Duration::from_secs(64)),
+            Some(3),
+            "the suppressed ones must be counted, not lost"
+        );
+
+        // The count resets, so the next line is not cumulative.
+        let t2 = t0 + Duration::from_secs(64);
+        assert_eq!(log.tally("/ws", t2 + Duration::from_secs(1)), None);
+        assert_eq!(
+            log.tally("/ws", t2 + REFUSAL_QUIET + Duration::from_secs(1)),
+            Some(1)
+        );
+
+        // A different path is throttled on its own clock: a genuine refusal
+        // elsewhere is never swallowed by a noisy one.
+        assert_eq!(log.tally("/api/agents", t2), Some(0));
+    }
+
+    #[test]
+    fn the_refusal_table_cannot_grow_without_bound() {
+        let log = RefusalLog::default();
+        let t0 = Instant::now();
+        for i in 0..200 {
+            log.tally(&format!("/api/{i}"), t0);
+        }
+        assert!(
+            log.seen.lock().expect("lock").len() <= 64,
+            "the map has to stay capped"
+        );
+    }
+
+    #[tokio::test]
+    async fn assets_are_always_revalidated() {
+        // Their URLs carry no content hash, so a cached `app.js` from before an
+        // upgrade would otherwise keep running.
+        for path in ["index.html", "common.js", "app.css"] {
+            let response = serve_embedded(path);
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-cache"),
+                "{path} may not be served without a revalidation directive"
+            );
         }
     }
 

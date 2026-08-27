@@ -186,7 +186,7 @@ pub struct Supervisor {
     /// The last rate-limit snapshot any agent's CLI reported. Kept so a browser
     /// that connects between two events still sees the numbers, rather than a
     /// blank panel until the next API call.
-    rate_limit: Arc<RwLock<Option<RateLimitInfo>>>,
+    rate_limit: Arc<RwLock<Option<(i64, RateLimitInfo)>>>,
     bus: broadcast::Sender<ServerMsg>,
 }
 
@@ -208,9 +208,39 @@ impl Supervisor {
         &self.db
     }
 
-    /// The last rate-limit snapshot, for a freshly loaded page.
-    pub async fn rate_limit(&self) -> Option<RateLimitInfo> {
+    /// The last rate-limit snapshot and when it was taken, for a freshly
+    /// loaded page. `None` until some agent's CLI has reported one, or a stored
+    /// one has been restored.
+    pub async fn rate_limit(&self) -> Option<(i64, RateLimitInfo)> {
         self.rate_limit.read().await.clone()
+    }
+
+    /// Load the stored snapshot into memory at startup.
+    ///
+    /// Without this the panel is empty on every restart until an agent runs a
+    /// turn — which is exactly backwards, because the moment the figure matters
+    /// most is when the account is rate-limited and nothing *can* run. The
+    /// windows carry absolute reset times, so a stored snapshot stays
+    /// meaningful; the frontend is told how old it is and drops any window that
+    /// has since reset.
+    pub async fn restore_rate_limit(&self) {
+        let stored = match self.db.run(|db| db.rate_limit()).await {
+            Ok(stored) => stored,
+            Err(err) => {
+                tracing::warn!(?err, "could not read the stored rate limit");
+                return;
+            }
+        };
+        let Some((captured_at, value)) = stored else {
+            return;
+        };
+        match serde_json::from_value::<RateLimitInfo>(value) {
+            Ok(info) => {
+                tracing::info!(captured_at, "restored the account's last known usage");
+                *self.rate_limit.write().await = Some((captured_at, info));
+            }
+            Err(err) => tracing::warn!(?err, "the stored rate limit did not parse"),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ServerMsg> {
@@ -1095,7 +1125,7 @@ struct Runner {
     recently_sent: std::collections::VecDeque<String>,
     /// The supervisor's rate-limit snapshot, written through on every
     /// `rate_limit_event` this agent's CLI reports.
-    rate_limit: Arc<RwLock<Option<RateLimitInfo>>>,
+    rate_limit: Arc<RwLock<Option<(i64, RateLimitInfo)>>>,
 }
 
 impl Runner {
@@ -1461,7 +1491,17 @@ impl Runner {
             Action::SessionId(_) => {}
             Action::RateLimit(info) => {
                 // Last writer wins: every agent's CLI reports the same account.
-                *self.rate_limit.write().await = Some((*info).clone());
+                let captured_at = now_ms();
+                *self.rate_limit.write().await = Some((captured_at, (*info).clone()));
+                // Written through so it survives a restart. One small upsert
+                // per API request, against an events table that takes several
+                // rows in the same span.
+                if let Ok(value) = serde_json::to_value(&*info) {
+                    self.db
+                        .run(move |db| db.set_rate_limit(&value, captured_at))
+                        .await
+                        .ok();
+                }
                 self.emit(ServerMsg::RateLimit { info });
             }
             Action::Notice { level, text } => {
@@ -2035,6 +2075,39 @@ mod tests {
     /// the start of a turn — so nothing but the handshake reply can move the
     /// agent out of `Starting`. Without that, Resume left the agent showing
     /// "starting" for as long as it ran.
+    /// The panel was empty after every restart until an agent happened to run a
+    /// turn — worst exactly when the account is rate-limited and nothing can.
+    #[tokio::test]
+    async fn the_last_known_usage_is_restored_at_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agents.db");
+        let db = Db::open(&path).expect("db");
+        db.set_rate_limit(
+            &json!({
+                "status": "rejected",
+                "unifiedWindows": {"five_hour": {"utilization": 0.99, "resetsAt": 1787846400i64}},
+            }),
+            1_787_800_000_000,
+        )
+        .expect("store");
+
+        let sup = Supervisor::new(db, Arc::new(RwLock::new(Config::default())));
+        assert!(
+            sup.rate_limit().await.is_none(),
+            "nothing is assumed before it is asked for"
+        );
+
+        sup.restore_rate_limit().await;
+        let (captured_at, info) = sup.rate_limit().await.expect("restored");
+        assert_eq!(captured_at, 1_787_800_000_000, "the age has to survive too");
+        assert_eq!(info.status, "rejected");
+        assert_eq!(
+            info.unified_windows["five_hour"].utilization,
+            Some(0.99),
+            "the windows are what the meters draw"
+        );
+    }
+
     #[tokio::test]
     async fn a_resume_reaches_idle_without_a_message() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -54,6 +54,18 @@ CREATE TABLE IF NOT EXISTS repo_usage (
   path TEXT PRIMARY KEY,
   last_used_at INTEGER NOT NULL
 );
+
+-- The account's last known usage against its rate-limit windows. One row: it
+-- describes the account, not an agent, and every agent's CLI reports the same
+-- thing. Kept because it is the one gauge whose value does not expire with the
+-- process — `resetsAt` is absolute, so a snapshot taken before a restart still
+-- says something true afterwards, and a server that has just come up has no
+-- other way to know it is rate-limited until an agent runs and finds out.
+CREATE TABLE IF NOT EXISTS rate_limit (
+  id          INTEGER PRIMARY KEY CHECK (id = 1),
+  captured_at INTEGER NOT NULL,
+  payload     TEXT NOT NULL
+);
 "#;
 
 /// Additive migrations applied after [`SCHEMA`].
@@ -500,6 +512,41 @@ impl Db {
         })
     }
 
+    // -- account rate limits -------------------------------------------------
+
+    /// Replace the stored snapshot. Called once per API request the CLI makes,
+    /// so it is a single small upsert and nothing more.
+    pub fn set_rate_limit(&self, info: &Value, captured_at: i64) -> Result<()> {
+        let payload = serde_json::to_string(info).context("serialising the rate limit")?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO rate_limit (id, captured_at, payload) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET captured_at = ?1, payload = ?2",
+                rusqlite::params![captured_at, payload],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The stored snapshot and when it was taken, if there is one.
+    pub fn rate_limit(&self) -> Result<Option<(i64, Value)>> {
+        self.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT captured_at, payload FROM rate_limit WHERE id = 1")?;
+            let mut rows = stmt.query([])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let captured_at: i64 = row.get(0)?;
+            let payload: String = row.get(1)?;
+            // A snapshot we cannot parse is one written by a different build.
+            // Dropping it is right: it is a cache, not a record.
+            Ok(serde_json::from_str(&payload)
+                .ok()
+                .map(|value| (captured_at, value)))
+        })
+    }
+
     pub fn repo_usage(&self) -> Result<HashMap<String, i64>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare("SELECT path, last_used_at FROM repo_usage")?;
@@ -694,6 +741,42 @@ mod tests {
         assert_eq!(db.max_seq("a").expect("max"), 3);
         assert_eq!(db.max_seq("b").expect("max"), 1);
         assert_eq!(db.max_seq("missing").expect("max"), 0);
+    }
+
+    #[test]
+    fn the_rate_limit_snapshot_survives_a_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agents.db");
+        let info = json!({
+            "status": "rejected",
+            "resetsAt": 1787846400i64,
+            "unifiedWindows": {"five_hour": {"utilization": 0.97, "resetsAt": 1787846400i64}},
+        });
+
+        {
+            let db = Db::open(&path).expect("open");
+            assert!(db.rate_limit().expect("read").is_none(), "empty to start");
+            db.set_rate_limit(&info, 1_787_800_000_000).expect("write");
+            // One row, however many times it is written: it describes the
+            // account, and the newest reading replaces the last.
+            db.set_rate_limit(&info, 1_787_800_001_000)
+                .expect("rewrite");
+        }
+
+        // A restart is the whole point: a fresh process must find it.
+        let db = Db::open(&path).expect("reopen");
+        let (captured_at, stored) = db.rate_limit().expect("read").expect("present");
+        assert_eq!(captured_at, 1_787_800_001_000, "the newest capture wins");
+        assert_eq!(stored, info);
+        assert_eq!(
+            db.with_conn(
+                |c| Ok(c.query_row("SELECT count(*) FROM rate_limit", [], |r| r
+                    .get::<_, i64>(0))?)
+            )
+            .expect("count"),
+            1,
+            "the table holds one row, not one per reading"
+        );
     }
 
     #[test]

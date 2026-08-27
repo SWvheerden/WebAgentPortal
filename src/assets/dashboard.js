@@ -9,6 +9,8 @@ const state = {
   repoInfo: null,
   cloneId: null,
   rateLimit: null,
+  /// When the snapshot above was taken, so an old one can say so.
+  rateLimitAt: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -55,6 +57,14 @@ function meter(label, utilization, resetsAt) {
   ]);
 }
 
+// A window whose reset time has passed has rolled over, and the utilization we
+// hold for it is from the window before. We do not know the new figure, so the
+// meter is dropped rather than shown wrong — the snapshot is restored across
+// restarts, so this is a real case, not a theoretical one.
+function stillCurrent(resetsAt) {
+  return !resetsAt || resetsAt * 1000 > Date.now();
+}
+
 function renderLimits() {
   const info = state.rateLimit;
   const panel = $('limits-panel');
@@ -63,12 +73,12 @@ function renderLimits() {
     return;
   }
   const windows = info.unifiedWindows || {};
-  const meters = WINDOWS.filter(([key]) => windows[key]?.utilization != null).map(([key, label]) =>
-    meter(label, windows[key].utilization, windows[key].resetsAt),
-  );
+  const meters = WINDOWS
+    .filter(([key]) => windows[key]?.utilization != null && stillCurrent(windows[key].resetsAt))
+    .map(([key, label]) => meter(label, windows[key].utilization, windows[key].resetsAt));
   // Accounts that report no per-window breakdown still name a governing window
   // and its utilization; show that rather than an empty panel.
-  if (!meters.length && info.utilization !== undefined && info.utilization !== null) {
+  if (!meters.length && info.utilization != null && stillCurrent(info.resetsAt)) {
     meters.push(meter(info.rateLimitType || 'Current window', info.utilization, info.resetsAt));
   }
   if (!meters.length) {
@@ -81,6 +91,10 @@ function renderLimits() {
   const notes = [];
   if (info.status && info.status !== 'allowed') notes.push(info.status.replace(/_/g, ' '));
   if (info.isUsingOverage) notes.push('on overage');
+  // Usage only ever climbs within a window, so an old reading is a floor, not a
+  // lie — but it must not read as live. Said only once it is worth saying.
+  const age = state.rateLimitAt ? Date.now() - state.rateLimitAt : 0;
+  if (age > 60000) notes.push(`as of ${fmtAgo(state.rateLimitAt)}`);
   $('limits-note').textContent = notes.length ? `— ${notes.join(' · ')}` : '';
   panel.classList.toggle('warn-tint', info.status === 'rejected');
   panel.classList.remove('hidden');
@@ -91,6 +105,7 @@ function renderLimits() {
 async function loadLimits() {
   const data = await api('/api/rate_limit').catch(() => null);
   state.rateLimit = data ? data.rate_limit : null;
+  state.rateLimitAt = (data && data.captured_at) || null;
   renderLimits();
 }
 
@@ -516,6 +531,7 @@ async function main() {
     })
     .on('rate_limit', (msg) => {
       state.rateLimit = msg.info;
+      state.rateLimitAt = Date.now();
       renderLimits();
     })
     .on('notice', (msg) => toast(msg.text, msg.level))

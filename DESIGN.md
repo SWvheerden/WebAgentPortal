@@ -137,6 +137,13 @@ CREATE TABLE events (
 );
 
 CREATE TABLE repo_usage (path TEXT PRIMARY KEY, last_used_at INTEGER NOT NULL);
+
+-- One row: the account's last known usage, not an agent's. See "Usage panel".
+CREATE TABLE rate_limit (
+  id          INTEGER PRIMARY KEY CHECK (id = 1),
+  captured_at INTEGER NOT NULL,
+  payload     TEXT NOT NULL
+);
 ```
 
 **Implementation note — one additive migration.** The shipped schema carries one
@@ -554,9 +561,23 @@ blocks), terminal look on top.
 ### Usage panel
 The dashboard shows one meter per rate-limit window — session (5 hours), week (7 days), and
 the overage-included week where the account reports it — each with its utilization and when
-it resets. Hidden entirely until a `rate_limit_event` has arrived, amber past 60% and red
-past 90%. An account that reports no per-window breakdown still names a governing window,
-which is shown instead of an empty panel.
+it resets. Amber past 60% and red past 90%. An account that reports no per-window breakdown
+still names a governing window, which is shown instead of an empty panel.
+
+**The snapshot is persisted**, one row in `rate_limit`, written through on each
+`rate_limit_event` and loaded at startup. Held only in memory it died with the process, so
+the panel was blank after every restart until an agent happened to run a turn — which is
+precisely backwards: the figure matters most when the account is rate-limited and *nothing
+can run*. F13's windows carry absolute reset times, so a stored reading stays meaningful.
+
+Two rules keep a restored reading honest, since it can be hours old:
+
+- `captured_at` travels with it, and a snapshot over a minute old is labelled *"as of 2h
+  ago"*. Usage only climbs within a window, so an old reading is a floor rather than a lie —
+  but it must not read as live.
+- A window whose `resetsAt` has passed has rolled over, and the utilization held for it
+  belongs to the window before. That meter is dropped rather than shown wrong; if none
+  survive, the panel hides.
 
 ### Spawn form
 Repo picker (§6) · task name (auto-filled from folder, editable) · **Workspace**
@@ -578,9 +599,26 @@ which is the only thing that actually helps, since the operator has to open the 
 Anything else, an unreachable server included, is the transient case and backs off as
 before. A page with no token at all never opens the socket in the first place.
 
+That fix only reaches pages **loaded after it shipped**: a tab already open keeps running
+the JavaScript it loaded, so the operator has to reload or close it. Two things follow.
+
+*Assets always revalidate.* They are compiled into the binary and their URLs carry no
+content hash, so `common.js` after an upgrade is a different file at the same address. With
+no `Cache-Control` at all a browser may heuristically cache it, which makes "reload to pick
+up the fix" a coin toss. They are a few KB over loopback, so every asset is served
+`no-cache`.
+
+*The refusal log is throttled.* A refusal is worth logging — it is the only sign that
+something on this machine is reaching for the control plane without the token — but a stuck
+page repeats one every 16s indefinitely, and two of them bury the log. So it is one line a
+minute per path, and the line carries how many it stands for. A flood still reads as a
+flood; it just takes one line instead of hundreds. Per **path**, so a genuine refusal
+somewhere else is never swallowed by a noisy one, and the table of paths is capped.
+
 ### Slash commands
 Typing `/` opens an autocomplete fed by the `initialize` command list (F9): name,
-description, argument hint. Known-unavailable built-ins greyed out (F8).
+description, argument hint. Built-in TUI commands are absent from that list, and the CLI
+refuses them if typed anyway (F16).
 
 ### Message queueing
 The input stays live while `Working`; messages queue natively (F6) and render greyed with
