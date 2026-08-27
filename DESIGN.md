@@ -17,6 +17,7 @@ These are load-bearing — several contradict what the published docs imply.
 | # | Fact | Evidence |
 |---|------|----------|
 | F1 | `claude -p --input-format stream-json --output-format stream-json` is a **long-lived, multi-turn process**. It does *not* exit after one turn; it waits on stdin. Same `session_id` throughout, one `result` event per turn, a fresh `system/init` before each turn. | Two messages 30s apart, one process, both answered. |
+| F1a | `system/init` opens a **turn**, not the process. A freshly launched child emits its `SessionStart` hook lines and answers control requests, then goes quiet — no `init` arrives until the first user message. So `init` is **not** a readiness signal; the reply to our `initialize` handshake (F9) is. | 2.1.247, both `--session-id` and `--resume`, no message sent: hook lines and the `initialize` reply within 1.3s, nothing further for 25s. |
 | F2 | A non-SDK host **can intercept tool permissions**. `--permission-prompt-tool stdio` (undocumented, absent from `--help`, accepted) makes the CLI emit `control_request` / `can_use_tool` carrying `tool_name`, `display_name`, `input`, `description`, `permission_suggestions`, `tool_use_id`. Host replies with a `control_response` `{behavior: "allow"｜"deny", updatedInput}`. | Answered `allow` over stdin; file was written. |
 | F3 | Without a handler, `--permission-mode manual` **denies silently** — `system/permission_denied` plus an error tool_result. No prompt is ever surfaced. | Write blocked, agent reported it couldn't ask. |
 | F4 | Trivially safe commands (e.g. `echo hello`) are **auto-approved** by an internal classifier even in `manual` mode. Not every tool call produces a `can_use_tool`. | Bash echo ran unprompted. |
@@ -162,6 +163,17 @@ claude -p
 cwd = work_path
 ```
 `Dangerously skip all` substitutes `--dangerously-skip-permissions` for `--permission-mode`.
+
+### Readiness: what moves an agent off `Starting`
+
+The `initialize` control request is sent immediately after launch, and **its reply
+is the readiness signal** — not `system/init`, which by F1a only arrives once a turn
+begins. A first launch usually carries a first message, so `init` follows within a
+second or two and the distinction never shows; a **resume sends no message at all**,
+so keying readiness off `init` left every resumed agent displaying `starting` until
+the operator happened to type something. An error reply counts: it still proves the
+child is reading stdin and writing stdout, which is all `Idle` claims. A launch with
+an empty first message had the same bug and is fixed by the same signal.
 
 ### Verbs
 | Verb | Effect |
@@ -538,9 +550,24 @@ past 90%. An account that reports no per-window breakdown still names a governin
 which is shown instead of an empty panel.
 
 ### Spawn form
-Repo picker (§6) · task name (auto-filled from folder, editable) · branch name preview ·
-base ref · model · permission mode · optional first message.
-**Advanced:** effort, `--add-dir`, `--max-budget-usd`, in-place-checkout toggle.
+Repo picker (§6) · task name (auto-filled from folder, editable) · **Workspace**
+(isolated worktree ｜ main checkout) · **Branch** (create a new one ｜ use an existing one,
+with the repo's branches listed) · branch name preview · base ref · model ·
+permission mode · optional first message.
+**Advanced:** effort, `--add-dir`, `--max-budget-usd`.
+
+### The socket, and a token that has gone stale
+The token is minted per boot, so a page left open across a server restart holds a dead one.
+A browser hides the HTTP status of a **rejected upgrade** — a refused token and an
+unreachable server both surface as a bare `close` with code 1006 — so the reconnect loop
+could not tell "come back later" from "never". It chose to come back, every 16s, silently,
+for as long as the tab stayed open.
+
+So a close is classified before it is retried: ask `/api/health`, which *does* report its
+status. A 401 is a verdict — reconnecting is abandoned and the stale-token banner goes up,
+which is the only thing that actually helps, since the operator has to open the new link.
+Anything else, an unreachable server included, is the transient case and backs off as
+before. A page with no token at all never opens the socket in the first place.
 
 ### Slash commands
 Typing `/` opens an autocomplete fed by the `initialize` command list (F9): name,

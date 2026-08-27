@@ -143,10 +143,19 @@ export class Socket {
     this.ws = null;
     this.retry = 0;
     this.onopen = null;
+    /** Set once reconnecting has been given up on, and never unset. */
+    this.stopped = false;
     this.connect();
   }
 
   connect() {
+    if (this.stopped) return;
+    if (!token) {
+      // Nothing to present, so the upgrade would be refused every time.
+      this.stopped = true;
+      needToken();
+      return;
+    }
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     // A browser cannot set headers on an upgrade, so the token rides in the
     // query string for this one request.
@@ -169,10 +178,33 @@ export class Socket {
       if (any) any(msg);
     });
     this.ws.addEventListener('close', () => {
-      // Reconnect with a cursor, so only the delta is replayed.
-      this.retry = Math.min(this.retry + 1, 6);
-      setTimeout(() => this.connect(), 250 * 2 ** this.retry);
+      this.reconnect();
     });
+  }
+
+  /// Decide whether reconnecting can ever work, and back off if it can.
+  ///
+  /// A browser deliberately hides the HTTP status of a rejected upgrade: a
+  /// refused token and a server that is merely down both arrive here as a bare
+  /// close with code 1006. Untangled, that made a page whose token had gone
+  /// stale — the usual cause being a tab left open across a restart, since the
+  /// token is minted per boot — retry every 16s for as long as it stayed open,
+  /// showing the operator nothing and filling the server log with refusals.
+  ///
+  /// So ask over HTTP, which does report the status. A 401 is a verdict, not a
+  /// hiccup: no number of retries will make a dead token live, and only opening
+  /// the new link will. Anything else — including an unreachable server, which
+  /// is exactly the transient case — backs off and tries again.
+  async reconnect() {
+    if (this.stopped) return;
+    if (await tokenRefused()) {
+      this.stopped = true;
+      needToken();
+      return;
+    }
+    // Reconnect with a cursor, so only the delta is replayed.
+    this.retry = Math.min(this.retry + 1, 6);
+    setTimeout(() => this.connect(), 250 * 2 ** this.retry);
   }
 
   on(type, handler) {
@@ -184,6 +216,20 @@ export class Socket {
     const text = JSON.stringify(msg);
     if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(text);
     else this.queue.push(text);
+  }
+}
+
+/// Does the server refuse our token outright? `false` for anything else,
+/// including not being able to ask — a server that is down is not a verdict on
+/// the token.
+async function tokenRefused() {
+  try {
+    const response = await fetch('/api/health', {
+      headers: { 'x-claude-web-token': token },
+    });
+    return response.status === 401;
+  } catch {
+    return false;
   }
 }
 

@@ -533,6 +533,7 @@ impl Supervisor {
             pending: HashMap::new(),
             next_request_id: 1,
             outstanding: HashSet::new(),
+            init_request_id: None,
             commands,
             stop_requested: false,
             last_stderr: None,
@@ -545,8 +546,11 @@ impl Supervisor {
 
         // Status starts at Starting for both a first launch and a resume.
         runner.set_status(Transition::Spawned).await;
-        // Ask for the slash command list up front (F9).
-        runner.send_control(protocol::initialize_request);
+        // Ask for the slash command list up front (F9). The answer doubles as
+        // the readiness signal that moves the agent to `Idle`, so remember
+        // which request it is.
+        let init_id = runner.send_control(protocol::initialize_request);
+        runner.init_request_id = Some(init_id);
         if let Some(text) = first
             && !text.trim().is_empty()
         {
@@ -1068,6 +1072,9 @@ struct Runner {
     /// Control requests we have sent and not yet seen answered. A response for
     /// anything else is not ours to act on.
     outstanding: HashSet<String>,
+    /// The id of the `initialize` handshake sent at launch, until it is
+    /// answered. Answering it is what moves the agent out of `Starting`.
+    init_request_id: Option<String>,
     commands: Arc<RwLock<Vec<SlashCommand>>>,
     stop_requested: bool,
     last_stderr: Option<String>,
@@ -1423,6 +1430,17 @@ impl Runner {
                         still_queued: payload["still_queued"].clone(),
                     });
                 }
+                // The child answering our handshake is the only readiness
+                // signal a launch is guaranteed to get: `system/init` is
+                // emitted at the *start of a turn*, not at process start, so an
+                // agent launched with no first message -- every resume -- would
+                // otherwise sit at `Starting` until someone typed something.
+                // An error reply still proves it is reading stdin and writing
+                // stdout, which is all `Idle` claims.
+                if self.init_request_id.as_deref() == Some(request_id.as_str()) {
+                    self.init_request_id = None;
+                    self.set_status(Transition::Initialized).await;
+                }
             }
             Action::Commands {
                 request_id,
@@ -1585,10 +1603,11 @@ impl Runner {
         id
     }
 
-    fn send_control(&mut self, build: fn(&str) -> Value) {
+    fn send_control(&mut self, build: fn(&str) -> Value) -> String {
         let id = self.take_request_id();
         let value = build(&id);
         self.write(value);
+        id
     }
 
     fn write(&self, value: Value) {
@@ -1770,6 +1789,7 @@ mod tests {
                 pending: HashMap::new(),
                 next_request_id: 1,
                 outstanding: HashSet::new(),
+                init_request_id: None,
                 commands: Arc::new(RwLock::new(Vec::new())),
                 stop_requested: false,
                 last_stderr: None,
@@ -1985,6 +2005,79 @@ mod tests {
             return None;
         }
         Some(path.to_string_lossy().to_string())
+    }
+
+    /// A CLI that answers the `initialize` handshake and nothing else — which
+    /// is exactly what a resumed session does until it is sent a message.
+    fn handshake_only_cli(dir: &Path) -> Option<String> {
+        let path = dir.join("handshake-cli");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+             while IFS= read -r line; do\n\
+             id=$(printf '%s' \"$line\" | sed -n 's/.*\"request_id\":\"\\([^\"]*\\)\".*/\\1/p')\n\
+             [ -n \"$id\" ] && printf '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"%s\",\"response\":{}}}\\n' \"$id\"\n\
+             done\n",
+        )
+        .ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok()?;
+        }
+        if !Path::new("/bin/sh").exists() {
+            return None;
+        }
+        Some(path.to_string_lossy().to_string())
+    }
+
+    /// A resume sends no first message, and the CLI emits `system/init` only at
+    /// the start of a turn — so nothing but the handshake reply can move the
+    /// agent out of `Starting`. Without that, Resume left the agent showing
+    /// "starting" for as long as it ran.
+    #[tokio::test]
+    async fn a_resume_reaches_idle_without_a_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(bin) = handshake_only_cli(dir.path()) else {
+            return;
+        };
+        let db = Db::open_in_memory().expect("db");
+        let record = agent_record("agent-resume-idle", dir.path());
+        db.insert_agent(&record).expect("insert");
+        let sup = Supervisor::new(
+            db.clone(),
+            Arc::new(RwLock::new(Config {
+                claude_bin: bin,
+                ..Config::default()
+            })),
+        );
+        let mut rx = sup.subscribe();
+        sup.resume(&record.id).await.expect("launch");
+
+        let idle = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(ServerMsg::Status { status, .. }) = rx.recv().await
+                    && status == Status::Idle
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            idle.is_ok(),
+            "the handshake reply must take the agent out of `starting`"
+        );
+        assert_eq!(
+            db.get_agent(&record.id)
+                .expect("get")
+                .expect("present")
+                .status,
+            Status::Idle,
+            "and the status has to be persisted, not only broadcast"
+        );
+
+        sup.shutdown().await;
     }
 
     #[tokio::test]

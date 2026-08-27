@@ -972,8 +972,11 @@ pub fn spawn(config: &SpawnConfig) -> Result<(ChildHandle, mpsc::UnboundedReceiv
                 }
             }
         }
+        // `system/init` opens a *turn*, not the process, so a session that was
+        // launched and stopped without ever being sent a message legitimately
+        // has none. It is only evidence of a protocol change when a turn ran.
         if !dispatcher.saw_init() {
-            tracing::warn!("child produced no system/init line; protocol may have changed");
+            tracing::debug!("child produced no system/init line; it never took a turn");
         }
     });
 
