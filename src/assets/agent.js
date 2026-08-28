@@ -284,10 +284,91 @@ function suggestionButtons(request) {
   return buttons;
 }
 
+// `AskUserQuestion` arrives on the permission channel but is not a permission:
+// it is the model asking the operator something, and it reaches the queue in
+// every mode, `bypass` and `dangerous` included. Approving it with the input
+// untouched answers nothing — the CLI reports "the user did not answer the
+// questions" and the model asks again. The answer rides back in `updatedInput`
+// as `answers`, keyed by the question text and valued with the chosen label.
+function isQuestion(request) {
+  return request.tool_name === 'AskUserQuestion'
+    && Array.isArray(request.input && request.input.questions)
+    && request.input.questions.length > 0;
+}
+
+function questionCard(request) {
+  const questions = request.input.questions;
+  const chosen = questions.map(() => new Set());
+  const typed = questions.map(() => '');
+  const fields = questions.map((question, index) => {
+    const name = `q${index}-${request.request_id}`;
+    const options = (question.options || []).map((option) => {
+      const input = el('input', {
+        type: question.multiSelect ? 'checkbox' : 'radio',
+        name,
+        value: option.label,
+        onchange: (event) => {
+          if (!question.multiSelect) chosen[index].clear();
+          if (event.target.checked) chosen[index].add(option.label);
+          else chosen[index].delete(option.label);
+        },
+      });
+      return el('label', { class: 'option' }, [
+        input,
+        el('span', { text: option.label }),
+        option.description ? el('span', { class: 'small muted', text: ` — ${option.description}` }) : null,
+      ]);
+    });
+    return el('div', { class: 'question' }, [
+      question.header ? el('div', { class: 'small muted', text: question.header }) : null,
+      el('div', { class: 'body', text: question.question || '' }),
+      ...options,
+      // The real picker always offers "Other"; typing here wins over the boxes.
+      el('input', {
+        class: 'other',
+        placeholder: 'Other — type an answer instead',
+        oninput: (event) => { typed[index] = event.target.value; },
+      }),
+    ]);
+  });
+
+  const answer = () => {
+    const answers = {};
+    for (const [index, question] of questions.entries()) {
+      // Multi-select answers go back as one string: the field is a string in
+      // the tool's own schema, so the labels are joined rather than nested.
+      const value = typed[index].trim() || [...chosen[index]].join(', ');
+      if (!value) {
+        toast('Every question needs an answer.', 'warn');
+        return;
+      }
+      answers[question.question] = value;
+    }
+    decide(request.request_id, 'allow', { ...request.input, answers });
+  };
+
+  return el('div', { class: 'approval' }, [
+    el('h3', { text: 'The agent is asking you a question' }),
+    ...fields,
+    el('div', { class: 'actions' }, [
+      el('button', { class: 'primary', text: 'Answer', onclick: answer }),
+      el('button', {
+        class: 'danger',
+        text: 'Decline to answer',
+        onclick: () => decide(request.request_id, 'deny'),
+      }),
+    ]),
+  ]);
+}
+
 function renderApprovals() {
   const host = $('approvals');
   host.replaceChildren();
   for (const request of state.pending.values()) {
+    if (isQuestion(request)) {
+      host.append(questionCard(request));
+      continue;
+    }
     host.append(el('div', { class: 'approval' }, [
       el('h3', { text: `Allow ${request.display_name || request.tool_name}?` }),
       request.description ? el('div', { class: 'small muted', text: request.description }) : null,
@@ -304,13 +385,14 @@ function renderApprovals() {
   setAttention(state.pending.size);
 }
 
-function decide(requestId, behavior) {
+function decide(requestId, behavior, updatedInput) {
   socket.send({
     type: 'permission_decision',
     agent_id: state.agent.id,
     request_id: requestId,
     behavior,
     message: behavior === 'deny' ? 'Denied by the operator' : null,
+    updated_input: updatedInput || null,
   });
   state.pending.delete(requestId);
   renderApprovals();

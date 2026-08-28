@@ -618,19 +618,23 @@ impl Supervisor {
         self.command(id, AgentCommand::Send(text.to_string())).await
     }
 
+    /// Answer a prompt the agent is waiting on.
+    ///
+    /// Deliberately not gated on the permission mode. Every mode launches with
+    /// the prompt tool attached (§5), and a mode that skips the *checks* can
+    /// still put a request in the queue — `AskUserQuestion` is the model asking
+    /// the operator a question, and the CLI routes it through the same channel
+    /// whatever the mode. Refusing to answer on the strength of the mode left
+    /// such an agent stuck in `AwaitingApproval` with no way out. What may not
+    /// be answered is a request that is not outstanding, and the runner — which
+    /// holds the pending map — is what says so.
     pub async fn decide(
         &self,
         id: &str,
         request_id: &str,
         decision: PermissionDecision,
     ) -> Result<()> {
-        let record = self.require_agent(id).await?;
-        if !record.permission_mode.intercepts_permissions() {
-            bail!(
-                "agent {id} runs in `{}` mode, so tool calls never reach the approval queue",
-                record.permission_mode
-            );
-        }
+        self.require_agent(id).await?;
         self.command(
             id,
             AgentCommand::Decide {
@@ -2267,12 +2271,16 @@ mod tests {
         assert!(argv.iter().any(|a| a == "/extra/two"));
     }
 
+    /// A mode that skips the ordinary checks still surfaces the prompts the CLI
+    /// routes through the permission tool regardless of mode — `AskUserQuestion`
+    /// being the one that matters. Gating the answer on the mode stranded those
+    /// agents in `AwaitingApproval`, so the mode must not be what decides.
     #[tokio::test]
-    async fn a_non_intercepting_agent_cannot_be_asked_for_a_decision() {
+    async fn a_bypassing_agent_may_still_be_answered() {
         let db = Db::open_in_memory().expect("db");
         let dir = tempfile::tempdir().expect("tempdir");
         let mut record = agent_record("agent-6", dir.path());
-        record.permission_mode = PermissionMode::Bypass;
+        record.permission_mode = PermissionMode::Dangerous;
         db.insert_agent(&record).expect("insert");
         let sup = Supervisor::new(db, Arc::new(RwLock::new(Config::default())));
 
@@ -2285,8 +2293,13 @@ mod tests {
                 },
             )
             .await
-            .expect_err("bypass never reaches the approval queue");
-        assert!(format!("{err:#}").contains("bypass"), "{err:#}");
+            .expect_err("this one is not running");
+        let err = format!("{err:#}");
+        assert!(err.contains("not running"), "{err}");
+        assert!(
+            !err.contains("dangerous"),
+            "the mode may not be what refuses a decision: {err}"
+        );
     }
 
     // -- teardown on every exit path, and shutdown waiting for it ------------

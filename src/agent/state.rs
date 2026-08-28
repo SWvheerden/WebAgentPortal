@@ -199,10 +199,6 @@ impl PermissionMode {
         self.strictness() < current.strictness()
     }
 
-    /// Whether this mode routes tool permission checks through our stdio handler.
-    pub fn intercepts_permissions(self) -> bool {
-        matches!(self, PermissionMode::Ask | PermissionMode::AcceptEdits)
-    }
 }
 
 impl fmt::Display for PermissionMode {
@@ -375,8 +371,6 @@ mod tests {
                 "{m} launches with no permission prompt tool"
             );
         }
-        assert!(PermissionMode::Ask.intercepts_permissions());
-        assert!(!PermissionMode::Bypass.intercepts_permissions());
         assert_eq!(PermissionMode::Dangerous.control_value(), None);
     }
 

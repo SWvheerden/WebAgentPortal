@@ -187,6 +187,12 @@ details.tool pre { color: var(--dim); }
 .approval h3 { margin: 0 0 6px; font-size: 12px; color: var(--warn); }
 .approval pre { background: #0a0e14; padding: 6px; border-radius: 4px; font-size: 11px; }
 .approval .modified { color: var(--warn); }
+/* AskUserQuestion: a question with options, not a tool call to vet. */
+.approval .question { margin: 8px 0 12px; }
+.approval .question .body { margin-bottom: 6px; }
+.approval .option { display: block; margin: 3px 0; cursor: pointer; }
+.approval .option input { width: auto; margin-right: 6px; }
+.approval .question .other { margin-top: 6px; }
 .truncated { color: var(--warn); font-size: 10px; }
 
 /* composer */

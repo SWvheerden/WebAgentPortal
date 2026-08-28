@@ -346,6 +346,19 @@ is not in force. And **the change is broadcast** as `permission_mode_changed`: t
 shows each agent's mode too, and a stale one there reads as a promise the agent is not
 keeping.
 
+### A mode that skips the checks can still ask
+
+`--permission-prompt-tool stdio` reaches the host in every mode, and one tool uses it
+whatever the mode is: **`AskUserQuestion`** is the model asking the operator a question, not
+asking to act, so it lands in the approval queue even under `bypass` and `dangerous`. Two
+things follow. Answering may not be gated on the permission mode — doing so left those
+agents stuck in `AwaitingApproval` with no way out; what may not be answered is a request
+that is not outstanding, which the runner's pending map decides. And approving such a request
+with the input untouched answers nothing: the CLI replies "the user did not answer the
+questions" and the model asks again. The answer rides back in `updatedInput.answers`, keyed
+by the question text and valued with the chosen label, so the browser renders the questions
+and their options rather than an Approve button over a JSON dump.
+
 Pending approvals block that agent only. They are persisted, so a browser reload doesn't
 lose them. Caveat F4 applies: safe commands never appear here.
 
