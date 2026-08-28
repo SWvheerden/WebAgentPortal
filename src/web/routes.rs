@@ -918,8 +918,11 @@ mod tests {
     }
 
     #[test]
-    fn both_permission_pickers_offer_every_mode() {
+    fn every_permission_picker_offers_every_mode() {
         let html = std::str::from_utf8(&Assets::get("index.html").expect("index.html").data)
+            .expect("utf-8")
+            .to_string();
+        let agent_html = std::str::from_utf8(&Assets::get("agent.html").expect("agent.html").data)
             .expect("utf-8")
             .to_string();
         for mode in [
@@ -940,6 +943,13 @@ mod tests {
             assert!(
                 html.matches(&option).count() >= 2,
                 "{} is missing from the spawn picker or the settings picker",
+                mode.as_str()
+            );
+            // The agent page picks the mode again, after launch: a mode missing
+            // there is one an agent could be put in and never taken out of.
+            assert!(
+                agent_html.contains(&option),
+                "{} is missing from the agent page's permission picker",
                 mode.as_str()
             );
         }

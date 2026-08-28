@@ -179,6 +179,11 @@ claude -p
 cwd = work_path
 ```
 `Dangerously skip all` substitutes `--dangerously-skip-permissions` for `--permission-mode`.
+`--permission-prompt-tool stdio` is passed in **every** mode, including the two that never
+ask. It only says a handler is reachable; a `bypass` or `dangerous` launch carrying it still
+runs tools without prompting (verified against the CLI). Omitting it is what would be
+permanent: by F3, a mode later tightened to `manual` with no handler denies silently, so an
+agent started in `bypass` could never be pulled back under review without a relaunch.
 
 ### Readiness: what moves an agent off `Starting`
 
@@ -311,17 +316,35 @@ Soft cap, default **8**. Beyond it the spawn button warns; it does not block.
 
 ## 5. Permissions
 
-Four per-agent modes chosen at spawn:
+Four per-agent modes, chosen at spawn and changeable afterwards:
 
 | UI label | Flags | Behaviour |
 |---|---|---|
 | **Ask me** (default) | `--permission-mode manual --permission-prompt-tool stdio` | `can_use_tool` → agent goes `AwaitingApproval`, browser shows tool, input and description, Approve / Deny. |
 | **Accept edits** | `--permission-mode acceptEdits --permission-prompt-tool stdio` | Edits auto-approved; everything else still asks. |
-| **Bypass** | `--permission-mode bypassPermissions` | No checks. |
-| **Dangerously skip all** | `--dangerously-skip-permissions` | No checks, no guard rails. |
+| **Bypass** | `--permission-mode bypassPermissions --permission-prompt-tool stdio` | No checks. |
+| **Dangerously skip all** | `--dangerously-skip-permissions --permission-prompt-tool stdio` | No checks, no guard rails. |
 
 `permission_suggestions` from the request powers extra buttons ("Accept edits for this
 session"), applied via the `set_permission_mode` control request.
+
+### Changing the mode after the task has started
+
+The mode an agent was spawned with is rarely the mode it should keep for a long task: work
+that starts under review earns the right to run unattended, and work that has started
+surprising the operator has to be pulled back under it. So the agent page carries the same
+picker the spawn form does, on the agent's current mode, and `POST
+/api/agents/<id>/permission_mode` applies it — live to a running agent through the
+`set_permission_mode` control request, and at launch for a stopped one, which needs nothing
+beyond the stored value.
+
+Three rules hold it together. **Relaxing is confirmed** (§8) and written into the agent's own
+event log with its initiator, so a widening appears in the transcript rather than silently.
+**`Dangerously skip all` is launch-only** — it is a flag, not a runtime mode, so the server
+refuses it for a running agent and the picker greys it out rather than recording a mode that
+is not in force. And **the change is broadcast** as `permission_mode_changed`: the dashboard
+shows each agent's mode too, and a stale one there reads as a promise the agent is not
+keeping.
 
 Pending approvals block that agent only. They are persisted, so a browser reload doesn't
 lose them. Caveat F4 applies: safe commands never appear here.
@@ -530,8 +553,8 @@ WS   /ws                        multiplexed, {agent_id, ...}-tagged envelope
 
 One WebSocket serves both dashboard and detail views: one reconnect path, one schema.
 Client→server: `send_message`, `permission_decision`, `interrupt`, `subscribe{agent_id, after_seq}`.
-Server→client: `event`, `status`, `permission_request`, `partial`, `clone_progress`,
-`rate_limit`.
+Server→client: `event`, `status`, `permission_request`, `permission_mode_changed`, `partial`,
+`clone_progress`, `rate_limit`.
 
 `rate_limit` carries no `agent_id`: every agent's CLI reports the same account, so the last
 snapshot to arrive is the truth for all of them. The supervisor keeps it so a page loaded

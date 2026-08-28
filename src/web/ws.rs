@@ -68,6 +68,7 @@ pub fn msg_agent_id(msg: &ServerMsg) -> Option<&str> {
         | ServerMsg::Status { agent_id, .. }
         | ServerMsg::PermissionRequest { agent_id, .. }
         | ServerMsg::PermissionResolved { agent_id, .. }
+        | ServerMsg::PermissionModeChanged { agent_id, .. }
         | ServerMsg::Partial { agent_id, .. }
         | ServerMsg::Commands { agent_id, .. }
         | ServerMsg::Queued { agent_id, .. }

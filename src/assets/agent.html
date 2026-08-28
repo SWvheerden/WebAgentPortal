@@ -14,6 +14,12 @@
     <span id="agent-status"></span>
     <span class="spacer"></span>
     <span class="muted small" id="agent-meta"></span>
+    <select id="agent-mode" title="Permission mode. A running agent switches at once; a stopped one picks it up on resume.">
+      <option value="ask">Ask me</option>
+      <option value="acceptEdits">Accept edits</option>
+      <option value="bypass">Bypass</option>
+      <option value="dangerous">Dangerously skip all</option>
+    </select>
     <button id="btn-interrupt">Interrupt</button>
     <button id="btn-stop">Stop</button>
     <button id="btn-resume">Resume</button>

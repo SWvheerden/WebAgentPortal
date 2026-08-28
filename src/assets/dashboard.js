@@ -594,6 +594,12 @@ async function main() {
       const agent = state.agents.get(msg.agent_id);
       toast(`${agent ? agent.name : msg.agent_id} needs approval for ${msg.request.tool_name}`, 'warn');
     })
+    .on('permission_mode_changed', (msg) => {
+      const agent = state.agents.get(msg.agent_id);
+      if (!agent) return;
+      agent.permission_mode = msg.mode;
+      renderAgents();
+    })
     .on('rate_limit', (msg) => {
       state.rateLimit = msg.info;
       state.rateLimitAt = Date.now();

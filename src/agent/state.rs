@@ -122,7 +122,8 @@ pub enum Transition {
     Errored,
 }
 
-/// The four per-agent permission modes offered at spawn time.
+/// The four per-agent permission modes. Chosen at spawn, and changeable
+/// afterwards from the agent's own page (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PermissionMode {
@@ -147,24 +148,25 @@ impl PermissionMode {
     }
 
     /// The CLI flags this mode launches with.
+    ///
+    /// `--permission-prompt-tool stdio` is passed in every mode, not only the
+    /// two that ask. It is what the CLI needs in order to be *able* to reach a
+    /// handler, and it is only ever consulted by a mode that checks: verified
+    /// against the CLI, a `bypass` or `dangerous` launch carrying it still runs
+    /// tools without asking. Without it at launch, tightening the mode later
+    /// would hit caveat F3 — `manual` with no handler denies silently — so an
+    /// agent started in `bypass` could never be pulled back under review.
     pub fn cli_flags(self) -> Vec<String> {
         let owned = |parts: &[&str]| parts.iter().map(|s| (*s).to_string()).collect();
-        match self {
-            PermissionMode::Ask => owned(&[
-                "--permission-mode",
-                "manual",
-                "--permission-prompt-tool",
-                "stdio",
-            ]),
-            PermissionMode::AcceptEdits => owned(&[
-                "--permission-mode",
-                "acceptEdits",
-                "--permission-prompt-tool",
-                "stdio",
-            ]),
+        let mut args: Vec<String> = match self {
+            PermissionMode::Ask => owned(&["--permission-mode", "manual"]),
+            PermissionMode::AcceptEdits => owned(&["--permission-mode", "acceptEdits"]),
             PermissionMode::Bypass => owned(&["--permission-mode", "bypassPermissions"]),
             PermissionMode::Dangerous => owned(&["--dangerously-skip-permissions"]),
-        }
+        };
+        args.push("--permission-prompt-tool".to_string());
+        args.push("stdio".to_string());
+        args
     }
 
     /// The value a `set_permission_mode` control request would carry, where one
@@ -353,8 +355,26 @@ mod tests {
         );
         assert_eq!(
             PermissionMode::Dangerous.cli_flags(),
-            vec!["--dangerously-skip-permissions"]
+            vec![
+                "--dangerously-skip-permissions",
+                "--permission-prompt-tool",
+                "stdio"
+            ]
         );
+        // Every mode launches able to reach the handler, so an agent can be
+        // tightened back under review without being relaunched.
+        for m in [
+            PermissionMode::Ask,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Bypass,
+            PermissionMode::Dangerous,
+        ] {
+            assert!(
+                m.cli_flags().windows(2).any(|w| w
+                    == ["--permission-prompt-tool".to_string(), "stdio".to_string()]),
+                "{m} launches with no permission prompt tool"
+            );
+        }
         assert!(PermissionMode::Ask.intercepts_permissions());
         assert!(!PermissionMode::Bypass.intercepts_permissions());
         assert_eq!(PermissionMode::Dangerous.control_value(), None);

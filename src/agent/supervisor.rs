@@ -57,6 +57,13 @@ pub enum ServerMsg {
         request_id: String,
         behavior: String,
     },
+    /// The agent's permission mode was changed after launch (§5). Sent to every
+    /// browser, not just the agent's own page: the dashboard displays the mode
+    /// too, and a stale one there reads as a promise the agent is not keeping.
+    PermissionModeChanged {
+        agent_id: String,
+        mode: PermissionMode,
+    },
     Partial {
         agent_id: String,
         payload: Value,
@@ -702,6 +709,10 @@ impl Supervisor {
                 payload,
             });
         }
+        self.broadcast(ServerMsg::PermissionModeChanged {
+            agent_id: id.to_string(),
+            mode,
+        });
         tracing::info!(agent = %id, %current, %mode, "operator changed the permission mode");
 
         // A running agent is switched live; a stopped one picks it up on resume.
@@ -2793,6 +2804,7 @@ mod tests {
         let record = agent_record("agent-perm", dir.path());
         db.insert_agent(&record).expect("insert");
         let sup = Supervisor::new(db.clone(), Arc::new(RwLock::new(Config::default())));
+        let mut bus = sup.subscribe();
 
         let err = sup
             .set_permission_mode(&record.id, PermissionMode::Bypass, false)
@@ -2829,6 +2841,20 @@ mod tests {
         assert_eq!(change.payload["to"], json!("bypass"));
         assert_eq!(change.payload["relaxed"], json!(true));
         assert_eq!(change.payload["initiator"], json!("operator"));
+
+        // Every browser is told, so no view is left showing the mode the agent
+        // was in before the switch.
+        let mut announced = None;
+        while let Ok(msg) = bus.try_recv() {
+            if let ServerMsg::PermissionModeChanged { agent_id, mode } = msg {
+                announced = Some((agent_id, mode));
+            }
+        }
+        assert_eq!(
+            announced,
+            Some((record.id.clone(), PermissionMode::Bypass)),
+            "the change must be broadcast, not only stored"
+        );
     }
 
     #[tokio::test]

@@ -168,6 +168,14 @@ function renderEvent(event) {
           el('div', { class: 'body', text: `— process exited (code ${p.code ?? '?'}${p.signal ? `, signal ${p.signal}` : ''})` }),
         ]);
       }
+      if (p.subtype === 'permission_mode_change') {
+        return el('div', { class: 'ev system' }, [
+          el('div', {
+            class: 'body',
+            text: `⚙ permission mode: ${p.from} → ${p.to}${p.relaxed ? ' (more freedom)' : ''} · by ${p.initiator || 'operator'}`,
+          }),
+        ]);
+      }
       if (p.type === 'control_response') return null;
       return el('div', { class: 'ev system' }, [
         el('div', { class: 'body', text: `${p.subtype || 'system'}` }),
@@ -311,6 +319,45 @@ function decide(requestId, behavior) {
 
 // -- header -----------------------------------------------------------------
 
+// Mirrors PermissionMode::strictness: higher constrains the agent more. Only
+// used to tell a tightening from a relaxation, which is the one the operator is
+// asked to confirm.
+const MODE_STRICTNESS = { ask: 3, acceptEdits: 2, bypass: 1, dangerous: 0 };
+
+function modeLabel(mode) {
+  const option = [...$('agent-mode').options].find((o) => o.value === mode);
+  return option ? option.textContent : mode;
+}
+
+// The mode shown is the mode the server holds. It is put back on every failure
+// and reasserted from the broadcast, so the picker never claims a freedom the
+// agent was not actually given.
+async function changeMode(mode) {
+  const agent = state.agent;
+  const current = agent.permission_mode;
+  const picker = $('agent-mode');
+  if (!agent || mode === current) return;
+  const relaxes = MODE_STRICTNESS[mode] < MODE_STRICTNESS[current];
+  if (relaxes
+    && !confirm(`Switch from ${modeLabel(current)} to ${modeLabel(mode)}? That gives the agent more freedom for the rest of this session.`)) {
+    picker.value = current;
+    return;
+  }
+  picker.disabled = true;
+  try {
+    await api(`/api/agents/${agent.id}/permission_mode`, {
+      method: 'POST',
+      body: JSON.stringify({ mode, confirm: relaxes }),
+    });
+    agent.permission_mode = mode;
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    picker.disabled = false;
+    renderHeader();
+  }
+}
+
 function renderHeader() {
   const agent = state.agent;
   if (!agent) return;
@@ -319,11 +366,22 @@ function renderHeader() {
   const where = agent.is_git
     ? `${agent.branch || 'detached'} · base ${agent.base_ref || '?'} · ${agent.uses_worktree ? 'worktree' : 'main checkout'}`
     : 'no VCS';
-  $('agent-meta').textContent = `${where} · ${agent.permission_mode} · ${fmtCost(agent.cost_usd)} · ${agent.work_path}`;
+  // The mode is the picker's job now; repeating it in the meta line would let
+  // the two disagree.
+  $('agent-meta').textContent = `${where} · ${fmtCost(agent.cost_usd)} · ${agent.work_path}`;
   const running = agent.status !== 'stopped' && agent.status !== 'failed';
   $('btn-interrupt').disabled = !running;
   $('btn-stop').disabled = !running;
   $('btn-resume').disabled = running;
+  const picker = $('agent-mode');
+  picker.value = agent.permission_mode;
+  for (const option of picker.options) {
+    // `--dangerously-skip-permissions` is a launch flag with no runtime
+    // equivalent: the server refuses it for a running agent, so don't offer it.
+    option.disabled = option.value === 'dangerous'
+      && running
+      && agent.permission_mode !== 'dangerous';
+  }
   setTitle(`${agent.name} · claude-web`);
 }
 
@@ -438,6 +496,7 @@ async function main() {
       button.disabled = false;
     }
   };
+  $('agent-mode').onchange = (event) => changeMode(event.target.value);
   $('send').onclick = send;
   $('load-earlier').onclick = () => loadEarlier().catch((e) => toast(e.message, 'error'));
   $('input').addEventListener('input', updateAutocomplete);
@@ -528,6 +587,11 @@ async function main() {
       if (msg.agent_id !== state.agent.id) return;
       state.pending.delete(msg.request_id);
       renderApprovals();
+    })
+    .on('permission_mode_changed', (msg) => {
+      if (msg.agent_id !== state.agent.id) return;
+      state.agent.permission_mode = msg.mode;
+      renderHeader();
     })
     .on('commands', (msg) => {
       if (msg.agent_id === state.agent.id) state.commands = msg.commands;
