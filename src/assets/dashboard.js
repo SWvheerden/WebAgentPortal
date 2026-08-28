@@ -1,5 +1,5 @@
 // Dashboard: the agent registry, account usage, the spawn form, cloning and settings.
-import { api, el, slugify, statusEl, fmtCost, fmtAgo, Socket, toast } from '/assets/common.js';
+import { api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, toast } from '/assets/common.js';
 
 const state = {
   agents: new Map(),
@@ -111,7 +111,21 @@ async function loadLimits() {
 
 // -- agents -----------------------------------------------------------------
 
-function agentCard(agent) {
+// Everything the card actually displays, in display form. Two agents with the
+// same signature render identically, so the node can be left alone — which is
+// what stops a card being torn down and rebuilt under the pointer on every
+// status message. `fmtAgo` rather than the raw timestamp: `last_active_at`
+// changes on every event, but "4m ago" changes once a minute.
+function cardSignature(agent) {
+  return JSON.stringify([
+    agent.name, agent.slug, agent.status, agent.status_detail,
+    agent.repo_path, agent.is_git, agent.branch, agent.uses_worktree,
+    agent.permission_mode, fmtCost(agent.cost_usd), fmtAgo(agent.last_active_at),
+    agent.status === 'failed' ? agent.last_stderr : null,
+  ]);
+}
+
+function agentCard(agent, signature) {
   const where = agent.is_git
     ? `${agent.branch || 'detached'} · ${agent.uses_worktree ? 'worktree' : 'main checkout'}`
     : 'no VCS';
@@ -132,7 +146,7 @@ function agentCard(agent) {
   actions.append(el('button', { text: 'Rename', onclick: () => rename(agent) }));
   actions.append(el('button', { class: 'danger', text: 'Delete', onclick: () => remove(agent) }));
 
-  return el('div', { class: 'card', 'data-id': agent.id }, [
+  return el('div', { class: 'card', 'data-id': agent.id, 'data-sig': signature }, [
     el('h3', {}, [
       el('a', { href: `/agent/${agent.slug}`, text: agent.name }),
     ]),
@@ -150,13 +164,47 @@ function agentCard(agent) {
 }
 
 function renderAgents() {
-  const cards = $('cards');
-  cards.replaceChildren();
-  const list = [...state.agents.values()].sort((a, b) => b.last_active_at - a.last_active_at);
-  for (const agent of list) cards.append(agentCard(agent));
+  const host = $('cards');
+  // Ordered by when the agent was created, which never changes: a card stays
+  // where it was first put, for as long as it exists, and a new one is appended
+  // after the rest. Ordering by `last_active_at` meant every status message —
+  // one per tool call — sent whichever agent just did something to the front,
+  // so with two agents working the board reshuffled continuously and a button
+  // moved out from under the cursor between aiming and clicking.
+  const list = [...state.agents.values()].sort((a, b) => a.created_at - b.created_at);
+
+  // Reconcile rather than rebuild: an untouched card keeps its own DOM node, so
+  // it holds its hover, focus and any in-flight button state.
+  const stale = new Map([...host.children].map((node) => [node.dataset.id, node]));
+  let previous = null;
+  for (const agent of list) {
+    const signature = cardSignature(agent);
+    let node = stale.get(agent.id);
+    if (node) {
+      stale.delete(agent.id);
+      if (node.dataset.sig !== signature) {
+        const fresh = agentCard(agent, signature);
+        node.replaceWith(fresh);
+        node = fresh;
+      }
+    } else {
+      node = agentCard(agent, signature);
+    }
+    // A no-op whenever the card is already in the right place, which — the
+    // order being stable — is nearly always.
+    if (node.parentNode !== host || node.previousElementSibling !== previous) {
+      if (previous) previous.after(node);
+      else host.prepend(node);
+    }
+    previous = node;
+  }
+  for (const gone of stale.values()) gone.remove();
+
   $('empty').classList.toggle('hidden', list.length > 0);
   const running = list.filter((a) => a.status !== 'stopped' && a.status !== 'failed').length;
   $('agent-count').textContent = list.length ? `— ${running} running of ${list.length}` : '';
+  // Every render, so the tab clears itself the moment the last one is answered.
+  setAttention(list.filter((a) => a.status === 'awaiting_approval').length);
 }
 
 async function loadAgents() {
@@ -414,6 +462,21 @@ async function startClone() {
   }
 }
 
+// The spawn form opens on the configured default rather than on whatever the
+// markup happens to list first. The server applies the same default to a
+// request that omits the mode, so the picker and that fallback agree; a
+// hand-edited config naming a mode this build does not offer is left alone
+// rather than blanking the control.
+function applySpawnDefaults() {
+  const cfg = state.config;
+  if (!cfg) return;
+  const mode = $('permission-mode');
+  if ([...mode.options].some((option) => option.value === cfg.default_permission_mode)) {
+    mode.value = cfg.default_permission_mode;
+  }
+  $('model').placeholder = cfg.default_model || 'opus';
+}
+
 // -- settings ---------------------------------------------------------------
 
 function fillSettings() {
@@ -444,6 +507,7 @@ async function saveSettings() {
   try {
     state.config = await api('/api/config', { method: 'PUT', body: JSON.stringify(cfg) });
     toast('Settings saved');
+    applySpawnDefaults();
     await loadRepos();
     updateBranchPreview();
   } catch (err) {
@@ -462,6 +526,7 @@ function togglePanel(id) {
 async function main() {
   state.config = await api('/api/config').catch(() => null);
   fillSettings();
+  applySpawnDefaults();
   await loadAgents();
   await loadLimits();
   await loadRepos();

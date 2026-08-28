@@ -556,7 +556,40 @@ ahead of a gap.
 **No build step.** Hand-written HTML/CSS/vanilla ES modules embedded via `rust-embed`.
 `cargo build` yields one self-contained binary; no npm, no bundler. Terminal-styled
 monospace transcript pane — structured events underneath (tool calls as collapsible
-blocks), terminal look on top.
+blocks), terminal look on top. Both pages carry a turtle favicon — an inline SVG, drawn for
+16px rather than shrunk to it, so a tab is identifiable at a glance.
+
+### The tab as a notification surface
+An agent in `awaiting_approval` is **blocked on a human**, and that human is usually in their
+editor rather than on this page. The browser tab is the only surface that reaches them there,
+so it carries the alert: the title counts what is waiting, and the turtle wears an amber
+badge — amber being the colour `awaiting_approval` already has in the UI.
+
+It flashes only while the operator is *not* looking: `document.hidden || !document.hasFocus()`,
+so a tab that is visible inside an unfocused window still counts as away, which is the case
+the whole thing exists for. Watching it, the badge sits still and the title reads
+`(1) claude-web` — the page already shows the amber card, and something blinking under
+someone's nose is just noise. It clears the moment the last request is answered.
+
+`document.title` is owned by the flasher and pages set their base title through `setTitle`,
+or the two would overwrite each other on every tick.
+
+Only `awaiting_approval` qualifies. `failed` looks like it belongs and does not: it is
+terminal, nothing is waiting on the human, and a flash with no answering action would simply
+never stop.
+
+**Agent cards hold their place.** They are ordered by `created_at`, which never changes: a
+card stays where it was first put for as long as it exists, and a new agent is appended
+after the rest. Ordering by `last_active_at` sent whichever agent had just done something to
+the front, and since a status message arrives per tool call, two working agents reshuffled
+the board continuously — a button could move out from under the cursor between aiming and
+clicking.
+
+The list is also reconciled rather than rebuilt. Each card carries a signature of everything
+it displays, in display form (`fmtAgo(last_active_at)`, not the raw timestamp, so a figure
+that changes on every event but reads the same is not a change). A card whose signature is
+unchanged keeps its own DOM node and with it its hover, focus and any in-flight button
+state; only the agent that actually changed is re-rendered.
 
 ### Usage panel
 The dashboard shows one meter per rate-limit window — session (5 hours), week (7 days), and
@@ -655,6 +688,19 @@ default_permission_mode = "ask"
 claude_bin      = "claude"
 pinned_cli_version = "2.1.241"   # warn on mismatch
 ```
+
+### The two defaults reach the spawn form
+
+`default_model` and `default_permission_mode` are the values a spawn request inherits when it
+omits them, but a form that always sends a value never omits anything — so a default that
+lives only on the server is a default the UI silently overrides. The spawn panel therefore
+reads both from the config on load, and again whenever Settings is saved: the permission
+picker opens on the configured mode, and the model field carries it as its placeholder. The
+markup's own first option is no longer what a fresh form means.
+
+A config naming a mode this build does not offer leaves the picker alone rather than blanking
+it, and a test asserts every `PermissionMode` variant appears in both pickers — a mode the
+form cannot select is a default that cannot be honoured.
 
 ---
 

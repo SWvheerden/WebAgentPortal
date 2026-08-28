@@ -1,5 +1,5 @@
 // Agent detail: transcript, approvals, composer, slash commands.
-import { api, el, statusEl, fmtCost, Socket, toast } from '/assets/common.js';
+import { api, el, statusEl, fmtCost, setAttention, setTitle, Socket, toast } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
@@ -291,6 +291,9 @@ function renderApprovals() {
       ]),
     ]));
   }
+  // Called after every change to `state.pending`, so this is the one place the
+  // tab needs to be told.
+  setAttention(state.pending.size);
 }
 
 function decide(requestId, behavior) {
@@ -321,7 +324,7 @@ function renderHeader() {
   $('btn-interrupt').disabled = !running;
   $('btn-stop').disabled = !running;
   $('btn-resume').disabled = running;
-  document.title = `${agent.name} · claude-web`;
+  setTitle(`${agent.name} · claude-web`);
 }
 
 // -- slash command autocomplete --------------------------------------------

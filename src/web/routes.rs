@@ -907,10 +907,40 @@ mod tests {
             "common.js",
             "dashboard.js",
             "agent.js",
+            "favicon.svg",
+            "favicon-alert.svg",
         ] {
             assert!(
                 Assets::get(name).is_some(),
                 "missing embedded asset: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_permission_pickers_offer_every_mode() {
+        let html = std::str::from_utf8(&Assets::get("index.html").expect("index.html").data)
+            .expect("utf-8")
+            .to_string();
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Bypass,
+            PermissionMode::Dangerous,
+        ] {
+            // Exhaustive on purpose: a new variant fails to compile here rather
+            // than quietly becoming a default the spawn form cannot select.
+            match mode {
+                PermissionMode::Ask
+                | PermissionMode::AcceptEdits
+                | PermissionMode::Bypass
+                | PermissionMode::Dangerous => {}
+            }
+            let option = format!("value=\"{}\"", mode.as_str());
+            assert!(
+                html.matches(&option).count() >= 2,
+                "{} is missing from the spawn picker or the settings picker",
+                mode.as_str()
             );
         }
     }

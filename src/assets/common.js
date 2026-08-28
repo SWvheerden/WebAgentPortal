@@ -134,6 +134,86 @@ export function fmtAgo(ms) {
   return `${Math.round(secs / 86400)}d ago`;
 }
 
+// -- tab attention ----------------------------------------------------------
+//
+// An agent in `awaiting_approval` is *blocked on a human*, and the operator is
+// usually in their editor rather than on this page. The tab is the only surface
+// that reaches them there, so it carries the alert: the title counts what is
+// waiting, and the turtle gets an amber badge.
+//
+// Only `awaiting_approval`. `failed` looks like it belongs here but does not:
+// it is terminal, nothing is waiting on the human, and a flash that cannot be
+// resolved by answering it would simply never stop.
+
+const ICON = '/assets/favicon.svg';
+const ICON_ALERT = '/assets/favicon-alert.svg';
+const FLASH_MS = 1200;
+
+let baseTitle = document.title;
+let attention = 0;
+let loudPhase = false;
+let flashTimer = null;
+
+/// Is the operator actually looking at this tab? A visible tab in an unfocused
+/// window does not count — that is the case this whole feature exists for.
+function watching() {
+  return !document.hidden && document.hasFocus();
+}
+
+function setIcon(href) {
+  const link = document.querySelector('link[rel="icon"]');
+  if (link && link.getAttribute('href') !== href) link.setAttribute('href', href);
+}
+
+function paintTab() {
+  if (!attention) {
+    document.title = baseTitle;
+    setIcon(ICON);
+    return;
+  }
+  const noun = attention === 1 ? 'approval' : 'approvals';
+  const loud = !watching() && loudPhase;
+  document.title = loud ? `🔔 ${attention} ${noun} needed` : `(${attention}) ${baseTitle}`;
+  // Looking at it, the badge sits still: the page already shows the amber card,
+  // and something blinking under their nose is just noise. Away, it blinks.
+  setIcon(watching() || loud ? ICON_ALERT : ICON);
+}
+
+function scheduleFlash() {
+  const wanted = attention > 0 && !watching();
+  if (wanted && !flashTimer) {
+    flashTimer = setInterval(() => {
+      loudPhase = !loudPhase;
+      paintTab();
+    }, FLASH_MS);
+  } else if (!wanted && flashTimer) {
+    clearInterval(flashTimer);
+    flashTimer = null;
+    loudPhase = false;
+  }
+  paintTab();
+}
+
+/// The title to show when nothing is waiting. Pages own their own title, so
+/// they set it through here rather than writing `document.title` — otherwise
+/// the two would overwrite each other every time the flash ticks.
+export function setTitle(text) {
+  baseTitle = text;
+  paintTab();
+}
+
+/// How many things are waiting on a human right now. 0 clears the alert.
+export function setAttention(count) {
+  const next = Math.max(0, Number(count) || 0);
+  if (next === attention) return;
+  attention = next;
+  scheduleFlash();
+}
+
+document.addEventListener('visibilitychange', scheduleFlash);
+window.addEventListener('focus', scheduleFlash);
+window.addEventListener('blur', scheduleFlash);
+
 // One socket, one reconnect path, one schema. Handlers are keyed by the
 // envelope's `type`.
 export class Socket {
