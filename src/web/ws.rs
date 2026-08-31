@@ -72,6 +72,7 @@ pub fn msg_agent_id(msg: &ServerMsg) -> Option<&str> {
         | ServerMsg::Partial { agent_id, .. }
         | ServerMsg::Commands { agent_id, .. }
         | ServerMsg::Queued { agent_id, .. }
+        | ServerMsg::AgentRenamed { agent_id, .. }
         | ServerMsg::AgentRemoved { agent_id } => Some(agent_id),
         ServerMsg::AgentAdded { agent } => Some(&agent.id),
         ServerMsg::Notice { agent_id, .. } => agent_id.as_deref(),
@@ -314,6 +315,15 @@ mod tests {
             },
             &HashSet::new()
         ));
+        // A rename changes what every card and tab title says, not just the
+        // window it was typed in.
+        assert!(should_forward(
+            &ServerMsg::AgentRenamed {
+                agent_id: "a".into(),
+                name: "New name".into()
+            },
+            &HashSet::new()
+        ));
         assert!(should_forward(
             &ServerMsg::CloneProgress {
                 clone_id: "c".into(),
@@ -393,11 +403,26 @@ mod tests {
         let value = serde_json::to_value(event_msg("a")).expect("serialise");
         assert_eq!(value["type"], json!("event"));
         assert_eq!(value["seq"], json!(1));
+
+        let value = serde_json::to_value(ServerMsg::AgentRenamed {
+            agent_id: "a".into(),
+            name: "New name".into(),
+        })
+        .expect("serialise");
+        assert_eq!(value["type"], json!("agent_renamed"));
+        assert_eq!(value["name"], json!("New name"));
     }
 
     #[test]
     fn agent_ids_are_found_on_every_variant_that_has_one() {
         assert_eq!(msg_agent_id(&event_msg("a")), Some("a"));
+        assert_eq!(
+            msg_agent_id(&ServerMsg::AgentRenamed {
+                agent_id: "a".into(),
+                name: "New name".into()
+            }),
+            Some("a")
+        );
         assert_eq!(
             msg_agent_id(&ServerMsg::Notice {
                 agent_id: None,

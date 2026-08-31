@@ -440,6 +440,29 @@ async function changeMode(mode) {
   }
 }
 
+// The display name only: the slug, the branch and this page's URL are fixed at
+// launch, so a rename never moves the agent out from under the open window.
+async function rename() {
+  const agent = state.agent;
+  if (!agent) return;
+  const name = prompt('New display name (the slug and branch never change):', agent.name);
+  if (name === null) return;
+  const button = $('btn-rename');
+  button.disabled = true;
+  try {
+    const data = await api(`/api/agents/${agent.id}/rename`, {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    });
+    Object.assign(state.agent, data.agent);
+    renderHeader();
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function renderHeader() {
   const agent = state.agent;
   if (!agent) return;
@@ -578,6 +601,7 @@ async function main() {
       button.disabled = false;
     }
   };
+  $('btn-rename').onclick = rename;
   $('agent-mode').onchange = (event) => changeMode(event.target.value);
   $('send').onclick = send;
   $('load-earlier').onclick = () => loadEarlier().catch((e) => toast(e.message, 'error'));
@@ -669,6 +693,11 @@ async function main() {
       if (msg.agent_id !== state.agent.id) return;
       state.pending.delete(msg.request_id);
       renderApprovals();
+    })
+    .on('agent_renamed', (msg) => {
+      if (msg.agent_id !== state.agent.id) return;
+      state.agent.name = msg.name;
+      renderHeader();
     })
     .on('permission_mode_changed', (msg) => {
       if (msg.agent_id !== state.agent.id) return;

@@ -203,7 +203,7 @@ an empty first message had the same bug and is fixed by the same signal.
 | **Stop** | SIGTERM (runs `SessionEnd` hooks, records the interrupted turn), 5s grace, then SIGKILL — to the CLI's process group *and* to every other process group found under it (see below). History and `session_id` retained. Worktree untouched. |
 | **Resume** | Respawn with `--resume <session_id>` (F7). Restores the conversation; it does **not** restart the interrupted turn — the CLI comes up and waits, so continuing the work takes an ordinary message. `/resume` is not that message: it is a TUI command the headless CLI refuses (F16). |
 | **Delete** | Removes agent + events. Worktree safety check first — see §6. |
-| **Rename** | Display name only; slug and branch are immutable. |
+| **Rename** | Display name only; slug and branch are immutable — the detail view's URL survives it. Offered on the dashboard card *and* in the agent window's header, and broadcast as `agent_renamed` so neither is left showing the old name. |
 
 **No auto-restart.** An unexpected exit surfaces `Failed` with exit code and last stderr,
 and offers one-click Resume. Silent respawn duplicates side effects.
@@ -566,8 +566,8 @@ WS   /ws                        multiplexed, {agent_id, ...}-tagged envelope
 
 One WebSocket serves both dashboard and detail views: one reconnect path, one schema.
 Client→server: `send_message`, `permission_decision`, `interrupt`, `subscribe{agent_id, after_seq}`.
-Server→client: `event`, `status`, `permission_request`, `permission_mode_changed`, `partial`,
-`clone_progress`, `rate_limit`.
+Server→client: `event`, `status`, `permission_request`, `permission_mode_changed`,
+`agent_renamed`, `partial`, `clone_progress`, `rate_limit`.
 
 `rate_limit` carries no `agent_id`: every agent's CLI reports the same account, so the last
 snapshot to arrive is the truth for all of them. The supervisor keeps it so a page loaded

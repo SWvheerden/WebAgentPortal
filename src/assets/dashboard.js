@@ -234,7 +234,7 @@ async function act(id, verb, button) {
 
 async function rename(agent) {
   const name = prompt('New display name (the slug and branch never change):', agent.name);
-  if (!name) return;
+  if (name === null) return;
   try {
     const data = await api(`/api/agents/${agent.id}/rename`, {
       method: 'POST',
@@ -584,6 +584,12 @@ async function main() {
     })
     .on('agent_added', (msg) => {
       state.agents.set(msg.agent.id, msg.agent);
+      renderAgents();
+    })
+    .on('agent_renamed', (msg) => {
+      const agent = state.agents.get(msg.agent_id);
+      if (!agent) return;
+      agent.name = msg.name;
       renderAgents();
     })
     .on('agent_removed', (msg) => {

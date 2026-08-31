@@ -64,6 +64,13 @@ pub enum ServerMsg {
         agent_id: String,
         mode: PermissionMode,
     },
+    /// The agent's display name was changed after launch. Wide, like the mode:
+    /// the dashboard card, the detail header and the browser tab all show the
+    /// name, and a rename in one window must not leave the others stale.
+    AgentRenamed {
+        agent_id: String,
+        name: String,
+    },
     Partial {
         agent_id: String,
         payload: Value,
@@ -736,9 +743,14 @@ impl Supervisor {
             bail!("name cannot be empty");
         }
         let agent_id = id.to_string();
+        let stored = name.clone();
         self.db
-            .run(move |db| db.rename_agent(&agent_id, &name))
+            .run(move |db| db.rename_agent(&agent_id, &stored))
             .await?;
+        self.broadcast(ServerMsg::AgentRenamed {
+            agent_id: id.to_string(),
+            name,
+        });
         self.require_agent(id).await
     }
 
@@ -2867,6 +2879,48 @@ mod tests {
             announced,
             Some((record.id.clone(), PermissionMode::Bypass)),
             "the change must be broadcast, not only stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn renaming_is_broadcast_to_every_window() {
+        let db = Db::open_in_memory().expect("db");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = agent_record("agent-rename", dir.path());
+        db.insert_agent(&record).expect("insert");
+        let sup = Supervisor::new(db.clone(), Arc::new(RwLock::new(Config::default())));
+        let mut bus = sup.subscribe();
+
+        sup.rename(&record.id, "  Fix the lexer  ")
+            .await
+            .expect("rename");
+
+        // Surrounding whitespace is not part of a display name.
+        let stored = db.get_agent(&record.id).expect("get").expect("present");
+        assert_eq!(stored.name, "Fix the lexer");
+        // The slug is the agent's identity — and its URL. A rename never moves it.
+        assert_eq!(stored.slug, record.slug);
+
+        let mut announced = None;
+        while let Ok(msg) = bus.try_recv() {
+            if let ServerMsg::AgentRenamed { agent_id, name } = msg {
+                announced = Some((agent_id, name));
+            }
+        }
+        assert_eq!(
+            announced,
+            Some((record.id.clone(), "Fix the lexer".to_string())),
+            "a rename in one window must reach the dashboard and every other view"
+        );
+
+        // An empty name would leave a card with nothing to click.
+        assert!(sup.rename(&record.id, "   ").await.is_err());
+        assert_eq!(
+            db.get_agent(&record.id)
+                .expect("get")
+                .expect("present")
+                .name,
+            "Fix the lexer"
         );
     }
 
