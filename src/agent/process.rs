@@ -5,7 +5,7 @@
 //! below only moves bytes, so the protocol handling can be tested against
 //! synthetic stdout without a real `claude` binary anywhere near it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use super::protocol::{
     self, CliEvent, EventKind, LaunchArgs, PermissionRequest, RateLimitInfo, SlashCommand,
-    ToolProgressLine, tool_uses,
+    SystemLine, ToolProgressLine, tool_uses,
 };
 use super::state::Transition;
 
@@ -110,6 +110,23 @@ pub struct Dispatcher {
     /// say "Bash: cargo test — 60s" instead of the bare tool name. Tool ids do
     /// not outlive their turn, so this is cleared at every `result`.
     tool_labels: HashMap<String, String>,
+    /// Backgrounded subagents that have not reported yet, `task_id` → label.
+    ///
+    /// The CLI hands the parent a tool result the instant a subagent *starts*
+    /// and lets the turn finish without waiting for it, so the `result` line
+    /// is no longer proof that the agent has nothing left to do. This set is.
+    background_tasks: BTreeMap<String, String>,
+    /// A turn that ended while [`Dispatcher::background_tasks`] was not empty.
+    /// The turn is over; the agent is not idle. The CLI wakes it with a
+    /// `task_notification` when the subagent reports, and it speaks again with
+    /// no operator input at all — so `idle`, which means "your turn to type",
+    /// would be a lie. Held until the last subagent is accounted for.
+    deferred_turn_end: bool,
+    /// Whether a turn is currently producing output. Only the first line of a
+    /// turn raises [`Transition::TurnStarted`], so a turn the *CLI* began —
+    /// waking on a subagent's result — moves the agent to `working` exactly
+    /// once, rather than on every line.
+    turn_open: bool,
 }
 
 /// How many in-flight tool labels to remember before dropping the lot. A bound
@@ -151,6 +168,147 @@ impl Dispatcher {
         Some(format!("{base} — {}", fmt_elapsed(elapsed)))
     }
 
+    /// Fold one backgrounded-subagent lifecycle line into the live set, and say
+    /// what that does to the status.
+    ///
+    /// `background_tasks_changed` carries the whole list and is therefore the
+    /// authority; the per-task lines are belt and braces, so that a version of
+    /// the CLI that stops sending the list — or a task that starts before we
+    /// attach — still leaves the set right.
+    fn on_task_line(&mut self, sys: &SystemLine) -> Vec<Action> {
+        let was_empty = self.background_tasks.is_empty();
+        match sys.subtype.as_deref() {
+            Some("background_tasks_changed") => {
+                let Some(tasks) = &sys.tasks else {
+                    return Vec::new();
+                };
+                self.background_tasks = tasks
+                    .iter()
+                    .map(|t| {
+                        let label = t
+                            .description
+                            .clone()
+                            .or_else(|| t.task_type.clone())
+                            .unwrap_or_else(|| t.task_id.clone());
+                        (t.task_id.clone(), label)
+                    })
+                    .collect();
+            }
+            Some("task_started") => {
+                // Only a *backgrounded* subagent outlives its parent's turn. A
+                // synchronous one is already covered — the parent sits in the
+                // `Task` tool call until it reports — and tracking it would
+                // risk pinning the agent to `working` on a task that has no
+                // completion line of its own. Anything not known to be
+                // backgrounded is left to `background_tasks_changed`, which is
+                // the authority on what is actually running.
+                if sys.is_backgrounded != Some(true) {
+                    return Vec::new();
+                }
+                let Some(id) = sys.task_id.clone() else {
+                    return Vec::new();
+                };
+                let label = sys
+                    .description
+                    .clone()
+                    .or_else(|| sys.subagent_type.clone())
+                    .unwrap_or_else(|| id.clone());
+                self.background_tasks.insert(id, label);
+            }
+            Some("task_progress") => {
+                // The subagent is still going and has said what it is doing.
+                // Only a refresh of a label we already hold: a progress line
+                // for a task we never saw start is not evidence enough to
+                // hold the turn open on.
+                let Some(id) = sys.task_id.as_deref() else {
+                    return Vec::new();
+                };
+                let Some(slot) = self.background_tasks.get_mut(id) else {
+                    return Vec::new();
+                };
+                if let Some(what) = sys
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                {
+                    *slot = what.to_string();
+                }
+            }
+            Some("task_updated") => {
+                let (Some(id), Some(status)) = (sys.task_id.as_deref(), sys.patched_status())
+                else {
+                    return Vec::new();
+                };
+                if !protocol::is_terminal_task_status(status) {
+                    return Vec::new();
+                }
+                self.background_tasks.remove(id);
+            }
+            Some("task_notification") => {
+                let Some(id) = sys.task_id.as_deref() else {
+                    return Vec::new();
+                };
+                self.background_tasks.remove(id);
+            }
+            _ => return Vec::new(),
+        }
+
+        if self.background_tasks.is_empty() {
+            // Nothing left to wait for. A turn that ended while a subagent was
+            // running has been held open until now; close it, so an agent the
+            // CLI decides not to wake still comes to rest at `idle`. The wake
+            // usually beats the operator to it and puts `working` straight
+            // back up.
+            if self.deferred_turn_end {
+                self.deferred_turn_end = false;
+                self.turn_open = false;
+                return vec![
+                    Action::StatusDetail(None),
+                    Action::Transition(Transition::TurnEnded),
+                ];
+            }
+            return Vec::new();
+        }
+        // Only speak for the status line while the agent has nothing of its own
+        // to report; mid-turn, the tool it is running is the better label.
+        if self.deferred_turn_end && !was_empty {
+            return vec![Action::StatusDetail(Some(self.waiting_label()))];
+        }
+        Vec::new()
+    }
+
+    /// Whose work a tool label describes. A subagent's tool is not the agent's
+    /// own, and once the agent's turn is over it is the only thing left to
+    /// report — so it keeps the framing the waiting label set, rather than
+    /// replacing "waiting on a subagent" with a tool the agent is not running.
+    fn delegated_label(&self, label: &str, delegated: bool) -> String {
+        match (delegated, self.deferred_turn_end) {
+            (true, true) => format!("waiting on subagent: {label}"),
+            (true, false) => format!("subagent · {label}"),
+            (false, _) => label.to_string(),
+        }
+    }
+
+    /// "waiting on subagent: Read a.txt" — what the agent is blocked on once
+    /// its own turn is over.
+    fn waiting_label(&self) -> String {
+        let mut names = self.background_tasks.values();
+        let count = self.background_tasks.len();
+        let first = names.next().map(String::as_str).unwrap_or("a subagent");
+        let short: String = first.trim().chars().take(60).collect();
+        let ellipsis = if short.len() < first.trim().len() {
+            "…"
+        } else {
+            ""
+        };
+        if count == 1 {
+            format!("waiting on subagent: {short}{ellipsis}")
+        } else {
+            format!("waiting on {count} subagents: {short}{ellipsis}, …")
+        }
+    }
+
     /// Interpret one line of stdout.
     pub fn on_stdout(&mut self, line: &str) -> Vec<Action> {
         let line = line.trim();
@@ -168,13 +326,14 @@ impl Dispatcher {
                     kind: EventKind::System,
                     payload: raw,
                 });
-                if let Some(id) = sys.session_id {
+                if let Some(id) = sys.session_id.clone() {
                     out.push(Action::SessionId(id));
                 }
                 if sys.subtype.as_deref() == Some("init") {
                     self.saw_init = true;
                     out.push(Action::Transition(Transition::Initialized));
                 }
+                out.extend(self.on_task_line(&sys));
             }
             CliEvent::Assistant(msg) if msg.is_api_error_message => {
                 // A synthesised line carrying an API failure, not the model
@@ -192,6 +351,17 @@ impl Dispatcher {
                 });
             }
             CliEvent::Assistant(msg) => {
+                // A subagent talks on its parent's stream, tagged with the tool
+                // call that launched it. That is the subagent's turn, not the
+                // parent's.
+                let delegated = msg.parent_tool_use_id.is_some();
+                // A turn is not always ours to start: the CLI wakes the agent
+                // when a backgrounded subagent reports, and it talks with no
+                // operator input at all. Whoever began it, output means work.
+                if !delegated && !self.turn_open {
+                    self.turn_open = true;
+                    out.push(Action::Transition(Transition::TurnStarted));
+                }
                 out.push(Action::Persist {
                     kind: EventKind::Assistant,
                     payload: raw,
@@ -204,7 +374,9 @@ impl Dispatcher {
                         }
                         self.tool_labels.insert(id, label.clone());
                     }
-                    out.push(Action::StatusDetail(Some(label)));
+                    out.push(Action::StatusDetail(Some(
+                        self.delegated_label(&label, delegated),
+                    )));
                     out.push(Action::Persist {
                         kind: EventKind::ToolUse,
                         payload: json!({
@@ -242,8 +414,19 @@ impl Dispatcher {
                     });
                 }
                 self.tool_labels.clear();
-                out.push(Action::StatusDetail(None));
-                out.push(Action::Transition(Transition::TurnEnded));
+                self.turn_open = false;
+                // The turn is over, but a backgrounded subagent outlives it:
+                // the CLI returns the `Task` tool result as soon as the
+                // subagent *starts*, and wakes the agent again when it
+                // finishes. Reporting `idle` here tells the operator the agent
+                // is waiting on them, when it is waiting on its own subagent.
+                if self.background_tasks.is_empty() {
+                    out.push(Action::StatusDetail(None));
+                    out.push(Action::Transition(Transition::TurnEnded));
+                } else {
+                    self.deferred_turn_end = true;
+                    out.push(Action::StatusDetail(Some(self.waiting_label())));
+                }
             }
             CliEvent::StreamEvent(value) => out.push(Action::Partial(value)),
             CliEvent::ControlRequest(req) => match req.as_permission_request() {
@@ -1170,6 +1353,213 @@ mod tests {
             "{actions:?}"
         );
         assert_eq!(kinds(&actions), vec![EventKind::Result]);
+    }
+
+    // -- backgrounded subagents ---------------------------------------------
+    //
+    // Shapes taken verbatim from a `--output-format stream-json` run of
+    // claude 2.1.251 that launched one subagent. The `Task`/`Agent` tool is
+    // asynchronous: the parent gets its tool result ("Async agent launched
+    // successfully") the moment the subagent starts, finishes its turn, and is
+    // woken by the CLI with a `task_notification` when the subagent reports.
+
+    const AGENT_TOOL_USE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01JX","name":"Agent","input":{"subagent_type":"general-purpose","description":"Read a.txt and report contents","prompt":"read a.txt"}}]}}"#;
+    const TASKS_ONE: &str = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a618","task_type":"local_agent","description":"Read a.txt and report contents"}],"session_id":"s1"}"#;
+    const TASKS_NONE: &str =
+        r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"session_id":"s1"}"#;
+    const TASK_STARTED: &str = r#"{"type":"system","subtype":"task_started","task_id":"a618","tool_use_id":"toolu_01JX","description":"Read a.txt and report contents","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","session_id":"s1"}"#;
+    const TURN_OVER: &str = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":0.4,"result":"The subagent has been launched and is reading a.txt in the background."}"#;
+
+    #[test]
+    fn a_turn_that_ends_with_a_subagent_still_running_is_not_idle() {
+        let actions = dispatch(&[AGENT_TOOL_USE, TASKS_ONE, TASK_STARTED, TURN_OVER]);
+
+        // The `result` closes the turn, but the agent has not stopped working
+        // and the operator is not being waited on: `idle` would say both.
+        assert!(
+            !actions.contains(&Action::Transition(Transition::TurnEnded)),
+            "a turn with a subagent still running must not report idle: {actions:?}"
+        );
+        assert!(
+            !actions.contains(&Action::StatusDetail(None)),
+            "the sub-label must not be cleared while the agent is still waiting"
+        );
+        assert!(
+            actions.contains(&Action::StatusDetail(Some(
+                "waiting on subagent: Read a.txt and report contents".into()
+            ))),
+            "the status has to name what is being waited on: {actions:?}"
+        );
+        // The cost the turn reported still lands.
+        assert!(actions.contains(&Action::Cost(0.4)));
+    }
+
+    #[test]
+    fn the_agent_comes_to_rest_once_the_last_subagent_reports() {
+        let mut d = Dispatcher::new();
+        for line in [AGENT_TOOL_USE, TASKS_ONE, TASK_STARTED, TURN_OVER] {
+            d.on_stdout(line);
+        }
+
+        // The list is the authority: emptied, nothing is left to wait for, and
+        // the turn end that was held back finally lands.
+        let actions = d.on_stdout(TASKS_NONE);
+        assert!(actions.contains(&Action::Transition(Transition::TurnEnded)));
+        assert!(actions.contains(&Action::StatusDetail(None)));
+
+        // ...and only once. A second drain has nothing left to close, so it
+        // must not push an idle agent through another turn end.
+        let again = d.on_stdout(TASKS_NONE);
+        assert!(
+            !again.contains(&Action::Transition(Transition::TurnEnded)),
+            "{again:?}"
+        );
+        assert!(!again.contains(&Action::StatusDetail(None)), "{again:?}");
+    }
+
+    /// The per-task lines close the turn too, for a CLI that stops sending the
+    /// list. An agent held at `working` by a task nobody ever retires is worse
+    /// than one that goes idle a moment early.
+    #[test]
+    fn a_completed_task_releases_the_turn_without_the_list() {
+        let mut d = Dispatcher::new();
+        for line in [AGENT_TOOL_USE, TASK_STARTED, TURN_OVER] {
+            d.on_stdout(line);
+        }
+        let progress = d.on_stdout(
+            r#"{"type":"system","subtype":"task_progress","task_id":"a618","description":"Reading a.txt","last_tool_name":"Read","session_id":"s1"}"#,
+        );
+        assert!(
+            progress.contains(&Action::StatusDetail(Some(
+                "waiting on subagent: Reading a.txt".into()
+            ))),
+            "a subagent's own progress is the best label there is: {progress:?}"
+        );
+        assert!(!progress.contains(&Action::Transition(Transition::TurnEnded)));
+
+        let done = d.on_stdout(
+            r#"{"type":"system","subtype":"task_updated","task_id":"a618","patch":{"status":"completed","end_time":1788185758593},"session_id":"s1"}"#,
+        );
+        assert!(done.contains(&Action::Transition(Transition::TurnEnded)));
+        assert!(done.contains(&Action::StatusDetail(None)));
+    }
+
+    #[test]
+    fn several_subagents_are_counted_and_the_last_one_closes_the_turn() {
+        let mut d = Dispatcher::new();
+        d.on_stdout(TASKS_ONE);
+        d.on_stdout(TURN_OVER);
+        let actions = d.on_stdout(
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a618","description":"Read a.txt and report contents"},{"task_id":"b729","description":"Read b.txt"}],"session_id":"s1"}"#,
+        );
+        let Some(Action::StatusDetail(Some(label))) = actions
+            .iter()
+            .find(|a| matches!(a, Action::StatusDetail(Some(_))))
+            .cloned()
+        else {
+            panic!("expected a refreshed label: {actions:?}");
+        };
+        assert!(label.starts_with("waiting on 2 subagents:"), "{label}");
+        assert!(
+            !actions.contains(&Action::Transition(Transition::TurnEnded)),
+            "one of the two is still running"
+        );
+    }
+
+    /// A subagent's own lines arrive on the parent's stream, tagged with the
+    /// tool call that launched it. They are the subagent working, not the
+    /// parent starting a turn, and the status has to say whose work it is.
+    #[test]
+    fn a_subagents_lines_do_not_pass_as_the_parents_own_turn() {
+        let mut d = Dispatcher::new();
+        for line in [AGENT_TOOL_USE, TASKS_ONE, TASK_STARTED, TURN_OVER] {
+            d.on_stdout(line);
+        }
+        let delegated = d.on_stdout(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_01JX","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_9","name":"Read","input":{"file_path":"a.txt"}}]}}"#,
+        );
+        assert!(
+            !delegated.contains(&Action::Transition(Transition::TurnStarted)),
+            "the parent's turn is over; the subagent's is not the parent's: {delegated:?}"
+        );
+        assert!(
+            delegated.contains(&Action::StatusDetail(Some(
+                "waiting on subagent: Read: a.txt".into()
+            ))),
+            "a subagent's tool must not read as one the agent is running: {delegated:?}"
+        );
+
+        // The drain closes the turn the subagent's chatter left open, so the
+        // parent's wake-up still registers as a turn of its own.
+        assert!(
+            d.on_stdout(TASKS_NONE)
+                .contains(&Action::Transition(Transition::TurnEnded))
+        );
+        let woken = d.on_stdout(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The subagent found: hello world"}]}}"#,
+        );
+        assert!(
+            woken.contains(&Action::Transition(Transition::TurnStarted)),
+            "an idle agent that starts talking is working: {woken:?}"
+        );
+    }
+
+    /// A subagent the parent waits on inline needs no help from us: the parent
+    /// is inside the tool call for its whole life. Holding the turn open for
+    /// one risks an agent stuck at `working` on a task with no completion line.
+    #[test]
+    fn a_synchronous_subagent_does_not_hold_the_turn_open() {
+        let mut d = Dispatcher::new();
+        d.on_stdout(AGENT_TOOL_USE);
+        d.on_stdout(
+            r#"{"type":"system","subtype":"task_started","task_id":"c930","description":"Inline work","subagent_type":"general-purpose","is_backgrounded":false,"session_id":"s1"}"#,
+        );
+        let end = d.on_stdout(TURN_OVER);
+        assert!(end.contains(&Action::Transition(Transition::TurnEnded)));
+        assert!(end.contains(&Action::StatusDetail(None)));
+    }
+
+    /// The wake-up turn arrives with no message from us. Nothing marks its
+    /// start but the output itself, so the output has to.
+    #[test]
+    fn a_turn_the_cli_begins_on_its_own_still_moves_the_agent_to_working() {
+        let mut d = Dispatcher::new();
+        for line in [
+            AGENT_TOOL_USE,
+            TASKS_ONE,
+            TASK_STARTED,
+            TURN_OVER,
+            TASKS_NONE,
+        ] {
+            d.on_stdout(line);
+        }
+        let woken = d.on_stdout(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a618","tool_use_id":"toolu_01JX","status":"completed","summary":"a.txt contains hello world","session_id":"s1"}"#,
+        );
+        assert!(
+            !woken.contains(&Action::Transition(Transition::TurnEnded)),
+            "the task was already accounted for by the list: {woken:?}"
+        );
+
+        let actions = d.on_stdout(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The subagent found: hello world"}]}}"#,
+        );
+        assert!(
+            actions.contains(&Action::Transition(Transition::TurnStarted)),
+            "an assistant line with no message from us is still a turn: {actions:?}"
+        );
+
+        // Once per turn, not once per line.
+        let more = d.on_stdout(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Anything else?"}]}}"#,
+        );
+        assert!(!more.contains(&Action::Transition(Transition::TurnStarted)));
+
+        // And with nothing outstanding, the turn ends the ordinary way.
+        let end =
+            d.on_stdout(r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1}"#);
+        assert!(end.contains(&Action::Transition(Transition::TurnEnded)));
+        assert!(end.contains(&Action::StatusDetail(None)));
     }
 
     #[test]

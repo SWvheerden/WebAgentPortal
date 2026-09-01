@@ -68,7 +68,8 @@ impl std::str::FromStr for EventKind {
 pub struct UnknownEventKind(pub String);
 
 /// A `system` line. `subtype` distinguishes `init` from everything else
-/// (`permission_denied`, compaction notices, …).
+/// (`permission_denied`, compaction notices, the backgrounded-subagent
+/// lifecycle, …).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemLine {
     #[serde(default)]
@@ -85,6 +86,57 @@ pub struct SystemLine {
     pub slash_commands: Vec<Value>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// `background_tasks_changed` only: the complete live list, which is the
+    /// authority on what is still running. `None` on every other subtype —
+    /// an *empty* list is the signal that the last subagent has finished, so
+    /// the two cannot be collapsed.
+    #[serde(default)]
+    pub tasks: Option<Vec<BackgroundTask>>,
+    /// `task_started` / `task_progress` / `task_updated` / `task_notification`.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    /// `task_started`: whether the parent was handed its tool result at once
+    /// and let go, rather than being blocked until the subagent reports.
+    #[serde(default)]
+    pub is_backgrounded: Option<bool>,
+    /// `task_notification`: `completed`, `failed`, …
+    #[serde(default)]
+    pub status: Option<String>,
+    /// `task_progress`: the tool the subagent is running right now.
+    #[serde(default)]
+    pub last_tool_name: Option<String>,
+    /// `task_updated`: the fields that changed, `status` among them.
+    #[serde(default)]
+    pub patch: Option<Value>,
+}
+
+impl SystemLine {
+    /// The task's state after a `task_updated` patch, if it carried one.
+    pub fn patched_status(&self) -> Option<&str> {
+        self.patch.as_ref()?.get("status")?.as_str()
+    }
+}
+
+/// One backgrounded subagent, as listed by `background_tasks_changed`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundTask {
+    pub task_id: String,
+    #[serde(default)]
+    pub task_type: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Is this the end of a backgrounded task, rather than an update to a live one?
+///
+/// Anything that is not explicitly still running counts: a task we stop hearing
+/// about must not pin the agent to `working` forever.
+pub fn is_terminal_task_status(status: &str) -> bool {
+    !matches!(status, "running" | "pending" | "queued" | "in_progress")
 }
 
 /// An `assistant` or `user` line. The nested `message` follows the Messages API
@@ -894,6 +946,50 @@ mod tests {
             retry.describe(None),
             "subagent subagent is retrying after timeout"
         );
+    }
+
+    /// The drain signal is an *empty* list, not a missing one. Collapsing the
+    /// two would leave a finished subagent looking like it was still running.
+    #[test]
+    fn an_empty_background_task_list_is_not_a_missing_one() {
+        let line = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"session_id":"s1"}"#;
+        let CliEvent::System(sys) = parse_line(line).event else {
+            panic!("expected system");
+        };
+        assert!(
+            sys.tasks.is_some_and(|t| t.is_empty()),
+            "an empty list has to survive as an empty list"
+        );
+
+        let line = r#"{"type":"system","subtype":"init","session_id":"s1"}"#;
+        let CliEvent::System(sys) = parse_line(line).event else {
+            panic!("expected system");
+        };
+        assert!(sys.tasks.is_none(), "no list at all is not an empty list");
+    }
+
+    #[test]
+    fn a_task_line_carries_what_the_subagent_is_doing() {
+        let line = r#"{"type":"system","subtype":"task_started","task_id":"a618","tool_use_id":"toolu_01JX","description":"Read a.txt and report contents","subagent_type":"general-purpose","is_backgrounded":true,"spawn_depth":1,"task_type":"local_agent","session_id":"s1"}"#;
+        let CliEvent::System(sys) = parse_line(line).event else {
+            panic!("expected system");
+        };
+        assert_eq!(sys.task_id.as_deref(), Some("a618"));
+        assert_eq!(
+            sys.description.as_deref(),
+            Some("Read a.txt and report contents")
+        );
+        assert_eq!(sys.subagent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(sys.is_backgrounded, Some(true));
+
+        let line = r#"{"type":"system","subtype":"task_updated","task_id":"a618","patch":{"status":"completed","end_time":1788185758593},"session_id":"s1"}"#;
+        let CliEvent::System(sys) = parse_line(line).event else {
+            panic!("expected system");
+        };
+        assert_eq!(sys.patched_status(), Some("completed"));
+        assert!(is_terminal_task_status("completed"));
+        assert!(is_terminal_task_status("failed"));
+        assert!(!is_terminal_task_status("running"));
     }
 
     #[test]

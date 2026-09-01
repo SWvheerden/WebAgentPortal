@@ -1219,6 +1219,16 @@ impl Runner {
         };
         if transition == Transition::Spawned {
             self.status_detail = None;
+            self.status = next;
+            self.publish_status().await;
+            return;
+        }
+        // A transition that lands where it already was is not news. Several
+        // arrive per turn — every line the CLI produces reasserts that the
+        // agent is working — and each one would otherwise cost a write and a
+        // broadcast to tell every browser what it already shows.
+        if next == self.status {
+            return;
         }
         self.status = next;
         self.publish_status().await;

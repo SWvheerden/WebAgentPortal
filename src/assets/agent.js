@@ -177,6 +177,33 @@ function renderEvent(event) {
         ]);
       }
       if (p.type === 'control_response') return null;
+      // A backgrounded subagent. The parent's `Agent` tool result only says one
+      // was launched, so without these the transcript goes quiet for as long as
+      // the subagent runs and then resumes as if nothing had happened.
+      if (p.subtype === 'task_started') {
+        const what = p.description || p.subagent_type || p.task_id;
+        return el('div', { class: 'ev system' }, [
+          el('div', { class: 'body', text: `⧉ subagent started${p.subagent_type ? ` (${p.subagent_type})` : ''}: ${what}` }),
+        ]);
+      }
+      if (p.subtype === 'task_notification') {
+        const line = el('div', { class: 'ev system' }, [
+          el('div', { class: 'body', text: `⧉ subagent ${p.status || 'finished'}` }),
+        ]);
+        if (p.summary) {
+          line.append(el('details', { class: 'tool' }, [
+            el('summary', { text: 'what it reported' }),
+            el('pre', { text: pretty(p.summary) }),
+          ]));
+        }
+        return line;
+      }
+      // Bookkeeping the status line already reflects: the running-task list and
+      // its progress pings, several of which arrive per subagent.
+      if (p.subtype === 'background_tasks_changed' || p.subtype === 'task_progress'
+        || p.subtype === 'task_updated') {
+        return null;
+      }
       return el('div', { class: 'ev system' }, [
         el('div', { class: 'body', text: `${p.subtype || 'system'}` }),
       ]);

@@ -30,9 +30,10 @@ These are load-bearing — several contradict what the published docs imply.
 | F11 | On-disk transcripts (`~/.claude/projects/*/*.jsonl`) are **documented as an unstable internal format**. Not a store we may read. | Official docs. |
 | F13 | The CLI emits a **`rate_limit_event`** whenever the account's usage changes, in practice once per API request. `rate_limit_info` is camelCase inside a snake_case envelope: `status` (`allowed`｜`allowed_warning`｜`rejected`), and optionally `resetsAt` (unix **seconds**), `rateLimitType`, `utilization`, `isUsingOverage` and `unifiedWindows` (`five_hour`, `seven_day`, `seven_day_overage_included`, each `{utilization, resetsAt}`). Present since at least 2.1.241. | Captured from 2.1.241 and 2.1.246; shape cross-checked against the CLI's own schema. |
 | F14 | The CLI emits a **`tool_progress`** every 30s for any tool still running (`heartbeat: true`), carrying `tool_name`, `elapsed_time_seconds`, and two ids that are not what they look like: `tool_use_id` is **synthetic** (`<real tool_use_id>-heartbeat-<n>`, so it matches no `tool_use` block) and `parent_tool_use_id` is the **tool actually running**, not a nesting flag. A variant with no heartbeat carries `subagent_retry` while a subagent's API call is being retried. The `bash_progress`-derived variant, which would carry incremental output, is gated behind `CLAUDE_CODE_REMOTE`/`CLAUDE_CODE_CONTAINER_ID`, so a local child never sends it. | Captured from 2.1.246: a 95s foreground `Bash` yielded `toolu_01Xd…-heartbeat-0` with `parent_tool_use_id` = `toolu_01Xd…`. 30s interval read from the CLI's own timer. |
-| F14a | The Agent tool is **exempt** from heartbeats, and a tool running *inside* a subagent was not observed to emit `tool_progress` on the parent's stream at all — so a long subagent is invisible to this signal from both directions. Stated as an observation, not a guarantee. | A delegated 40s `Bash` inside a `general-purpose` subagent produced no `tool_progress`; the exemption is explicit in the CLI's heartbeat timer. |
+| F14a | The Agent tool is **exempt** from heartbeats, and a tool running *inside* a subagent was not observed to emit `tool_progress` on the parent's stream at all — so a long subagent is invisible to this signal from both directions. Stated as an observation, not a guarantee. | A delegated 40s `Bash` inside a `general-purpose` subagent produced no `tool_progress`; the exemption is explicit in the CLI's heartbeat timer. The `task_*` lines of F17 are what fill that gap. |
 | F15 | An API failure **does not stop the turn from looking like a success**. The CLI synthesises an `assistant` line with `is_api_error_message: true`, `error: "rate_limit"` and `model: "<synthetic>"` carrying the human text, then closes the turn with a `result` whose `subtype` is still **`"success"`** while `is_error: true` and `api_error_status: 429`. So `subtype` must never be keyed off; `is_error` is the flag that means it and `result` carries the wording. The agent is genuinely `Idle` afterwards — the process is alive and can be spoken to. | A session that hit its five-hour limit mid-task on 2.1.246: two synthetic `assistant` lines, then `result` with `subtype: "success"`, `is_error: true`, `api_error_status: 429`. |
 | F16 | **Built-in TUI slash commands are not in the `initialize` list and are refused if typed.** `/resume`, `/status`, `/cost` and `/help` are absent from the 74 commands 2.1.247 advertised; sending `/resume` returns a `<synthetic>` assistant line — *"/resume isn't available in this environment."* — and a `result` with `is_error: false`. Skills, plugin and project commands do resolve (F8). | The advertised list inspected; `/resume` sent and refused. |
+| F17 | The **Agent/Task tool is asynchronous**. The parent is handed its tool result — *"Async agent launched successfully … you will be notified automatically when it completes"* — the moment the subagent **starts**, and closes its turn with an ordinary `result` while the subagent runs on. The lifecycle arrives as `system` lines: `background_tasks_changed` (the **complete live list**, emptied when the last one ends), `task_started` (`task_id`, `tool_use_id`, `description`, `subagent_type`, `is_backgrounded`), `task_progress` (`description`, `last_tool_name`), `task_updated` (`patch.status`) and `task_notification` (`status`, `summary`). The notification then **wakes the parent into a fresh turn with no user message**. So `result` is not proof the agent has finished, and the first line of a turn is not always a reply to something we sent. | 2.1.251, one backgrounded `general-purpose` subagent: `task_started` → `result` ("I'll let you know as soon as it completes") → `background_tasks_changed: []` → `task_notification` → a second `system/init`, `assistant` lines and a second `result`, none of it prompted. |
 | F12 | Remote Control (`claude remote-control`) is a persistent server, ≤32 concurrent sessions, outbound-only, but **scoped to one directory** and requiring a full-scope subscription login. Compatibility with `-p` is **undocumented and untested** (testing would create a real session on the account). | `claude remote-control --help` + docs. |
 
 ### Risk register
@@ -165,6 +166,22 @@ thousands of rows per turn and replay re-animates every keystroke.
 `Starting → Idle → Working → Idle …`, with `AwaitingApproval` branching off `Working`,
 and `Stopped(code)` / `Failed(error)` as terminal states. `Working` carries a live
 sub-label naming the current tool.
+
+**`Idle` claims the agent is waiting on the operator**, which is the only reason the
+status exists — it is what tells them to type. By F17 the closing `result` no longer
+proves it: a backgrounded subagent outlives the turn that launched it, and the CLI wakes
+the agent when it reports. So a turn that ends with subagents still running **holds its
+`TurnEnded` back** and shows `Working — waiting on subagent: <what it is doing>`; the
+held turn end lands when the live list empties, so an agent the CLI decides not to wake
+still comes to rest rather than sitting at `Working` for good. Only tasks the CLI calls
+`is_backgrounded` are tracked — a synchronous subagent already keeps its parent inside
+the tool call, and tracking one whose completion we might never see is the way to a
+permanently busy agent.
+
+And because that woken turn carries no message from us, **the first line of CLI output
+raises `TurnStarted`**, whoever began the turn. Sending a message still raises it too,
+so the transition arrives at most once per turn either way; a transition that lands
+where it already was is not published.
 
 ### Launch
 ```
