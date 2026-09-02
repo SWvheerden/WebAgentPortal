@@ -523,6 +523,9 @@ Relaxing an agent's permission mode is additionally a confirmed action, and the
 change is written into that agent's own event log with its initiator, so it
 appears in the transcript rather than silently.
 
+All of the above describes the loopback default. Binding a non-loopback address
+is opt-in, requires a separate durable credential, and is specified in §12.
+
 ### Host and Origin
 
 Loopback binding alone does not survive DNS rebinding: a page served from
@@ -849,8 +852,8 @@ already takes: the token raises the bar, it does not build a wall.
 
 **Not integrated.** The portal already does what Remote Control does — messages, streaming
 output, approvals, interrupt — and keeps arbitrary per-agent directories, which Remote
-Control cannot (it is scoped to one directory). Phone access comes from putting the portal
-on Tailscale, or binding `0.0.0.0` behind a bearer token.
+Control cannot (it is scoped to one directory). Phone access comes from §12: binding a
+tailnet or private address, behind a paired device key.
 
 Deliberately avoided: an undocumented `-p` + `--remote-control` combination, a subscription
 coupling, and two competing permission handlers (our stdio handler vs the phone).
@@ -865,6 +868,8 @@ possible. The design does not depend on it.
 
 ```toml
 port            = 7717
+bind            = "127.0.0.1"    # loopback by default; see §12
+hostnames       = []             # extra names the Host header may carry (§12)
 open_browser    = true
 repo_roots      = ["~/Code"]
 branch_prefix   = "sw_"
@@ -892,13 +897,283 @@ form cannot select is a default that cannot be honoured.
 
 ## 11. Out of scope (v1)
 
-Multi-user auth · remote/non-loopback binding · auto-commit, auto-push, PR creation ·
-Remote Control integration · reading Claude's internal transcript files (F11) ·
-agents surviving server death · virtualised scrollback.
+Multi-user auth · auto-commit, auto-push, PR creation · Remote Control integration ·
+reading Claude's internal transcript files (F11) · agents surviving server death ·
+virtualised scrollback · TLS termination in-process (§12 uses a VPN instead).
 
 ---
 
-## 12. Note before implementation
+## 12. Remote access
+
+Everything in §7 describes a portal bound to `127.0.0.1`, and that stays the
+default: run `claude-web` with no configuration and nothing here applies. This
+section covers the opt-in case — binding an address other than loopback so the
+portal can be driven from a phone or another machine — and the authentication
+that binding requires.
+
+The principal is one person on several devices. There are no accounts, no
+per-agent ownership and no authorization layer: a device is either paired or it
+is nothing. Multi-user auth remains out of scope (§10).
+
+### What this closes, and what it does not
+
+It closes the network edge. Nothing else.
+
+The residual §7 names — an agent running as the same user can go looking for
+whatever credential the browser holds — is unchanged and unimproved here. It is
+not made worse either, which is why the loopback path below keeps its own
+never-on-disk token rather than being folded into the remote one. Fixing that
+residual means putting the control plane somewhere the agents are not (a
+separate uid, a socket with peer credentials), and that is a different project.
+
+The thing to be careful about is not letting a local-only residual become a
+remote one. That is the reason the per-boot token is refused off-box, and the
+reason the durable key is stored hashed.
+
+### Transport: a VPN, not TLS
+
+The binary terminates no TLS and ships no certificate machinery. Encryption and
+device authentication come from WireGuard — in practice Tailscale — and the
+credential below sits behind that.
+
+A self-signed certificate was the alternative and is worse than nothing: it
+cannot authenticate the server, so its only durable effect is teaching you to
+click through a browser warning, which is exactly the reflex that makes an
+interception attack work. Fronting the server with someone else's reverse proxy
+moves the whole security argument into a config file this project neither ships
+nor validates.
+
+So the deployment shape is enforced rather than documented. `Config::validate`
+refuses any bind address outside:
+
+- loopback,
+- RFC1918 private ranges (`10/8`, `172.16/12`, `192.168/16`),
+- the carrier-grade NAT range `100.64.0.0/10`, which is where tailnet addresses
+  live.
+
+A public bind is not a warning. It does not start.
+
+### Two credentials
+
+Loopback and remote authenticate differently, and each is refused where it does
+not belong.
+
+**Loopback — the per-boot token of §7, unchanged.** Minted at startup, never
+written to disk, handed to the browser through the URL it is opened with, held
+in `sessionStorage`. It is now additionally **refused when the peer address is
+not loopback.** It is delivered by strictly local means and therefore never
+legitimately arrives from off-box; refusing it there costs one comparison and
+keeps §7's one acknowledged leak — a server run as `claude-web > log` writing
+the token into that log — a local problem rather than a remotely replayable
+credential.
+
+**Remote — a durable key.** 256 bits from the OS random source, generated by
+`claude-web pair` (below). It is accepted from any allowed peer, loopback
+included: the browser on this machine may perfectly well be a paired device.
+
+The key is presented exactly as the per-boot token is — the `x-claude-web-token`
+header, or the `token` query parameter on the `/ws` upgrade, which is the one
+place a browser cannot set a header. Same middleware, same seam, one added
+branch. It reuses `SessionToken`'s constant-time comparison and its redacted
+`Debug`.
+
+**No cookies, and therefore no CSRF.** A session cookie plus a `sessions` table
+would buy per-device revocation, at the price of introducing the first identity
+state into the schema and reopening a vulnerability class the header-only token
+is structurally immune to — on a control plane whose endpoints include
+`permission_mode: bypass`. For a handful of devices belonging to one person,
+"rotate the key and re-pair" is an adequate revocation story and a much smaller
+design.
+
+The consequence is that a paired device holds the key in `localStorage`, not
+`sessionStorage`. This is a deliberate departure from §7's reasoning and it is
+narrow: a phone that must be re-paired every time the browser drops the tab is
+not usable, and the device is one you chose to pair.
+
+### The key on disk
+
+`~/.claude-web/remote-key`, mode 0600, containing **the SHA-256 of the key and
+not the key**.
+
+256 bits of entropy is not brute-forceable, so a bare hash verifies it — no
+salt, no KDF, nothing that would matter. What this buys is that the file is not
+a working credential: an agent that reads it has read nothing it can use. That
+is the property §7's never-on-disk token has and that a raw key would have given
+away.
+
+It does not live in `config.toml`. The Settings endpoint rewrites that file
+wholesale through `Config::save`, so a secret there is one serialisation change
+away from being silently dropped, and it would sit in a file the frontend
+round-trips.
+
+The cost of hashing is that the raw key exists only in the moment it is
+generated. There is no "add a device" — only "re-pair every device". For two or
+three devices that is a minute of scanning, and it is the right trade.
+
+### Pairing
+
+`claude-web pair` generates a key, writes its hash, and prints a QR code —
+Unicode half-blocks — with the URL underneath for terminals that are too narrow
+or whose font mangles the blocks.
+
+**The key rides in the URL fragment**, `#k=<key>`, not the query string. A
+fragment is never sent to the server and never appears in a `Referer` header;
+the page reads it on load and immediately clears it with `history.replaceState`,
+so it does not sit in browser history either. This mirrors the existing
+read-from-URL-then-stash handling of `?t=` in `common.js`.
+
+The host part of that URL is the first configured `hostname` if any, otherwise
+the bind address. If a hostname is configured at all, that is the way in.
+
+**`pair` refuses to run without a terminal attached**, exiting non-zero. Its
+entire output is a secret. The startup path in §7 writes a 0600 file when stdout
+is not a terminal because the server has to start however it was invoked; `pair`
+is a deliberate interactive act with no headless case worth serving, and the
+file variant would only create another on-disk copy of a raw key this design
+takes some trouble to avoid keeping.
+
+### Rotation, unpairing, and a device that has gone stale
+
+Running `pair` again generates a new key and overwrites the hash. The old key is
+dead immediately, on every device.
+
+`claude-web unpair` deletes the file. Because a non-loopback bind refuses to
+start without one, that is also the switch that turns remote access off. It is
+the lost-phone procedure: one command.
+
+A device presenting a dead key reaches the same refusal banner as a stale
+loopback tab, and that banner's current text — *"Open the link claude-web
+printed when it started"* — is useless advice on a phone that has never been
+near the terminal. The message therefore branches on the peer address the server
+already knows: a non-loopback peer is told to re-pair and scan a fresh code.
+
+### Picking up a new pairing without a restart
+
+The server holds the hash in memory. Requiring a restart to pick up a new one
+would be a poor trade, because §10 puts agents surviving server death out of
+scope: restarting to pair a tablet would end every agent mid-task.
+
+So when a presented key fails against the cached hash, the server re-reads the
+file once and retries — **guarded to at most one re-read per second**, so a
+wrong key cannot be turned into a file-read amplifier. A fresh pairing takes
+effect on the paired device's first request. No watcher, no signal handler, no
+per-request file read.
+
+### Binding and configuration
+
+Two keys join `config.toml`:
+
+```toml
+bind      = "127.0.0.1"   # default: loopback
+hostnames = []            # extra names the Host header may carry
+```
+
+`Config::validate` refuses to start when:
+
+- `bind` is outside loopback / RFC1918 / `100.64.0.0/10`, or
+- `bind` is non-loopback and no key file exists.
+
+Both errors name the config key or command that fixes them.
+
+**Neither key is editable through the Settings panel**, which otherwise
+round-trips `Config` through the web UI. They are shown read-only if shown at
+all. A control-plane client that can widen its own listening address is a
+privilege escalation with extra steps, and it is precisely the move a client
+that had got hold of a credential would make. Changing where this thing listens
+requires touching the machine.
+
+### Host and Origin, off loopback
+
+§7's rebinding defence requires a loopback `Host`, which a tailnet request fails
+outright. Rebinding matters more remotely, not less, so the check widens rather
+than lifting: the allowlist becomes loopback, the configured bind address, and
+each configured hostname — on the port actually being served.
+
+A hostile domain rebound to your tailnet address still arrives with
+`Host: evil.example`, which is on no list. `Origin` and `Sec-Fetch-Site` are
+unchanged; same-origin is same-origin wherever the page was served from.
+
+Loopback keeps its own listener whatever `bind` says, so the local browser is
+still opened on the loopback tokened URL and the per-boot token still has
+somewhere it is legitimately presented.
+
+### What a paired device may do
+
+Everything a loopback client may do, including relaxing an agent's permission
+mode.
+
+Restricting that one endpoint looks prudent and is close to theatre: a client
+that can approve each individual tool call already reaches everywhere bypass
+mode reaches, one prompt at a time. And approvals are the reason to want this on
+a phone at all — a portal that shows a blocked agent but makes you walk to a
+desk to unblock it has failed at its only job. A credential not trusted enough
+for the full verb set is a device that should not have been paired.
+
+Multiple attached clients need no new machinery. `/ws` already fans out from
+`sup.subscribe()`, and `decide` resolves a permission request by removing it
+from the pending map, so the first answer wins and the second is told the
+approval is no longer outstanding.
+
+### Attribution
+
+§7 already writes a permission-mode change into the agent's event log with its
+initiator. With two credential paths, that field gains a meaning it did not have
+on loopback: *which client*.
+
+Permission decisions and permission-mode changes therefore record the channel —
+`local` or `paired` — and, for paired requests, the peer address. The field is
+the existing one; nothing new is added to the schema.
+
+Having given up per-device sessions, this log is the only visibility into which
+devices are acting. That is what it is for.
+
+### Failed authentication
+
+No lockout, no throttling. The key is not guessable, so a limiter would protect
+nothing and would add a state machine to maintain. (`rate_limit` in the schema
+is a cache of Claude's usage headers and is unrelated.)
+
+The existing refusal logging stands: a warning per refusal, escalating on
+repeats. Refusals from a non-loopback peer additionally record that peer's
+address, because someone on your tailnet failing to authenticate is worth more
+than a local page whose token went stale across a restart. The presented
+credential is never logged, valid or not.
+
+### Startup
+
+A non-loopback bind prints, plainly, the address it is listening on and that the
+portal is reachable from the network.
+
+The local browser is still opened on the loopback tokened URL. The durable key
+is never printed at startup and never reaches an `open` command line, for the
+same reason the per-boot token does not: an argv is readable by every process on
+the machine.
+
+### Tests
+
+The boundary properties are asserted directly, in the enumerating style of
+`every_api_route_needs_the_token` — a route added later that forgets the check
+is the failure this catches:
+
+1. With neither credential, every `/api/*` route and the `/ws` upgrade is
+   refused.
+2. The per-boot token is refused when the peer address is not loopback.
+3. A non-loopback bind refuses to start when no key file exists.
+4. A public-IP bind is refused by `Config::validate`.
+5. `Host` is accepted for loopback, the configured bind address and each
+   configured hostname, and refused for anything else.
+6. The key file never contains the raw key.
+
+### Dependencies
+
+One addition: a pure-Rust QR encoder for `pair`. The alternative — printing the
+URL and letting you type 64 hex characters into a phone — is bad enough that it
+would be routed around by pasting the key into a chat app, which is a worse
+outcome than the dependency.
+
+---
+
+## 13. Note before implementation
 
 The project directory is `~/Code/claude web` — **the space breaks `cargo init`'s default
 package name.** Use `cargo init --name claude-web`.

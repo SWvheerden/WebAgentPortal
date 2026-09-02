@@ -198,7 +198,6 @@ impl PermissionMode {
     pub fn relaxes(self, current: PermissionMode) -> bool {
         self.strictness() < current.strictness()
     }
-
 }
 
 impl fmt::Display for PermissionMode {
@@ -366,8 +365,9 @@ mod tests {
             PermissionMode::Dangerous,
         ] {
             assert!(
-                m.cli_flags().windows(2).any(|w| w
-                    == ["--permission-prompt-tool".to_string(), "stdio".to_string()]),
+                m.cli_flags()
+                    .windows(2)
+                    .any(|w| w == ["--permission-prompt-tool".to_string(), "stdio".to_string()]),
                 "{m} launches with no permission prompt tool"
             );
         }

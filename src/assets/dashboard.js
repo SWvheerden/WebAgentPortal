@@ -723,6 +723,10 @@ function fillSettings() {
   $('cfg-mode').value = cfg.default_permission_mode;
   $('cfg-pin').value = cfg.pinned_cli_version;
   $('cfg-open').checked = cfg.open_browser;
+  // Shown, never edited: the server keeps its own values whatever this panel
+  // sends back (§12).
+  $('cfg-bind').value = `${cfg.bind}:${cfg.port}`;
+  $('cfg-hostnames').value = (cfg.hostnames || []).join(', ') || '(none)';
 }
 
 async function saveSettings() {

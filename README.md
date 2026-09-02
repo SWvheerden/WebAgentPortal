@@ -26,14 +26,28 @@ redirecting the server's output to a log file does not put the token in it.
 
 ```
 claude-web [--port N] [--config PATH] [--db PATH] [--no-open]
+claude-web pair          # pair a device for remote access
+claude-web unpair        # forget it again
 ```
 
-Loopback only. The session token above raises the bar in front of the control
-plane — including against the agents themselves, which can otherwise reach every
-endpoint that constrains them — but it cannot be hidden from a determined
-process running as the same user; see DESIGN §7 for what it does and does not
-achieve. Do not bind this to a non-loopback interface: it would need real
-multi-user authentication first.
+Loopback by default. The session token above raises the bar in front of the
+control plane — including against the agents themselves, which can otherwise
+reach every endpoint that constrains them — but it cannot be hidden from a
+determined process running as the same user; see DESIGN §7 for what it does and
+does not achieve.
+
+## Reaching it from a phone
+
+Set `bind` in `config.toml` to a private or tailnet address and run
+`claude-web pair`, which prints a QR code to scan. The server terminates no TLS,
+so it refuses to start on anything but loopback, RFC1918 or `100.64.0.0/10`:
+encryption and device authentication come from the VPN (Tailscale, in practice),
+and the paired key sits behind it. Loopback keeps its own listener either way.
+
+Only the hash of that key is stored, in `~/.claude-web/remote-key` (mode 0600),
+so the file is not itself a working credential. Pairing again replaces it
+everywhere; `claude-web unpair` deletes it, which also stops a non-loopback bind
+from starting — that is the lost-phone procedure. See DESIGN §12.
 
 ## Development
 

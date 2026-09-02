@@ -1,21 +1,23 @@
 //! claude-web — a local multi-agent Claude Code server.
 //!
-//! Binds loopback only. The OS is the security boundary: the agents execute
-//! arbitrary code, so this must never listen on a non-loopback interface
-//! without authentication (§7).
+//! Binds loopback by default. The OS is not the security boundary: the agents
+//! execute arbitrary code as this user, so every data route carries a per-boot
+//! token (§7). Binding anything other than loopback is opt-in, is restricted to
+//! private and tailnet addresses, and requires a paired device key (§12).
 
 mod agent;
 mod config;
 mod db;
+mod remote;
 mod repo;
 mod web;
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
@@ -23,11 +25,14 @@ use crate::agent::process;
 use crate::agent::supervisor::{ServerMsg, Supervisor};
 use crate::config::Config;
 use crate::db::Db;
-use crate::web::routes::AppState;
+use crate::remote::RemoteKey;
+use crate::web::routes::{AppState, HostPolicy};
 
 #[derive(Debug, Parser)]
 #[command(name = "claude-web", about = "Local multi-agent Claude Code server")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Override the configured port.
     #[arg(long)]
     port: Option<u16>,
@@ -40,6 +45,14 @@ struct Cli {
     /// Do not open a browser on startup.
     #[arg(long)]
     no_open: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Pair a device: generate a key, store its hash, print a QR code (§12).
+    Pair,
+    /// Forget the paired key. Also the switch that turns remote access off.
+    Unpair,
 }
 
 #[tokio::main]
@@ -56,6 +69,12 @@ async fn main() -> Result<()> {
         .config
         .clone()
         .unwrap_or_else(config::default_config_path);
+    // `pair` and `unpair` touch only the key file. Neither starts a server, and
+    // neither may be gated on a bind being valid, since pairing is what makes a
+    // non-loopback bind valid in the first place.
+    if let Some(command) = &cli.command {
+        return run_command(command, &config_path, cli.port);
+    }
     let mut cfg = Config::load_or_create(&config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
     if let Some(port) = cli.port {
@@ -75,6 +94,8 @@ async fn main() -> Result<()> {
     }
 
     let port = cfg.port;
+    let bind_ip = cfg.bind_ip()?;
+    let hostnames = cfg.hostnames.clone();
     let claude_bin = cfg.claude_bin.clone();
     let pinned = cfg.pinned_cli_version.clone();
     let sup = Supervisor::new(db, Arc::new(RwLock::new(cfg)));
@@ -120,19 +141,46 @@ async fn main() -> Result<()> {
     // The token lives only here and in the URL below: never on disk, never in a
     // log, never in a served page.
     let token = Arc::new(web::routes::SessionToken::mint());
+    // The durable key of §12, if a device has been paired. Only its hash is on
+    // disk, and only the hash is ever held here.
+    let key_path = remote::key_path();
+    let remote_key = RemoteKey::load(&key_path)
+        .with_context(|| format!("loading {}", key_path.display()))?
+        .map(Arc::new);
+    if !bind_ip.is_loopback() && remote_key.is_none() {
+        anyhow::bail!(
+            "bind = \"{bind_ip}\" is not loopback and no device is paired. Run `claude-web pair`, \
+             or set bind = \"127.0.0.1\" in {}.",
+            config_path.display()
+        );
+    }
     let state = AppState {
         sup: sup.clone(),
         config_path,
-        port,
+        hosts: Arc::new(HostPolicy::new(port, bind_ip, &hostnames)),
         token: token.clone(),
+        remote: remote_key,
         refusals: Default::default(),
     };
     let app = web::routes::router(state);
 
+    // Loopback is always served, whatever else is: the local browser is opened
+    // on the loopback tokened URL, and the per-boot token is refused anywhere
+    // else (§12).
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding {addr}"))?;
+    let mut listeners = vec![
+        tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding {addr}"))?,
+    ];
+    let remote_addr = SocketAddr::new(bind_ip, port);
+    if !bind_ip.is_loopback() {
+        listeners.push(
+            tokio::net::TcpListener::bind(remote_addr)
+                .await
+                .with_context(|| format!("binding {remote_addr}"))?,
+        );
+    }
     // The token travels in the URL the browser is opened with; the page keeps
     // it in sessionStorage and strips it from the address bar.
     let url = format!("http://{addr}/?t={}", token.as_str());
@@ -159,6 +207,17 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Plainly, and without the durable key: it is never printed at startup and
+    // never reaches an `open` command line, for the same reason the per-boot
+    // token does not — an argv is readable by every process on the machine.
+    if !bind_ip.is_loopback() {
+        tracing::info!(%remote_addr, "claude-web is reachable from the network");
+        println!("This portal is also reachable from the network, at:\n");
+        println!("    http://{remote_addr}/\n");
+        println!("Only devices paired with `claude-web pair` can use it. `claude-web unpair`");
+        println!("turns it off again.\n");
+    }
+
     if open_browser {
         // Open a private local file that redirects, rather than passing the
         // tokened URL to `open`: a command line is readable by every process on
@@ -172,19 +231,89 @@ async fn main() -> Result<()> {
         }
     }
 
+    // One signal, however many listeners: each drains when the watch flips.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_sup = sup.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            wait_for_signal().await;
-            tracing::info!("shutting down: SIGTERM to every agent, then 5s");
-            shutdown_sup.shutdown().await;
-        })
-        .await
-        .context("serving")?;
+    tokio::spawn(async move {
+        wait_for_signal().await;
+        tracing::info!("shutting down: SIGTERM to every agent, then 5s");
+        shutdown_sup.shutdown().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    let mut servers = Vec::new();
+    for listener in listeners {
+        let app = app.clone();
+        let mut rx = shutdown_rx.clone();
+        servers.push(tokio::spawn(async move {
+            // The peer address decides which credential is acceptable, so the
+            // service is mounted with connect info rather than without (§12).
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = rx.changed().await;
+            })
+            .await
+        }));
+    }
+    for server in servers {
+        server.await.context("serving")?.context("serving")?;
+    }
 
     // A second pass, in case anything started during the drain.
     sup.shutdown().await;
     Ok(())
+}
+
+/// `claude-web pair` and `claude-web unpair` (§12).
+fn run_command(command: &Command, config_path: &std::path::Path, port: Option<u16>) -> Result<()> {
+    let key_path = remote::key_path();
+    match command {
+        Command::Pair => {
+            let cfg = Config::load_lenient(config_path)
+                .with_context(|| format!("loading {}", config_path.display()))?;
+            let port = port.unwrap_or(cfg.port);
+            let bind = cfg.bind.trim();
+            // If a hostname is configured at all, that is the way in.
+            let host = cfg
+                .hostnames
+                .iter()
+                .map(|h| h.trim())
+                .find(|h| !h.is_empty())
+                .unwrap_or(bind);
+            let host = match host.parse::<IpAddr>() {
+                // An IPv6 literal needs its brackets back in a URL.
+                Ok(IpAddr::V6(v6)) => format!("[{v6}]"),
+                _ => host.to_string(),
+            };
+            remote::pair(&key_path, &format!("http://{host}:{port}/"))?;
+            if bind.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+                println!(
+                    "Note: bind is still \"{bind}\", so this key only works from this machine.\n\
+                     Set `bind` in {} to a private or tailnet address to reach it from a phone.\n",
+                    config_path.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Unpair => {
+            if remote::unpair(&key_path)? {
+                println!(
+                    "Deleted {}. Every paired device is now refused, and a non-loopback bind \
+                     will not start.",
+                    key_path.display()
+                );
+            } else {
+                println!(
+                    "No device was paired ({} does not exist).",
+                    key_path.display()
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Write the tokened URL to a private file for the browser to be pointed at.

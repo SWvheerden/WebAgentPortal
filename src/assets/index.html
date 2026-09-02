@@ -145,9 +145,16 @@
           <div class="field"><label for="cfg-pin">Pinned CLI version</label><input id="cfg-pin"></div>
         </div>
       </div>
+      <div class="row">
+        <div class="field"><label for="cfg-bind">Listening on (read-only)</label><input id="cfg-bind" readonly disabled></div>
+        <div class="field"><label for="cfg-hostnames">Extra hostnames (read-only)</label><input id="cfg-hostnames" readonly disabled></div>
+      </div>
       <div class="field inline"><input type="checkbox" id="cfg-open"><label for="cfg-open" style="margin:0">Open a browser on startup</label></div>
       <button id="cfg-save" class="primary">Save</button>
-      <span class="small muted">Port changes take effect on restart.</span>
+      <span class="small muted">Port changes take effect on restart. Where the server listens is
+        editable only on the machine itself, in config.toml — a client that could widen its own
+        listening address would be a privilege escalation with extra steps. Use
+        <code>claude-web pair</code> to add a device.</span>
     </section>
 
     <section class="panel hidden" id="limits-panel">

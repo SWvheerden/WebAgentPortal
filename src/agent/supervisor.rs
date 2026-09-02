@@ -17,6 +17,7 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 
 use crate::config::Config;
 use crate::db::{AgentRecord, Db, now_ms};
+use crate::remote::Initiator;
 use crate::repo::git;
 
 use super::process::{self, Action, ChildHandle, ExitInfo, ProcessMsg, SpawnConfig, Sweep};
@@ -180,6 +181,8 @@ enum AgentCommand {
     Decide {
         request_id: String,
         decision: PermissionDecision,
+        /// Which client answered (§12).
+        initiator: Initiator,
     },
     Interrupt,
     SetPermissionMode(PermissionMode),
@@ -646,6 +649,7 @@ impl Supervisor {
         id: &str,
         request_id: &str,
         decision: PermissionDecision,
+        initiator: Initiator,
     ) -> Result<()> {
         self.require_agent(id).await?;
         self.command(
@@ -653,6 +657,7 @@ impl Supervisor {
             AgentCommand::Decide {
                 request_id: request_id.to_string(),
                 decision,
+                initiator,
             },
         )
         .await
@@ -672,6 +677,7 @@ impl Supervisor {
         id: &str,
         mode: PermissionMode,
         confirmed: bool,
+        initiator: Initiator,
     ) -> Result<()> {
         let record = self.require_agent(id).await?;
         let current = record.permission_mode;
@@ -707,9 +713,10 @@ impl Supervisor {
             "subtype": "permission_mode_change",
             "from": current.as_str(),
             "to": mode.as_str(),
-            // Only the operator can reach this: the endpoint requires the
-            // session token, which agents never see.
-            "initiator": "operator",
+            // Only a credentialed client can reach this: the endpoint requires
+            // the per-boot token or a paired device key, neither of which an
+            // agent is given. Which of the two it was is recorded (§12).
+            "initiator": initiator.label(),
             "relaxed": mode.relaxes(current),
         });
         let payload_for_db = payload.clone();
@@ -730,7 +737,14 @@ impl Supervisor {
             agent_id: id.to_string(),
             mode,
         });
-        tracing::info!(agent = %id, %current, %mode, "operator changed the permission mode");
+        tracing::info!(
+            agent = %id,
+            %current,
+            %mode,
+            channel = initiator.channel(),
+            peer = ?initiator.peer(),
+            "operator changed the permission mode"
+        );
 
         // A running agent is switched live; a stopped one picks it up on resume.
         self.command(id, AgentCommand::SetPermissionMode(mode))
@@ -1592,7 +1606,8 @@ impl Runner {
             AgentCommand::Decide {
                 request_id,
                 decision,
-            } => self.decide(&request_id, decision).await,
+                initiator,
+            } => self.decide(&request_id, decision, &initiator).await,
             AgentCommand::Interrupt => {
                 self.send_control(protocol::interrupt_request);
             }
@@ -1642,7 +1657,12 @@ impl Runner {
         self.set_status(Transition::TurnStarted).await;
     }
 
-    async fn decide(&mut self, request_id: &str, decision: PermissionDecision) {
+    async fn decide(
+        &mut self,
+        request_id: &str,
+        decision: PermissionDecision,
+        initiator: &Initiator,
+    ) {
         // Only a prompt that is actually outstanding may be answered: an
         // `allow` for anything else is a decision nobody asked for.
         let Some(request) = self.pending.remove(request_id) else {
@@ -1683,6 +1703,9 @@ impl Runner {
                 "tool_name": request.tool_name,
                 "input": sent_input,
                 "input_modified": modified,
+                // Which client answered. With two credential paths this is the
+                // only visibility into which devices are acting (§12).
+                "initiator": initiator.label(),
             }),
         )
         .await;
@@ -2339,6 +2362,7 @@ mod tests {
                 PermissionDecision::Allow {
                     updated_input: None,
                 },
+                Initiator::Local,
             )
             .await
             .expect_err("this one is not running");
@@ -2554,6 +2578,7 @@ mod tests {
                 decision: PermissionDecision::Allow {
                     updated_input: Some(json!({"command": "cargo test --lib"})),
                 },
+                initiator: Initiator::Local,
             })
             .expect("runner is alive");
         harness.next_status().await;
@@ -2588,6 +2613,7 @@ mod tests {
                 decision: PermissionDecision::Allow {
                     updated_input: None,
                 },
+                initiator: Initiator::Local,
             })
             .expect("runner is alive");
 
@@ -2920,7 +2946,7 @@ mod tests {
         let mut bus = sup.subscribe();
 
         let err = sup
-            .set_permission_mode(&record.id, PermissionMode::Bypass, false)
+            .set_permission_mode(&record.id, PermissionMode::Bypass, false, Initiator::Local)
             .await
             .expect_err("an unconfirmed relaxation must be refused");
         assert!(format!("{err:#}").contains("more freedom"), "{err:#}");
@@ -2934,14 +2960,21 @@ mod tests {
         );
 
         // Tightening never needs confirmation.
-        sup.set_permission_mode(&record.id, PermissionMode::Ask, false)
+        sup.set_permission_mode(&record.id, PermissionMode::Ask, false, Initiator::Local)
             .await
             .expect("no change is fine");
 
         // Confirmed, it goes through — and lands in the agent's own log.
-        sup.set_permission_mode(&record.id, PermissionMode::Bypass, true)
-            .await
-            .expect("confirmed");
+        sup.set_permission_mode(
+            &record.id,
+            PermissionMode::Bypass,
+            true,
+            Initiator::Paired {
+                peer: "100.64.0.7".to_string(),
+            },
+        )
+        .await
+        .expect("confirmed");
         let agent = db.get_agent(&record.id).expect("get").expect("present");
         assert_eq!(agent.permission_mode, PermissionMode::Bypass);
         let change = db
@@ -2953,7 +2986,8 @@ mod tests {
         assert_eq!(change.payload["from"], json!("ask"));
         assert_eq!(change.payload["to"], json!("bypass"));
         assert_eq!(change.payload["relaxed"], json!(true));
-        assert_eq!(change.payload["initiator"], json!("operator"));
+        // The channel the change came in on: a paired phone, here (§12).
+        assert_eq!(change.payload["initiator"], json!("paired 100.64.0.7"));
 
         // Every browser is told, so no view is left showing the mode the agent
         // was in before the switch.
@@ -3031,7 +3065,12 @@ mod tests {
         sup.resume(&record.id).await.expect("launch");
 
         let err = sup
-            .set_permission_mode(&record.id, PermissionMode::Dangerous, true)
+            .set_permission_mode(
+                &record.id,
+                PermissionMode::Dangerous,
+                true,
+                Initiator::Local,
+            )
             .await
             .expect_err("there is no runtime equivalent of the launch flag");
         assert!(

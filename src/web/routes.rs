@@ -1,11 +1,12 @@
 //! REST endpoints and the embedded frontend.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path as AxPath, Query, Request, State};
+use axum::extract::{ConnectInfo, Extension, Path as AxPath, Query, Request, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -18,6 +19,7 @@ use crate::agent::protocol::PermissionDecision;
 use crate::agent::state::PermissionMode;
 use crate::agent::supervisor::{DeleteError, ServerMsg, SpawnRequest, Supervisor};
 use crate::config::Config;
+use crate::remote::{Initiator, RemoteKey};
 use crate::repo::{clone, git, scan};
 
 /// Events handed to a fresh page load before it starts streaming (§7).
@@ -31,12 +33,93 @@ struct Assets;
 pub struct AppState {
     pub sup: Arc<Supervisor>,
     pub config_path: PathBuf,
-    /// The port we are listening on, for the loopback `Host` check.
-    pub port: u16,
-    /// The per-boot token every API call and socket upgrade must carry.
+    /// The names we answer to, on the port we are listening on.
+    pub hosts: Arc<HostPolicy>,
+    /// The per-boot token a loopback client must carry (§7).
     pub token: Arc<SessionToken>,
+    /// The durable key a paired device carries, once one has been paired (§12).
+    pub remote: Option<Arc<RemoteKey>>,
     /// Throttle for the refusal log, so one stuck page cannot drown it.
     pub refusals: Arc<RefusalLog>,
+}
+
+/// The `Host` and `Origin` allowlist.
+///
+/// §7's rebinding defence requires a loopback `Host`, which a tailnet request
+/// fails outright. Rebinding matters more remotely, not less, so the check
+/// widens rather than lifting: loopback, the configured bind address and each
+/// configured hostname, on the port actually being served. A hostile domain
+/// rebound to your tailnet address still arrives with `Host: evil.example`,
+/// which is on no list.
+#[derive(Debug, Clone)]
+pub struct HostPolicy {
+    port: u16,
+    names: Vec<String>,
+}
+
+impl HostPolicy {
+    pub fn new(port: u16, bind: IpAddr, hostnames: &[String]) -> Self {
+        let mut names = vec![
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            "[::1]".to_string(),
+            "::1".to_string(),
+        ];
+        match bind {
+            IpAddr::V4(v4) => names.push(v4.to_string()),
+            IpAddr::V6(v6) => {
+                names.push(v6.to_string());
+                names.push(format!("[{v6}]"));
+            }
+        }
+        names.extend(
+            hostnames
+                .iter()
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty()),
+        );
+        Self { port, names }
+    }
+
+    /// Hosts we answer to, on the port we are actually serving.
+    pub fn host_allowed(&self, host: Option<&str>) -> bool {
+        let Some(host) = host else {
+            // HTTP/1.1 requires a Host header; a request without one is not a
+            // browser we want to trust.
+            return false;
+        };
+        let host = host.trim();
+        let (name, given_port) = match host.rsplit_once(':') {
+            // An IPv6 literal keeps its brackets: `[::1]:7717`.
+            Some((name, p)) if !name.ends_with('[') => (name, p.parse::<u16>().ok()),
+            _ => (host, None),
+        };
+        let name = name.to_ascii_lowercase();
+        let name_ok = self.names.contains(&name);
+        let port_ok = match given_port {
+            Some(p) => p == self.port,
+            // A missing port means the scheme default.
+            None => self.port == 80,
+        };
+        name_ok && port_ok
+    }
+
+    /// Origins we accept. Absent is fine — that is a non-browser client, which
+    /// cannot be a rebinding victim; present and foreign is not.
+    pub fn origin_allowed(&self, origin: Option<&str>) -> bool {
+        let Some(origin) = origin else {
+            return true;
+        };
+        let origin = origin.trim();
+        let Some(rest) = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+        else {
+            // "null" and anything exotic is refused.
+            return false;
+        };
+        self.host_allowed(Some(rest))
+    }
 }
 
 /// How long one path's refusals collapse into a single log line.
@@ -66,16 +149,31 @@ struct Refusal {
 
 impl RefusalLog {
     /// Record a refusal and log it if this path has been quiet long enough.
-    pub fn note(&self, path: &str) {
-        if let Some(suppressed) = self.tally(path, Instant::now()) {
+    ///
+    /// A refusal from a non-loopback peer additionally records that peer's
+    /// address and is throttled on its own key: someone on your tailnet failing
+    /// to authenticate is worth more than a local page whose token went stale
+    /// across a restart, and must not be swallowed by it. The credential that
+    /// was presented is never logged, valid or not.
+    pub fn note(&self, path: &str, peer: Option<SocketAddr>) {
+        let remote = peer
+            .filter(|p| !p.ip().is_loopback())
+            .map(|p| p.ip().to_string());
+        let key = match &remote {
+            Some(ip) => format!("{path} from {ip}"),
+            None => path.to_string(),
+        };
+        if let Some(suppressed) = self.tally(&key, Instant::now()) {
             if suppressed == 0 {
-                tracing::warn!(%path, "refused a request with no valid session token");
+                tracing::warn!(%path, peer = ?remote, "refused a request with no valid credential");
             } else {
                 tracing::warn!(
                     %path,
+                    peer = ?remote,
                     suppressed,
-                    "repeatedly refused requests with no valid session token; a page is likely \
-                     retrying with a token from before the last restart"
+                    "repeatedly refused requests with no valid credential; a page is likely \
+                     retrying with a token from before the last restart, or a device needs \
+                     pairing again"
                 );
             }
         }
@@ -263,50 +361,8 @@ pub fn router(state: AppState) -> Router {
         // Loopback binding alone does not survive DNS rebinding: a page on
         // http://evil.example:7717 rebound to 127.0.0.1 would otherwise reach
         // every endpoint here, including spawning an agent in `dangerous` mode.
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            guard_loopback,
-        ))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
-}
-
-/// Hosts we answer to: loopback, on the port we are actually serving.
-pub fn host_allowed(host: Option<&str>, port: u16) -> bool {
-    let Some(host) = host else {
-        // HTTP/1.1 requires a Host header; a request without one is not a
-        // browser we want to trust.
-        return false;
-    };
-    let host = host.trim();
-    let (name, given_port) = match host.rsplit_once(':') {
-        // An IPv6 literal keeps its brackets: `[::1]:7717`.
-        Some((name, p)) if !name.ends_with('[') => (name, p.parse::<u16>().ok()),
-        _ => (host, None),
-    };
-    let name_ok = matches!(name, "127.0.0.1" | "localhost" | "[::1]" | "::1");
-    let port_ok = match given_port {
-        Some(p) => p == port,
-        // A missing port means the scheme default.
-        None => port == 80,
-    };
-    name_ok && port_ok
-}
-
-/// Origins we accept. Absent is fine — that is a non-browser client, which
-/// cannot be a rebinding victim; present and foreign is not.
-pub fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
-    let Some(origin) = origin else {
-        return true;
-    };
-    let origin = origin.trim();
-    let Some(rest) = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-    else {
-        // "null" and anything exotic is refused.
-        return false;
-    };
-    host_allowed(Some(rest), port)
 }
 
 /// Endpoints that carry data or change state. The pages and their assets stay
@@ -348,19 +404,69 @@ fn token_of(req: &Request) -> Option<String> {
     })
 }
 
-async fn guard_loopback(State(state): State<AppState>, req: Request, next: Next) -> Response {
+/// The address the request came from, as the listener saw it.
+///
+/// `None` only when the router was mounted without connect info, which the
+/// server never does; it is read as "not loopback", so the per-boot token is
+/// refused rather than accepted on a guess.
+fn peer_of(req: &Request) -> Option<SocketAddr> {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr)
+}
+
+/// Which credential a request presented, if it presented a valid one.
+///
+/// Loopback and remote authenticate differently, and each is refused where it
+/// does not belong. The per-boot token is delivered by strictly local means —
+/// a URL the server opens on this machine — and therefore never legitimately
+/// arrives from off-box; refusing it there costs one comparison and keeps §7's
+/// one acknowledged leak (a server run as `claude-web > log`) a local problem
+/// rather than a remotely replayable credential. The durable key is accepted
+/// from any allowed peer, loopback included: the browser on this machine may
+/// perfectly well be a paired device.
+fn authenticate(state: &AppState, req: &Request, peer: Option<SocketAddr>) -> Option<Initiator> {
+    let presented = token_of(req)?;
+    let from_loopback = peer.is_some_and(|p| p.ip().is_loopback());
+    if from_loopback && state.token.matches(&presented) {
+        return Some(Initiator::Local);
+    }
+    let remote = state.remote.as_ref()?;
+    remote.matches(&presented).then(|| Initiator::Paired {
+        peer: peer.map_or_else(|| "unknown".to_string(), |p| p.ip().to_string()),
+    })
+}
+
+/// What to tell a client whose credential did not work.
+///
+/// The stale-loopback-tab advice — "open the link claude-web printed" — is
+/// useless on a phone that has never been near the terminal, so the message
+/// branches on the peer address the server already knows.
+fn refusal_message(from_loopback: bool) -> &'static str {
+    if from_loopback {
+        "This request needs the session token. Open the link claude-web printed at \
+         startup — the token changes every time the server restarts."
+    } else {
+        "This device is not paired, or its key has been replaced. Run `claude-web pair` \
+         on the machine running the server and scan the new code."
+    }
+}
+
+async fn guard(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    let peer = peer_of(&req);
+    let from_loopback = peer.is_some_and(|p| p.ip().is_loopback());
     let headers = req.headers();
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-    if !host_allowed(host, state.port) {
-        tracing::warn!(?host, "refused a request with a non-loopback Host header");
+    if !state.hosts.host_allowed(host) {
+        tracing::warn!(?host, "refused a request with an unknown Host header");
         return (
             StatusCode::FORBIDDEN,
-            "claude-web only answers to a loopback Host header",
+            "claude-web does not answer to that Host header",
         )
             .into_response();
     }
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
-    if !origin_allowed(origin, state.port) {
+    if !state.hosts.origin_allowed(origin) {
         tracing::warn!(?origin, "refused a cross-origin request");
         return (
             StatusCode::FORBIDDEN,
@@ -385,15 +491,13 @@ async fn guard_loopback(State(state): State<AppState>, req: Request, next: Next)
             )
                 .into_response();
         }
-        let presented = token_of(&req);
-        if !presented.is_some_and(|t| state.token.matches(&t)) {
-            state.refusals.note(&path);
-            return ApiError::unauthorized(
-                "This request needs the session token. Open the link claude-web printed at \
-                 startup — the token changes every time the server restarts.",
-            )
-            .into_response();
-        }
+        let Some(initiator) = authenticate(&state, &req, peer) else {
+            state.refusals.note(&path, peer);
+            return ApiError::unauthorized(refusal_message(from_loopback)).into_response();
+        };
+        // Which client asked. Endpoints that write into an agent's event log
+        // read it back out of here (§12).
+        req.extensions_mut().insert(initiator);
     }
 
     next.run(req).await
@@ -463,6 +567,17 @@ async fn put_config(
     State(state): State<AppState>,
     Json(cfg): Json<Config>,
 ) -> ApiResult<Json<Config>> {
+    // Where this thing listens is not editable through the control plane it
+    // serves: a client that can widen its own listening address is a privilege
+    // escalation with extra steps, and it is precisely the move a client that
+    // had got hold of a credential would make (§12). Whatever the body claims,
+    // the running values are kept.
+    let current = state.sup.config().await;
+    let cfg = Config {
+        bind: current.bind,
+        hostnames: current.hostnames,
+        ..cfg
+    };
     // The branch prefix reaches git as a positional argument, so an
     // option-shaped one is refused here rather than at spawn time.
     cfg.validate().map_err(ApiError::from)?;
@@ -812,15 +927,21 @@ struct PermissionModeBody {
     confirm: bool,
 }
 
+/// Relaxing a permission mode is something a paired device may do, like
+/// everything else (§12): a client that can approve each individual tool call
+/// already reaches everywhere bypass mode reaches, one prompt at a time, and
+/// unblocking a stuck agent from a phone is the reason to want this at all.
+/// Which client asked is recorded in the agent's own log.
 async fn set_permission_mode(
     State(state): State<AppState>,
+    Extension(initiator): Extension<Initiator>,
     AxPath(id): AxPath<String>,
     Json(body): Json<PermissionModeBody>,
 ) -> ApiResult<Json<Value>> {
     let record = resolve(&state, &id).await?;
     state
         .sup
-        .set_permission_mode(&record.id, body.mode, body.confirm)
+        .set_permission_mode(&record.id, body.mode, body.confirm, initiator)
         .await?;
     Ok(Json(json!({"ok": true, "mode": body.mode})))
 }
@@ -837,6 +958,7 @@ struct PermissionBody {
 
 async fn post_permission(
     State(state): State<AppState>,
+    Extension(initiator): Extension<Initiator>,
     AxPath(id): AxPath<String>,
     Json(body): Json<PermissionBody>,
 ) -> ApiResult<Json<Value>> {
@@ -845,7 +967,7 @@ async fn post_permission(
         .ok_or_else(|| ApiError::bad_request(format!("unknown behavior: {}", body.behavior)))?;
     state
         .sup
-        .decide(&record.id, &body.request_id, decision)
+        .decide(&record.id, &body.request_id, decision, initiator)
         .await?;
     Ok(Json(json!({"ok": true})))
 }
@@ -1061,13 +1183,14 @@ mod tests {
 
     #[test]
     fn only_loopback_hosts_are_answered() {
+        let policy = loopback_hosts(7717);
         for host in [
             "127.0.0.1:7717",
             "localhost:7717",
             "[::1]:7717",
             " localhost:7717 ",
         ] {
-            assert!(host_allowed(Some(host), 7717), "{host} must be allowed");
+            assert!(policy.host_allowed(Some(host)), "{host} must be allowed");
         }
         for host in [
             "evil.example:7717",
@@ -1077,20 +1200,59 @@ mod tests {
             "localhost",
             "192.168.1.5:7717",
         ] {
-            assert!(!host_allowed(Some(host), 7717), "{host} must be refused");
+            assert!(!policy.host_allowed(Some(host)), "{host} must be refused");
         }
-        assert!(!host_allowed(None, 7717), "a missing Host is refused");
-        assert!(host_allowed(Some("localhost"), 80));
+        assert!(!policy.host_allowed(None), "a missing Host is refused");
+        assert!(loopback_hosts(80).host_allowed(Some("localhost")));
+    }
+
+    /// Off loopback the rebinding defence widens rather than lifting: the
+    /// allowlist becomes loopback, the configured bind address and each
+    /// configured hostname, on the port actually being served (§12).
+    #[test]
+    fn a_remote_bind_answers_to_its_own_address_and_names_and_nothing_else() {
+        let policy = HostPolicy::new(
+            7717,
+            "100.64.0.7".parse().expect("ip"),
+            &["laptop.tail-scale.ts.net".to_string(), "  ".to_string()],
+        );
+        for host in [
+            // Loopback is still served, and still answered for.
+            "127.0.0.1:7717",
+            "localhost:7717",
+            "[::1]:7717",
+            "100.64.0.7:7717",
+            "laptop.tail-scale.ts.net:7717",
+            "LAPTOP.Tail-Scale.TS.NET:7717",
+        ] {
+            assert!(policy.host_allowed(Some(host)), "{host} must be allowed");
+        }
+        for host in [
+            // A hostile domain rebound to the tailnet address still arrives
+            // carrying its own name, which is on no list.
+            "evil.example:7717",
+            "laptop.tail-scale.ts.net.evil.example:7717",
+            "100.64.0.7:9999",
+            "100.64.0.8:7717",
+            // An unconfigured name is not a name we answer to.
+            "phone.tail-scale.ts.net:7717",
+        ] {
+            assert!(!policy.host_allowed(Some(host)), "{host} must be refused");
+        }
+        assert!(policy.origin_allowed(Some("http://100.64.0.7:7717")));
+        assert!(policy.origin_allowed(Some("http://laptop.tail-scale.ts.net:7717")));
+        assert!(!policy.origin_allowed(Some("http://evil.example:7717")));
     }
 
     #[test]
     fn only_loopback_origins_are_accepted() {
+        let policy = loopback_hosts(7717);
         assert!(
-            origin_allowed(None, 7717),
+            policy.origin_allowed(None),
             "non-browser clients send no Origin"
         );
-        assert!(origin_allowed(Some("http://127.0.0.1:7717"), 7717));
-        assert!(origin_allowed(Some("http://localhost:7717"), 7717));
+        assert!(policy.origin_allowed(Some("http://127.0.0.1:7717")));
+        assert!(policy.origin_allowed(Some("http://localhost:7717")));
         for origin in [
             "http://evil.example",
             "https://evil.example:7717",
@@ -1099,24 +1261,44 @@ mod tests {
             "file://",
         ] {
             assert!(
-                !origin_allowed(Some(origin), 7717),
+                !policy.origin_allowed(Some(origin)),
                 "{origin} must be refused"
             );
         }
     }
 
+    /// The loopback-only policy of §7, which is what most of these assert on.
+    fn loopback_hosts(port: u16) -> HostPolicy {
+        HostPolicy::new(port, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), &[])
+    }
+
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     async fn test_state() -> AppState {
+        test_state_with(None, loopback_hosts(7717))
+    }
+
+    fn test_state_with(remote: Option<Arc<RemoteKey>>, hosts: HostPolicy) -> AppState {
         let db = crate::db::Db::open_in_memory().expect("db");
         let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
         AppState {
             sup: Supervisor::new(db, config),
             config_path: PathBuf::from("/dev/null"),
-            port: 7717,
+            hosts: Arc::new(hosts),
             token: Arc::new(SessionToken(TEST_TOKEN.to_string())),
+            remote,
             refusals: Default::default(),
         }
+    }
+
+    /// A paired device key, and the state that accepts it.
+    fn paired_state() -> (tempfile::TempDir, String, AppState) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("remote-key");
+        let key = crate::remote::generate(&path).expect("generate");
+        let remote = RemoteKey::load(&path).expect("load").expect("paired");
+        let hosts = HostPolicy::new(7717, "100.64.0.7".parse().expect("ip"), &[]);
+        (dir, key, test_state_with(Some(Arc::new(remote)), hosts))
     }
 
     #[test]
@@ -1191,8 +1373,23 @@ mod tests {
     }
 
     async fn status_of(request: axum::http::Request<axum::body::Body>) -> StatusCode {
+        status_from(LOOPBACK_PEER, test_state().await, request).await
+    }
+
+    const LOOPBACK_PEER: &str = "127.0.0.1:51234";
+
+    /// Drive one request through the real router as if it had arrived from
+    /// `peer`. The server mounts the service with connect info, so the guard
+    /// always has this; the tests have to supply it too.
+    async fn status_from(
+        peer: &str,
+        state: AppState,
+        mut request: axum::http::Request<axum::body::Body>,
+    ) -> StatusCode {
         use tower::ServiceExt;
-        router(test_state().await)
+        let peer: SocketAddr = peer.parse().expect("peer address");
+        request.extensions_mut().insert(ConnectInfo(peer));
+        router(state)
             .oneshot(request)
             .await
             .expect("response")
@@ -1238,25 +1435,30 @@ mod tests {
         assert_eq!(status_of(request).await, StatusCode::UNAUTHORIZED);
     }
 
+    /// Every route that carries data or changes state, enumerated: one added
+    /// later that forgets the check is exactly what this catches.
+    const GUARDED_ROUTES: [(&str, &str); 16] = [
+        ("GET", "/api/health"),
+        ("GET", "/api/repos"),
+        ("GET", "/api/agents"),
+        ("GET", "/api/rate_limit"),
+        ("GET", "/api/config"),
+        ("PUT", "/api/config"),
+        ("POST", "/api/agents"),
+        ("POST", "/api/repos/clone"),
+        ("POST", "/api/agents/x/permission_mode"),
+        ("POST", "/api/agents/x/stop"),
+        ("DELETE", "/api/agents/x"),
+        ("GET", "/api/notes"),
+        ("POST", "/api/notes"),
+        ("PATCH", "/api/notes/x"),
+        ("DELETE", "/api/notes/x"),
+        ("GET", "/ws"),
+    ];
+
     #[tokio::test]
     async fn every_api_route_needs_the_token() {
-        for (method, path) in [
-            ("GET", "/api/health"),
-            ("GET", "/api/repos"),
-            ("GET", "/api/agents"),
-            ("GET", "/api/rate_limit"),
-            ("GET", "/api/config"),
-            ("PUT", "/api/config"),
-            ("POST", "/api/agents"),
-            ("POST", "/api/repos/clone"),
-            ("POST", "/api/agents/x/permission_mode"),
-            ("POST", "/api/agents/x/stop"),
-            ("DELETE", "/api/agents/x"),
-            ("GET", "/api/notes"),
-            ("POST", "/api/notes"),
-            ("PATCH", "/api/notes/x"),
-            ("DELETE", "/api/notes/x"),
-        ] {
+        for (method, path) in GUARDED_ROUTES {
             let request = api_request(path)
                 .method(method)
                 .header("content-type", "application/json")
@@ -1268,6 +1470,199 @@ mod tests {
                 "{method} {path} must not be reachable without the token"
             );
         }
+    }
+
+    /// The same enumeration with a device paired: having a second credential
+    /// must not make "no credential at all" reach anything (§12).
+    #[tokio::test]
+    async fn every_api_route_needs_a_credential_off_box_too() {
+        for (method, path) in GUARDED_ROUTES {
+            for (peer, host) in [
+                (LOOPBACK_PEER, "127.0.0.1:7717"),
+                ("100.64.0.9:41000", "100.64.0.7:7717"),
+            ] {
+                let (_dir, _key, state) = paired_state();
+                let request = axum::http::Request::builder()
+                    .uri(path)
+                    .method(method)
+                    .header("host", host)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .expect("request");
+                assert_eq!(
+                    status_from(peer, state, request).await,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {path} must not be reachable from {peer} without a credential"
+                );
+            }
+        }
+    }
+
+    /// The per-boot token is delivered by strictly local means, so it never
+    /// legitimately arrives from off-box (§12). Refusing it there keeps §7's one
+    /// acknowledged leak — a server run as `claude-web > log` — a local problem
+    /// rather than a remotely replayable credential.
+    #[tokio::test]
+    async fn the_per_boot_token_is_refused_when_the_peer_is_not_loopback() {
+        let build = || {
+            axum::http::Request::builder()
+                .uri("/api/health")
+                .header("host", "100.64.0.7:7717")
+                .header(TOKEN_HEADER, TEST_TOKEN)
+                .body(axum::body::Body::empty())
+                .expect("request")
+        };
+        let (_dir, _key, state) = paired_state();
+        assert_eq!(
+            status_from("100.64.0.9:41000", state, build()).await,
+            StatusCode::UNAUTHORIZED,
+            "this run's session token may not be replayed from off-box"
+        );
+
+        // The same token from the machine itself is the ordinary case.
+        let (_dir, _key, state) = paired_state();
+        assert_eq!(
+            status_from(LOOPBACK_PEER, state, build()).await,
+            StatusCode::OK
+        );
+    }
+
+    /// A paired device may do everything a loopback client may do, from
+    /// anywhere the bind allows — including relaxing a permission mode, which
+    /// is the reason to want this on a phone at all (§12).
+    #[tokio::test]
+    async fn a_paired_key_is_accepted_from_any_allowed_peer() {
+        for peer in ["100.64.0.9:41000", LOOPBACK_PEER] {
+            let (_dir, key, state) = paired_state();
+            let request = axum::http::Request::builder()
+                .uri("/api/health")
+                .header("host", "100.64.0.7:7717")
+                .header(TOKEN_HEADER, &key)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            assert_eq!(
+                status_from(peer, state, request).await,
+                StatusCode::OK,
+                "a paired device must be served at {peer}"
+            );
+        }
+
+        // A key that is not the paired one is nothing, wherever it comes from.
+        let (_dir, _key, state) = paired_state();
+        let request = axum::http::Request::builder()
+            .uri("/api/health")
+            .header("host", "100.64.0.7:7717")
+            .header(TOKEN_HEADER, "f".repeat(64))
+            .body(axum::body::Body::empty())
+            .expect("request");
+        assert_eq!(
+            status_from("100.64.0.9:41000", state, request).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// Where this thing listens is not editable through the control plane it
+    /// serves: whatever the body claims, the running values are kept (§12).
+    #[tokio::test]
+    async fn the_settings_panel_cannot_move_the_listening_address() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = test_state().await;
+        state.config_path = dir.path().join("config.toml");
+        let mut body = serde_json::to_value(Config::default()).expect("config");
+        body["bind"] = json!("0.0.0.0");
+        body["hostnames"] = json!(["evil.example"]);
+        body["max_agents"] = json!(3);
+        let mut request = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/config")
+            .header("host", "127.0.0.1:7717")
+            .header(TOKEN_HEADER, TEST_TOKEN)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(
+            LOOPBACK_PEER.parse::<SocketAddr>().expect("peer"),
+        ));
+        let response = router(state).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let saved: Config = serde_json::from_slice(&bytes).expect("config");
+        assert_eq!(saved.bind, crate::config::DEFAULT_BIND);
+        assert!(saved.hostnames.is_empty());
+        // The rest of the panel still works.
+        assert_eq!(saved.max_agents, 3);
+        let on_disk = Config::from_toml_str(
+            &std::fs::read_to_string(dir.path().join("config.toml")).expect("read"),
+        )
+        .expect("parse");
+        assert_eq!(on_disk.bind, crate::config::DEFAULT_BIND);
+    }
+
+    /// "Open the link claude-web printed when it started" is useless advice on
+    /// a phone that has never been near the terminal, so the refusal branches
+    /// on the peer the server already knows.
+    #[tokio::test]
+    async fn a_refusal_says_what_to_do_where_the_client_is() {
+        use tower::ServiceExt;
+        let body_of = |peer: &'static str| async move {
+            let (_dir, _key, state) = paired_state();
+            let peer: SocketAddr = peer.parse().expect("peer");
+            let mut request = axum::http::Request::builder()
+                .uri("/api/health")
+                .header("host", "100.64.0.7:7717")
+                .body(axum::body::Body::empty())
+                .expect("request");
+            request.extensions_mut().insert(ConnectInfo(peer));
+            let response = router(state).oneshot(request).await.expect("response");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .expect("body");
+            String::from_utf8_lossy(&bytes).to_string()
+        };
+        assert!(body_of(LOOPBACK_PEER).await.contains("printed at startup"));
+        let remote = body_of("100.64.0.9:41000").await;
+        assert!(remote.contains("claude-web pair"), "{remote}");
+        assert!(
+            !remote.contains("printed at startup"),
+            "a phone cannot see the terminal: {remote}"
+        );
+    }
+
+    /// A paired device presenting a key that has just been replaced is refused,
+    /// and the device paired a moment ago is served without a restart.
+    #[tokio::test]
+    async fn a_fresh_pairing_needs_no_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("remote-key");
+        let old = crate::remote::generate(&path).expect("generate");
+        let remote = Arc::new(RemoteKey::load(&path).expect("load").expect("paired"));
+        let hosts = || HostPolicy::new(7717, "100.64.0.7".parse().expect("ip"), &[]);
+        let request = |key: &str| {
+            axum::http::Request::builder()
+                .uri("/api/health")
+                .header("host", "100.64.0.7:7717")
+                .header(TOKEN_HEADER, key)
+                .body(axum::body::Body::empty())
+                .expect("request")
+        };
+
+        // `pair` runs again on the machine while the server keeps serving.
+        let new = crate::remote::generate(&path).expect("re-pair");
+        let state = test_state_with(Some(remote.clone()), hosts());
+        assert_eq!(
+            status_from("100.64.0.9:41000", state, request(&new)).await,
+            StatusCode::OK,
+            "the new key must work on the paired device's first request"
+        );
+        let state = test_state_with(Some(remote), hosts());
+        assert_eq!(
+            status_from("100.64.0.9:41000", state, request(&old)).await,
+            StatusCode::UNAUTHORIZED,
+            "the old key is dead immediately, on every device"
+        );
     }
 
     #[tokio::test]

@@ -1,19 +1,38 @@
 // Shared helpers: API calls, the multiplexed socket, small DOM utilities.
 // No build step, no dependencies — plain ES modules (§7).
 
-// The per-boot session token. It arrives in the URL the server opens, is kept
-// out of the address bar afterwards, and is required on every API call and on
-// the socket upgrade. Loopback is not an authentication boundary — everything
-// on this machine can reach the server, agents included — so this raises the
-// bar in front of the control plane.
+// The credential this page presents. There are two of them, and which one a
+// page holds depends on how it was opened (§7, §12).
 //
-// sessionStorage, not localStorage: it is scoped to this tab and does not
-// outlive the browser session, which shortens the window in which the token
-// sits in the browser profile on disk. It cannot be made unreadable to a
-// process running as the same user; see DESIGN §7.
+// *The per-boot session token* arrives in the URL the server opens (`?t=`), is
+// kept out of the address bar afterwards, and is required on every API call and
+// on the socket upgrade. Loopback is not an authentication boundary —
+// everything on this machine can reach the server, agents included — so this
+// raises the bar in front of the control plane. It lives in sessionStorage, not
+// localStorage: scoped to this tab, gone when the browser session ends, which
+// shortens the window in which it sits in the browser profile on disk. The
+// server refuses it from any peer that is not loopback.
+//
+// *The paired device key* arrives in the fragment of the URL the QR code from
+// `claude-web pair` carries (`#k=`). A fragment is never sent to the server and
+// never appears in a Referer; it is read on load and cleared immediately with
+// replaceState, so it does not sit in browser history either. It lives in
+// localStorage — a deliberate departure from the reasoning above, and a narrow
+// one: a phone that must be re-paired every time the browser drops the tab is
+// not usable, and the device is one you chose to pair.
+//
+// Neither can be made unreadable to a process running as the same user; see
+// DESIGN §7.
 const TOKEN_KEY = 'claude-web-token';
+const PAIRED_KEY = 'claude-web-key';
 
-function readToken() {
+/// Was this page served over loopback? The two credentials are not
+/// interchangeable, and this decides which one is worth presenting.
+function servedLocally() {
+  return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(location.hostname);
+}
+
+function readCredential() {
   try {
     const url = new URL(location.href);
     const fromUrl = url.searchParams.get('t');
@@ -23,13 +42,41 @@ function readToken() {
       history.replaceState(null, '', url.pathname + url.search + url.hash);
       return fromUrl;
     }
-    return sessionStorage.getItem(TOKEN_KEY) || '';
+    const paired = takeFragmentKey(url);
+    if (paired) {
+      localStorage.setItem(PAIRED_KEY, paired);
+      return paired;
+    }
+    const token = sessionStorage.getItem(TOKEN_KEY) || '';
+    const key = localStorage.getItem(PAIRED_KEY) || '';
+    // Off loopback the per-boot token is refused outright, so the device key is
+    // the only one worth sending; on loopback it is the one the server minted
+    // for this run.
+    return servedLocally() ? token || key : key || token;
   } catch {
     return '';
   }
 }
 
-export const token = readToken();
+/// Read `#k=<key>` and strip it from the address bar, the way `?t=` is handled.
+function takeFragmentKey(url) {
+  const hash = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash;
+  if (!hash) return '';
+  let params;
+  try {
+    params = new URLSearchParams(hash);
+  } catch {
+    return '';
+  }
+  const key = params.get('k');
+  if (!key) return '';
+  params.delete('k');
+  const rest = params.toString();
+  history.replaceState(null, '', url.pathname + url.search + (rest ? `#${rest}` : ''));
+  return key;
+}
+
+export const token = readCredential();
 
 export async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -50,7 +97,7 @@ export async function api(path, options = {}) {
     }
   }
   if (!response.ok) {
-    if (response.status === 401) needToken();
+    if (response.status === 401) needToken(body && body.error);
     const err = new Error((body && body.error) || `${response.status} ${response.statusText}`);
     err.status = response.status;
     err.body = body;
@@ -237,8 +284,9 @@ export class Socket {
       return;
     }
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    // A browser cannot set headers on an upgrade, so the token rides in the
-    // query string for this one request.
+    // A browser cannot set headers on an upgrade, so the credential rides in
+    // the query string for this one request — the per-boot token or the paired
+    // device key, whichever this page holds.
     this.ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
     this.ws.addEventListener('open', () => {
       this.retry = 0;
@@ -277,9 +325,10 @@ export class Socket {
   /// is exactly the transient case — backs off and tries again.
   async reconnect() {
     if (this.stopped) return;
-    if (await tokenRefused()) {
+    const refusal = await credentialRefused();
+    if (refusal !== null) {
       this.stopped = true;
-      needToken();
+      needToken(refusal);
       return;
     }
     // Reconnect with a cursor, so only the delta is replayed.
@@ -299,29 +348,42 @@ export class Socket {
   }
 }
 
-/// Does the server refuse our token outright? `false` for anything else,
-/// including not being able to ask — a server that is down is not a verdict on
-/// the token.
-async function tokenRefused() {
+/// Does the server refuse our credential outright? The refusal's own wording if
+/// so — the server knows whether we reached it over loopback, and says
+/// something different to a phone — and `null` for anything else, including not
+/// being able to ask: a server that is down is not a verdict on the credential.
+async function credentialRefused() {
   try {
     const response = await fetch('/api/health', {
       headers: { 'x-claude-web-token': token },
     });
-    return response.status === 401;
+    if (response.status !== 401) return null;
+    const body = await response.json().catch(() => null);
+    return (body && body.error) || '';
   } catch {
-    return false;
+    return null;
   }
 }
 
-/// Tell the operator their link is stale, once, and stop pretending to work.
+/// Tell the operator their credential is stale, once, and stop pretending to
+/// work.
+///
+/// "Open the link claude-web printed when it started" is useless advice on a
+/// phone that has never been near the terminal, so the server's own message is
+/// preferred — it branches on the peer address it can see — and the fallback
+/// branches the same way on where this page was served from.
 let toldAboutToken = false;
-export function needToken() {
+export function needToken(message) {
   if (toldAboutToken) return;
   toldAboutToken = true;
+  const fallback = servedLocally()
+    ? 'Open the link claude-web printed when it started — the token changes every '
+      + 'time the server restarts.'
+    : 'This device is not paired, or its key has been replaced. Run `claude-web pair` '
+      + 'on the machine running the server and scan the new code.';
   const banner = el('div', { class: 'errbox' }, [
-    el('strong', { text: 'This page has no valid session token. ' }),
-    'Open the link claude-web printed when it started — the token changes every '
-      + 'time the server restarts.',
+    el('strong', { text: 'This page has no valid credential. ' }),
+    message || fallback,
   ]);
   document.querySelector('main')?.prepend(banner);
 }

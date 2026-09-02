@@ -6,14 +6,15 @@
 
 use std::collections::HashSet;
 
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Extension, State};
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::agent::supervisor::ServerMsg;
+use crate::remote::Initiator;
 
 use super::routes::{AppState, REPLAY_WINDOW, decision_from};
 
@@ -90,11 +91,18 @@ pub fn should_forward(msg: &ServerMsg, subscriptions: &HashSet<String>) -> bool 
     msg_agent_id(msg).is_some_and(|id| subscriptions.contains(id))
 }
 
-pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| run(socket, state))
+/// The credential is checked on the upgrade, and the client it identifies is
+/// carried for the life of the socket: every decision made over it is attributed
+/// to the device that opened it (§12).
+pub async fn handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(initiator): Extension<Initiator>,
+) -> Response {
+    ws.on_upgrade(move |socket| run(socket, state, initiator))
 }
 
-async fn run(mut socket: WebSocket, state: AppState) {
+async fn run(mut socket: WebSocket, state: AppState, initiator: Initiator) {
     let mut rx = state.sup.subscribe();
     let mut subscriptions: HashSet<String> = HashSet::new();
 
@@ -102,7 +110,8 @@ async fn run(mut socket: WebSocket, state: AppState) {
         tokio::select! {
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(text))) => {
-                    if let Some(reply) = handle_client(&state, &text, &mut subscriptions).await
+                    if let Some(reply) =
+                        handle_client(&state, &text, &mut subscriptions, &initiator).await
                         && send(&mut socket, &reply).await.is_err() {
                             return;
                         }
@@ -159,6 +168,7 @@ async fn handle_client(
     state: &AppState,
     text: &str,
     subscriptions: &mut HashSet<String>,
+    initiator: &Initiator,
 ) -> Option<Value> {
     let msg: ClientMsg = match serde_json::from_str(text) {
         Ok(msg) => msg,
@@ -210,7 +220,11 @@ async fn handle_client(
                     "text": format!("Unknown permission behavior: {behavior}"),
                 }));
             };
-            match state.sup.decide(&agent_id, &request_id, decision).await {
+            match state
+                .sup
+                .decide(&agent_id, &request_id, decision, initiator.clone())
+                .await
+            {
                 Ok(()) => None,
                 Err(err) => Some(error_notice(&agent_id, err)),
             }
