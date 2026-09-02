@@ -145,6 +145,15 @@ CREATE TABLE rate_limit (
   captured_at INTEGER NOT NULL,
   payload     TEXT NOT NULL
 );
+
+-- Free-text reminders about work not being done now. Flat and global on purpose;
+-- see "Notes".
+CREATE TABLE notes (
+  id         TEXT PRIMARY KEY,
+  body       TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 ```
 
 **Implementation note — one additive migration.** The shipped schema carries one
@@ -733,7 +742,110 @@ an ✕ to cancel. Interrupt cancels the turn only and reports what remains queue
 
 ---
 
-## 8. Remote Control
+## 8. Notes
+
+A place to write down a task you are not doing now. The portal is where the decision of what
+to spawn next gets made, and until now that decision was made entirely from memory.
+
+A note is **inert text and nothing else**: no repo, no branch, no stored spawn parameters, no
+button that turns one into an agent. That boundary is the design. A note carrying spawn
+parameters is a spawn request with a second lifecycle to keep in sync — the model goes stale,
+the branch it names gets used by something else, and the one thing actually wanted (a sentence
+reminding you what to do) ends up buried in a form. Retyping a task into the spawn form costs
+seconds and keeps the note a memo.
+
+### Schema
+
+```sql
+CREATE TABLE notes (
+  id         TEXT PRIMARY KEY,      -- uuid
+  body       TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+```
+
+Created with `CREATE TABLE IF NOT EXISTS` alongside the rest of the schema, so an existing
+database gains it on open with nothing to migrate.
+
+No foreign key: notes are one flat global list, not a property of a repo or of an agent.
+Tagging a note with a repo was considered and dropped — a column that is usually NULL is a
+filter nobody uses. Hanging notes off an agent is worse: they would inherit the agent's
+`ON DELETE CASCADE`, and for a note about *future* work that is exactly backwards. The note
+should outlive the agent that prompted it.
+
+### Ordering and lifecycle
+
+Ordered `created_at ASC` — oldest first, so the list reads top to bottom as a queue and a new
+note appends to the bottom. A note never moves once written. Ordering by `updated_at` was
+rejected: it reshuffles the backlog every time a typo is fixed, and gives no way to demote
+anything.
+
+**There is no done state.** Finishing a task deletes its note. A `done` flag needs a toggle, a
+visual treatment, and a decision about where checked-off items live, and it ends as a graveyard
+nobody prunes — where a list of only-still-true things needs none of that. Bodies are editable
+in place, so a half-finished task becomes a note describing the other half.
+
+### Endpoints
+
+```
+GET    /api/notes          -> [{ id, body, created_at, updated_at }], created_at ASC
+POST   /api/notes          { body } -> the created note
+PATCH  /api/notes/{id}     { body } -> the updated note
+DELETE /api/notes/{id}
+```
+
+Behind the same session token as every other route (§7). Bodies are trimmed of surrounding
+whitespace; an empty or whitespace-only body is a 400 on create and on edit alike. A body over
+8 KiB is a 400 — far past what a memo needs, and it bounds the payload the dashboard poll
+carries. There is no cap on how many notes exist.
+
+Saves are last-write-wins with no version check. Optimistic concurrency — PATCH carrying the
+`updated_at` it loaded, 409 on a mismatch — is correct in the abstract and wrong here: this is
+a single-user loopback memo list, and a 409 the operator cannot meaningfully resolve is worse
+than a duplicated edit they would notice immediately.
+
+### The panel
+
+A collapsible panel on the dashboard, beside the agent list. That is the page the portal opens
+on, which is exactly the moment "what next" is a live question; behind a nav link it becomes a
+backlog nobody reads. Expanded by default, with the collapsed state persisted in
+`localStorage` — this frontend's first use of it. The `sessionStorage` choice in `common.js` is
+specifically about not letting the *token* outlive the tab, and that reasoning does not
+generalise to a UI preference.
+
+A note renders as plain text with `white-space: pre-wrap`, its first line used as the heading
+of the collapsed row (derived at render time, never stored). **Not markdown.** The frontend is
+embedded in the binary with no Node and no bundler; rendering markdown means vendoring a parser
+and then owning a sanitiser, for text only its author will ever read.
+
+Clicking a note opens an in-place editor. **New note** appends an empty row already in that
+same editor, held client-side until first save — Escape on an empty row discards it and the
+database never sees a blank. One editor, one code path, no separate composer.
+
+Deleting prompts through a native `confirm()`, matching the agent-delete pattern: the body is
+text the operator typed and cannot get back.
+
+### Freshness
+
+Notes ride the dashboard's existing poll rather than the socket, so a second tab — or a phone
+over Tailscale — catches up within one interval. A wide `is_broadcast_wide` message would be
+real protocol work in service of a list of tens of rows.
+
+The poll must not overwrite a note being typed into. A row in edit mode is exempt from
+re-render until it is saved or cancelled; every other row updates normally.
+
+### Who can write one
+
+There is no agent-facing tool for notes, and that is a scope decision rather than a boundary.
+Agents run as the same user and can reach every token-protected endpoint (§7), `/api/notes`
+included, so an agent that goes looking can write one. Enforcing otherwise would mean a second
+auth tier for a memo list, which is out of all proportion. The honest position is the one §7
+already takes: the token raises the bar, it does not build a wall.
+
+---
+
+## 9. Remote Control
 
 **Not integrated.** The portal already does what Remote Control does — messages, streaming
 output, approvals, interrupt — and keeps arbitrary per-agent directories, which Remote
@@ -749,7 +861,7 @@ possible. The design does not depend on it.
 
 ---
 
-## 9. Configuration (`config.toml`)
+## 10. Configuration (`config.toml`)
 
 ```toml
 port            = 7717
@@ -778,7 +890,7 @@ form cannot select is a default that cannot be honoured.
 
 ---
 
-## 10. Out of scope (v1)
+## 11. Out of scope (v1)
 
 Multi-user auth · remote/non-loopback binding · auto-commit, auto-push, PR creation ·
 Remote Control integration · reading Claude's internal transcript files (F11) ·
@@ -786,7 +898,7 @@ agents surviving server death · virtualised scrollback.
 
 ---
 
-## 11. Note before implementation
+## 12. Note before implementation
 
 The project directory is `~/Code/claude web` — **the space breaks `cargo init`'s default
 package name.** Use `cargo init --name claude-web`.
