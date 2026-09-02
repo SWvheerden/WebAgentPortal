@@ -433,6 +433,26 @@ git's own refusals are surfaced, not forced past: a branch already checked out e
 ("`main` is already used by worktree at …") and a switch that would clobber uncommitted
 changes both fail the spawn. Two checkouts of one branch is not isolation.
 
+### Leaving git alone
+The **Branch** control's third setting, *stay on the current one*, runs no git command at
+all: the agent works in the main checkout on whatever HEAD already is. It is the mode for
+an agent that is not doing branch-shaped work — a question about the code, a one-file fix
+on the branch you are already on, a repo whose branching you manage yourself.
+
+It is a mode rather than a combination of the other two because every other option asks for
+exactly the work it refuses to do, so `no_branch` wins over `in_place`, `existing_branch`
+and `base_ref` alike. A worktree is a second checkout, which is the thing being declined, so
+the form pins **Workspace** to the main checkout and disables it — the control is held
+rather than silently contradicted.
+
+The current branch is still *recorded* (`NULL` on a detached HEAD, a state to report rather
+than to fix). It is never `branch_is_new`, so the two reuse guarantees carry over unchanged:
+the delete-time check reports that branch's whole unpushed history, and deleting the agent
+never deletes the branch. With no worktree to remove either, Delete takes nothing off disk.
+
+> **Warned in the UI:** the agent's changes land in the checkout the operator is working in.
+> That is the point of the mode, but it is not the default, so it is stated.
+
 > **Warned in the UI:** a new worktree checks out from HEAD, so **uncommitted changes in the
 > main checkout are invisible to the agent.** Spawning against a dirty repo shows a warning.
 
@@ -668,7 +688,8 @@ Two rules keep a restored reading honest, since it can be hours old:
 ### Spawn form
 Repo picker (§6) · task name (auto-filled from folder, editable) · **Workspace**
 (isolated worktree ｜ main checkout) · **Branch** (create a new one ｜ use an existing one,
-with the repo's branches listed) · branch name preview · base ref · model ·
+with the repo's branches listed ｜ stay on the current one, which pins Workspace to the main
+checkout) · branch name preview · base ref · model ·
 permission mode · optional first message.
 **Advanced:** effort, `--add-dir`, `--max-budget-usd`.
 

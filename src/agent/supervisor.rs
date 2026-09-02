@@ -136,6 +136,12 @@ pub struct SpawnRequest {
     /// than created.
     #[serde(default)]
     pub existing_branch: Option<String>,
+    /// Touch git not at all: run in the main checkout on whatever HEAD already
+    /// is (§6). No worktree, no branch created, no checkout switched. Wins over
+    /// `in_place`, `existing_branch` and `base_ref`, all of which ask for
+    /// exactly the git work this mode refuses to do.
+    #[serde(default)]
+    pub no_branch: bool,
     #[serde(default)]
     pub add_dirs: Vec<String>,
     #[serde(default)]
@@ -1009,6 +1015,26 @@ fn prepare_workspace(
             base_ref: None,
             work_path: repo_path.to_path_buf(),
             is_git: false,
+            uses_worktree: false,
+            branch_is_new: false,
+        });
+    }
+
+    // "Leave git alone": the agent runs in the main checkout on the branch that
+    // is already checked out. Nothing is created and nothing is switched, so
+    // there is no worktree to remove at delete time and no branch that is ours
+    // to delete — the current branch is recorded (so the safety check still
+    // reports its unpushed work) but never as new.
+    if req.no_branch {
+        let slug = git::unique_name(&git::slugify(task_name), |c| taken_slugs.contains(c));
+        return Ok(Prepared {
+            slug,
+            // None on a detached HEAD, which is a state to report rather than
+            // to fix: this mode does not touch the checkout either way.
+            branch: git::current_branch(repo_path),
+            base_ref: None,
+            work_path: repo_path.to_path_buf(),
+            is_git: true,
             uses_worktree: false,
             branch_is_new: false,
         });
@@ -2725,6 +2751,7 @@ mod tests {
             permission_mode: None,
             in_place: false,
             existing_branch: None,
+            no_branch: false,
             add_dirs: Vec::new(),
             first_message: None,
         }
@@ -2813,6 +2840,57 @@ mod tests {
             head,
             "the reused branch must not have moved"
         );
+    }
+
+    /// The whole point of the mode: git is untouched. Same directory, same
+    /// branch, same set of branches as before the spawn.
+    #[test]
+    fn no_branch_leaves_the_checkout_exactly_as_it_was() {
+        let Some((_dir, repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let before = git::list_branches(&repo);
+        let mut req = spawn_req(&repo);
+        req.no_branch = true;
+        let prepared = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
+            .expect("prepare");
+
+        assert_eq!(prepared.work_path, repo);
+        assert!(!prepared.uses_worktree);
+        assert!(prepared.is_git);
+        assert_eq!(prepared.branch.as_deref(), Some("main"));
+        assert_eq!(prepared.base_ref, None);
+        assert!(
+            !prepared.branch_is_new,
+            "the branch predates the agent, so deleting the agent must not delete it"
+        );
+        assert_eq!(prepared.slug, "fix_the_parser");
+        assert_eq!(git::list_branches(&repo), before, "nothing may be created");
+        assert_eq!(git::current_branch(&repo).as_deref(), Some("main"));
+    }
+
+    /// Every other workspace option asks for the git work this mode refuses to
+    /// do, so none of them may leak past it.
+    #[test]
+    fn no_branch_overrides_the_other_workspace_options() {
+        let Some((_dir, repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let mut req = spawn_req(&repo);
+        req.no_branch = true;
+        req.existing_branch = Some("feature_login".to_string());
+        req.base_ref = Some("feature_login".to_string());
+        let prepared = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
+            .expect("prepare");
+
+        assert_eq!(
+            prepared.branch.as_deref(),
+            Some("main"),
+            "the checkout must not have been switched"
+        );
+        assert_eq!(prepared.base_ref, None);
+        assert!(!prepared.uses_worktree);
+        assert_eq!(git::current_branch(&repo).as_deref(), Some("main"));
     }
 
     #[test]

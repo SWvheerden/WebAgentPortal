@@ -345,31 +345,52 @@ async function selectRepo(repo) {
   renderSpawnWarnings(info);
 }
 
-// A repository with no branches to pick has nothing to reuse: the choice is
-// forced back to "new" rather than left as a control that cannot be honoured.
+// A repository with no branches to pick has nothing to reuse, and a folder
+// with no VCS has no branch choice at all: each option is disabled where it
+// cannot be honoured, and a selection that has just become impossible falls
+// back to "new" rather than being left as a control that does nothing.
+//
+// "Stay on the current one" needs the main checkout — a worktree is a second
+// checkout, which is precisely what it is asking us not to make — so it takes
+// the Workspace control over and holds it there.
 function renderBranchMode() {
   const info = state.repoInfo;
-  const canReuse = !!(info && info.is_git && info.branches.length);
+  const isGit = !!(info && info.is_git);
+  const canReuse = isGit && !!info.branches.length;
   const source = $('branch-source');
-  source.disabled = !canReuse;
-  if (!canReuse) source.value = 'new';
+  source.disabled = !isGit;
+  source.querySelector('option[value="existing"]').disabled = !canReuse;
+  if (!isGit || (source.value === 'existing' && !canReuse)) source.value = 'new';
+
   const reusing = source.value === 'existing';
-  $('new-branch-fields').classList.toggle('hidden', reusing);
+  const untouched = source.value === 'none';
+  $('new-branch-fields').classList.toggle('hidden', reusing || untouched);
   $('existing-branch-field').classList.toggle('hidden', !reusing);
+
+  const isolation = $('isolation');
+  if (untouched) isolation.value = 'in-place';
+  isolation.disabled = untouched;
 }
 
 function renderSpawnWarnings(info) {
   const host = $('spawn-warnings');
   host.replaceChildren();
   if (!info) return;
+  const source = $('branch-source').value;
   const inPlace = $('isolation').value === 'in-place';
+  if (source === 'none') {
+    host.append(el('div', {
+      class: 'warnbox small',
+      text: `No worktree and no new branch: the agent works directly in the main checkout on ${info.current || 'the current HEAD'}, so its changes land where you are working.`,
+    }));
+  }
   if (info.dirty && !inPlace) {
     host.append(el('div', {
       class: 'warnbox small',
       text: 'This checkout has uncommitted changes. A worktree starts from the branch head, so those changes will be invisible to the agent.',
     }));
   }
-  if (info.dirty && inPlace && $('branch-source').value === 'existing') {
+  if (info.dirty && inPlace && source === 'existing') {
     host.append(el('div', {
       class: 'warnbox small',
       text: 'Switching the main checkout to an existing branch with uncommitted changes: git will refuse if the switch would overwrite them.',
@@ -389,6 +410,10 @@ function updateBranchPreview() {
   const name = $('task-name').value.trim();
   if (!repo || !repo.is_git) {
     $('branch-preview').value = repo ? '(no VCS — no branch)' : '';
+    return;
+  }
+  if ($('branch-source').value === 'none') {
+    $('branch-preview').value = '(no branch — the current one is kept)';
     return;
   }
   $('branch-preview').value = prefix + slugify(name || repo.name);
@@ -411,19 +436,24 @@ async function spawn() {
     return;
   }
   const budget = parseFloat($('budget').value);
-  const reusing = $('branch-source').value === 'existing';
+  const source = $('branch-source').value;
+  const reusing = source === 'existing';
+  const untouched = source === 'none';
   const body = {
     repo_path: state.selectedRepo.path,
     task_name: $('task-name').value.trim() || state.selectedRepo.name,
     // A reused branch has its own head; a base ref would only move it, so it is
     // not sent at all rather than sent and ignored.
-    base_ref: reusing ? null : $('base-ref').value || null,
+    base_ref: reusing || untouched ? null : $('base-ref').value || null,
     existing_branch: reusing ? $('existing-branch').value || null : null,
+    no_branch: untouched,
     model: $('model').value.trim() || null,
     effort: $('effort').value.trim() || null,
     max_budget_usd: Number.isFinite(budget) ? budget : null,
     permission_mode: $('permission-mode').value,
-    in_place: $('isolation').value === 'in-place',
+    // Staying on the current branch means the main checkout by definition; the
+    // control is held there, but the flag is sent explicitly all the same.
+    in_place: untouched || $('isolation').value === 'in-place',
     add_dirs: $('add-dirs').value.split('\n').map((s) => s.trim()).filter(Boolean),
     first_message: $('first-message').value.trim() || null,
   };
@@ -541,6 +571,7 @@ async function main() {
   $('isolation').onchange = () => renderSpawnWarnings(state.repoInfo);
   $('branch-source').onchange = () => {
     renderBranchMode();
+    updateBranchPreview();
     renderSpawnWarnings(state.repoInfo);
   };
   $('spawn-btn').onclick = spawn;
