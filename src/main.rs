@@ -164,21 +164,17 @@ async fn main() -> Result<()> {
     };
     let app = web::routes::router(state);
 
-    // Loopback is always served, whatever else is: the local browser is opened
-    // on the loopback tokened URL, and the per-boot token is refused anywhere
-    // else (§12).
+    // The loopback listener is always one of these, and is the one the browser
+    // is pointed at below.
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let mut listeners = vec![
-        tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("binding {addr}"))?,
-    ];
+    let addrs = listen_addrs(bind_ip, port);
     let remote_addr = SocketAddr::new(bind_ip, port);
-    if !bind_ip.is_loopback() {
+    let mut listeners = Vec::with_capacity(addrs.len());
+    for addr in &addrs {
         listeners.push(
-            tokio::net::TcpListener::bind(remote_addr)
+            tokio::net::TcpListener::bind(addr)
                 .await
-                .with_context(|| format!("binding {remote_addr}"))?,
+                .with_context(|| format!("binding {addr}"))?,
         );
     }
     // The token travels in the URL the browser is opened with; the page keeps
@@ -265,6 +261,23 @@ async fn main() -> Result<()> {
     // A second pass, in case anything started during the drain.
     sup.shutdown().await;
     Ok(())
+}
+
+/// Every address to listen on, v4 loopback first.
+///
+/// Loopback is always served, whatever `bind` says: the local browser is opened
+/// on the loopback tokened URL, and the per-boot token is refused from anywhere
+/// else (§12). `bind` therefore adds a listener rather than replacing one — and
+/// it must actually add it, including for the `::1` case, or a configuration
+/// this accepts would be one it silently ignores.
+fn listen_addrs(bind_ip: IpAddr, port: u16) -> Vec<SocketAddr> {
+    let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let bound = SocketAddr::new(bind_ip, port);
+    if bound == loopback {
+        vec![loopback]
+    } else {
+        vec![loopback, bound]
+    }
 }
 
 /// `claude-web pair` and `claude-web unpair` (§12).
@@ -358,5 +371,56 @@ async fn wait_for_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_v6_loopback_bind_opens_a_v6_socket() {
+        // `bind = "::1"` is accepted by `Config::validate`, so it has to mean
+        // something: a browser sent to `http://localhost:7717` that resolves
+        // localhost to ::1 must find something listening.
+        assert_eq!(
+            listen_addrs("::1".parse().expect("ip"), 7717),
+            vec![
+                "127.0.0.1:7717".parse::<SocketAddr>().expect("addr"),
+                "[::1]:7717".parse::<SocketAddr>().expect("addr"),
+            ]
+        );
+
+        // The default binds once, not twice: the loopback listener is the one
+        // `bind` already names.
+        assert_eq!(
+            listen_addrs(
+                config::DEFAULT_BIND.parse().expect("ip"),
+                config::DEFAULT_PORT
+            ),
+            vec!["127.0.0.1:7717".parse::<SocketAddr>().expect("addr")]
+        );
+
+        // A remote bind is served alongside loopback, not instead of it.
+        assert_eq!(
+            listen_addrs("100.64.0.7".parse().expect("ip"), 7717),
+            vec![
+                "127.0.0.1:7717".parse::<SocketAddr>().expect("addr"),
+                "100.64.0.7:7717".parse::<SocketAddr>().expect("addr"),
+            ]
+        );
+
+        // Every address `Config::validate` accepts gets a listener of its own.
+        for bind in ["::1", "10.0.0.4", "192.168.1.5", "172.16.9.9", "100.64.0.7"] {
+            let ip: IpAddr = bind.parse().expect("ip");
+            assert!(
+                config::bind_allowed(ip),
+                "{bind} is part of the accepted shape"
+            );
+            assert!(
+                listen_addrs(ip, 7717).contains(&SocketAddr::new(ip, 7717)),
+                "{bind} is accepted by validate and must actually be bound"
+            );
+        }
     }
 }

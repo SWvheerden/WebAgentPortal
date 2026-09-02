@@ -78,6 +78,8 @@ impl HostPolicy {
                 .map(|h| h.trim().to_ascii_lowercase())
                 .filter(|h| !h.is_empty()),
         );
+        // A loopback bind names something already on the list.
+        names.dedup();
         Self { port, names }
     }
 

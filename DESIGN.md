@@ -1095,7 +1095,9 @@ unchanged; same-origin is same-origin wherever the page was served from.
 
 Loopback keeps its own listener whatever `bind` says, so the local browser is
 still opened on the loopback tokened URL and the per-boot token still has
-somewhere it is legitimately presented.
+somewhere it is legitimately presented. `bind` therefore *adds* a listener
+rather than replacing one — including for `::1`, which would otherwise be a
+value the config accepts and the server silently ignores.
 
 ### What a paired device may do
 
