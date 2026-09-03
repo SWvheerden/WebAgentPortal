@@ -155,11 +155,24 @@
       <div class="meters" id="limits"></div>
     </section>
 
-    <section class="panel">
-      <h2>Agents <span class="muted" id="agent-count"></span></h2>
-      <div class="cards" id="cards"></div>
-      <p class="muted small" id="empty">No agents yet. Spawn one above.</p>
-    </section>
+    <div class="board">
+      <section class="panel agents">
+        <h2>Agents <span class="muted" id="agent-count"></span></h2>
+        <div class="cards" id="cards"></div>
+        <p class="muted small" id="empty">No agents yet. Spawn one above.</p>
+      </section>
+
+      <section class="panel notes" id="notes-panel">
+        <h2>
+          <button id="notes-toggle" class="disclosure" aria-expanded="true">Notes</button>
+          <span class="muted" id="notes-count"></span>
+          <span class="spacer"></span>
+          <button id="note-new" title="Write down something to do later">New note</button>
+        </h2>
+        <div class="note-list" id="notes"></div>
+        <p class="muted small" id="notes-empty">Nothing noted.</p>
+      </section>
+    </div>
   </main>
 
   <script type="module" src="/assets/dashboard.js"></script>

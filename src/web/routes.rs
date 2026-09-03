@@ -9,7 +9,7 @@ use axum::extract::{Path as AxPath, Query, Request, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -256,6 +256,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/agents/{id}/permission", post(post_permission))
         .route("/api/agents/{id}/delete_preview", get(delete_preview))
+        .route("/api/notes", get(list_notes).post(create_note))
+        .route("/api/notes/{id}", patch(update_note).delete(delete_note))
         .route("/ws", get(super::ws::handler))
         .route("/api/health", get(health))
         // Loopback binding alone does not survive DNS rebinding: a page on
@@ -894,6 +896,74 @@ async fn delete_agent(
     }
 }
 
+// -- notes -------------------------------------------------------------------
+
+/// A body big enough for any memo and small enough that the dashboard's poll
+/// can carry the whole list without thinking about it.
+const MAX_NOTE_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct NoteBody {
+    body: String,
+}
+
+/// Surrounding whitespace is never part of a memo, and a note that is only
+/// whitespace is not one — refused on create and on edit alike, so the database
+/// never holds a blank row.
+fn clean_note(body: &str) -> ApiResult<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::bad_request("a note needs a body"));
+    }
+    if trimmed.len() > MAX_NOTE_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "a note is limited to {MAX_NOTE_BYTES} bytes"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn list_notes(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let notes = state.sup.db().run(|db| db.list_notes()).await?;
+    Ok(Json(json!({ "notes": notes })))
+}
+
+async fn create_note(
+    State(state): State<AppState>,
+    Json(body): Json<NoteBody>,
+) -> ApiResult<Json<Value>> {
+    let body = clean_note(&body.body)?;
+    let note = state.sup.db().run(move |db| db.create_note(&body)).await?;
+    Ok(Json(json!({ "note": note })))
+}
+
+async fn update_note(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Json(body): Json<NoteBody>,
+) -> ApiResult<Json<Value>> {
+    let body = clean_note(&body.body)?;
+    let key = id.clone();
+    let note = state
+        .sup
+        .db()
+        .run(move |db| db.update_note(&key, &body))
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no such note: {id}")))?;
+    Ok(Json(json!({ "note": note })))
+}
+
+async fn delete_note(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> ApiResult<Json<Value>> {
+    let key = id.clone();
+    if !state.sup.db().run(move |db| db.delete_note(&key)).await? {
+        return Err(ApiError::not_found(format!("no such note: {id}")));
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,6 +1036,21 @@ mod tests {
             Some(PermissionDecision::Deny { .. })
         ));
         assert!(decision_from("maybe", None, None).is_none());
+    }
+
+    #[test]
+    fn a_note_body_is_trimmed_and_bounded() {
+        assert_eq!(
+            clean_note("  ship the parser \n").ok().as_deref(),
+            Some("ship the parser")
+        );
+        assert!(clean_note("").is_err());
+        assert!(clean_note("   \n\t ").is_err());
+        assert!(clean_note(&"x".repeat(MAX_NOTE_BYTES)).is_ok());
+        // Measured after trimming, so trailing newlines cannot push a legal
+        // body over the edge.
+        assert!(clean_note(&format!(" {} ", "x".repeat(MAX_NOTE_BYTES))).is_ok());
+        assert!(clean_note(&"x".repeat(MAX_NOTE_BYTES + 1)).is_err());
     }
 
     #[tokio::test]
@@ -1167,6 +1252,10 @@ mod tests {
             ("POST", "/api/agents/x/permission_mode"),
             ("POST", "/api/agents/x/stop"),
             ("DELETE", "/api/agents/x"),
+            ("GET", "/api/notes"),
+            ("POST", "/api/notes"),
+            ("PATCH", "/api/notes/x"),
+            ("DELETE", "/api/notes/x"),
         ] {
             let request = api_request(path)
                 .method(method)

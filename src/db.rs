@@ -66,6 +66,16 @@ CREATE TABLE IF NOT EXISTS rate_limit (
   captured_at INTEGER NOT NULL,
   payload     TEXT NOT NULL
 );
+
+-- Free-text reminders about work not being done now. No foreign key on
+-- purpose: notes are one flat global list, and a note about future work must
+-- outlive whatever agent prompted it (§ "Notes").
+CREATE TABLE IF NOT EXISTS notes (
+  id         TEXT PRIMARY KEY,
+  body       TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 "#;
 
 /// Additive migrations applied after [`SCHEMA`].
@@ -136,6 +146,15 @@ pub struct AgentRecord {
 
 fn default_true() -> bool {
     true
+}
+
+/// A row of the `notes` table: a reminder about work not being done now.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Note {
+    pub id: String,
+    pub body: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 /// A row of the `events` table.
@@ -559,6 +578,80 @@ impl Db {
             Ok(out)
         })
     }
+
+    // -- notes ---------------------------------------------------------------
+
+    /// Every note, oldest first, so the list reads top to bottom as a queue.
+    ///
+    /// `rowid` breaks a tie rather than `id`: two notes written in the same
+    /// millisecond then still come out in the order they were written, which is
+    /// the whole promise of appending to the bottom.
+    pub fn list_notes(&self) -> Result<Vec<Note>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, body, created_at, updated_at FROM notes
+                 ORDER BY created_at ASC, rowid ASC",
+            )?;
+            let rows = stmt.query_map([], row_to_note)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    pub fn create_note(&self, body: &str) -> Result<Note> {
+        let note = Note {
+            id: uuid::Uuid::new_v4().to_string(),
+            body: body.to_string(),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+        };
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO notes (id, body, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![note.id, note.body, note.created_at, note.updated_at],
+            )?;
+            Ok(())
+        })?;
+        Ok(note)
+    }
+
+    /// Last write wins: no version is checked, by design — this is a
+    /// single-user memo list, and a 409 the operator cannot resolve is worse
+    /// than an edit they would notice themselves.
+    ///
+    /// `None` when there is no such note, which is a 404 rather than a silent
+    /// success — the row it was typed into is gone.
+    pub fn update_note(&self, id: &str, body: &str) -> Result<Option<Note>> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE notes SET body = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, body, now_ms()],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            let mut stmt =
+                conn.prepare("SELECT id, body, created_at, updated_at FROM notes WHERE id = ?1")?;
+            Ok(stmt.query_row(params![id], row_to_note).optional()?)
+        })
+    }
+
+    /// `false` when there was nothing to delete. Finishing a task deletes its
+    /// note — there is no done state to move it to.
+    pub fn delete_note(&self, id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+            Ok(changed > 0)
+        })
+    }
+}
+
+fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
+    Ok(Note {
+        id: row.get(0)?,
+        body: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+    })
 }
 
 const AGENT_COLUMNS: &str = "id, name, slug, repo_path, work_path, is_git, branch, base_ref, \
@@ -871,6 +964,38 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].request_id, "2");
         assert_eq!(pending[0].tool_name, "Write");
+    }
+
+    #[test]
+    fn notes_are_listed_oldest_first_and_edit_in_place() {
+        let db = Db::open_in_memory().expect("db");
+        assert!(db.list_notes().expect("list").is_empty());
+
+        let first = db.create_note("rewrite the scanner").expect("create");
+        let second = db.create_note("check the fetch timeout").expect("create");
+        // Written in the same millisecond, so only the insertion order can
+        // separate them — and it must, or the list reshuffles on every load.
+        let listed = db.list_notes().expect("list");
+        assert_eq!(
+            listed.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec![first.id.as_str(), second.id.as_str()]
+        );
+
+        let edited = db
+            .update_note(&first.id, "rewrite the scanner, then the walker")
+            .expect("update")
+            .expect("present");
+        assert_eq!(edited.body, "rewrite the scanner, then the walker");
+        // An edit does not move a note: the position is where it was written.
+        assert_eq!(edited.created_at, first.created_at);
+        let listed = db.list_notes().expect("list");
+        assert_eq!(listed[0].id, first.id);
+
+        // Finishing a task deletes its note; there is no done state.
+        assert!(db.delete_note(&first.id).expect("delete"));
+        assert!(!db.delete_note(&first.id).expect("delete again"));
+        assert!(db.update_note(&first.id, "gone").expect("update").is_none());
+        assert_eq!(db.list_notes().expect("list").len(), 1);
     }
 
     #[test]

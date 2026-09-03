@@ -117,6 +117,55 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 /* A refused request is not a footnote: outline the whole panel. */
 .panel.warn-tint { border-color: var(--err); }
 
+/* The board: the agent list with the notes panel beside it. Notes take a
+   narrow column and wrap underneath on a phone rather than squeezing the
+   cards down to one per row. */
+.board { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.board > .agents { flex: 3 1 520px; }
+.board > .notes { flex: 1 1 260px; }
+
+/* notes */
+.notes h2 { display: flex; align-items: center; gap: 8px; }
+.notes h2 .spacer { flex: 1; }
+/* A heading that is also the collapse control: it has to look like the
+   heading, not like a button. */
+.disclosure {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+}
+.disclosure:hover { color: var(--accent-2); }
+.disclosure::before { content: "▾ "; }
+.notes.collapsed .disclosure::before { content: "▸ "; }
+
+.note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+}
+.note .body { flex: 1; white-space: pre-wrap; word-break: break-word; cursor: text; }
+.note .del { border: none; background: none; color: var(--dim); padding: 0 4px; }
+.note .del:hover { color: var(--err); }
+.note textarea { min-height: 66px; resize: vertical; }
+/* Collapsed, each note is one line of its own text: enough to see what is on
+   the list without the panel taking the height of every body. */
+.notes.collapsed .note { padding: 3px 8px; }
+.notes.collapsed .body {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
+}
+
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
 .card h3 { margin: 0 0 4px; font-size: 13px; }

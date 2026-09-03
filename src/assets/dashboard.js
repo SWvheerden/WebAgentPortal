@@ -1,4 +1,5 @@
-// Dashboard: the agent registry, account usage, the spawn form, cloning and settings.
+// Dashboard: the agent registry, account usage, notes, the spawn form, cloning
+// and settings.
 import { api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, toast } from '/assets/common.js';
 
 const state = {
@@ -11,6 +12,11 @@ const state = {
   rateLimit: null,
   /// When the snapshot above was taken, so an old one can say so.
   rateLimitAt: null,
+  notes: [],
+  notesOpen: true,
+  /// The id of the note being typed into, `NEW_NOTE` for one that has never
+  /// been saved, or null. Exactly one row can be in the editor at a time.
+  editing: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -273,6 +279,203 @@ async function remove(agent) {
     } else {
       toast(err.message, 'error');
     }
+  }
+}
+
+// -- notes ------------------------------------------------------------------
+//
+// A note is inert text: no repo, no branch, no spawn parameters. Retyping a
+// task into the spawn form costs seconds and keeps the note a memo.
+
+/// The row that has been appended but never saved. Held client-side until it
+/// has a body, so the database never sees a blank.
+const NEW_NOTE = '\u0000new';
+
+/// localStorage, not the sessionStorage the token uses: keeping the *token* out
+/// of the browser profile past the tab is a decision about the token, and it
+/// does not generalise to a panel that is open or shut.
+const NOTES_OPEN_KEY = 'claude-web-notes-open';
+
+function readNotesOpen() {
+  try {
+    return localStorage.getItem(NOTES_OPEN_KEY) !== '0';
+  } catch {
+    return true;
+  }
+}
+
+/// The first line, derived here and never stored: a note is one body, and a
+/// title column would be a second thing to keep in step with it.
+function noteHeading(body) {
+  return String(body).split('\n')[0] || '(empty)';
+}
+
+/// Collapsed and expanded are different rows, so the mode belongs in the
+/// signature — otherwise toggling the panel leaves every row as it was.
+function noteSignature(note) {
+  return JSON.stringify([state.notesOpen, note.body]);
+}
+
+function noteRow(note, signature) {
+  if (!state.notesOpen) {
+    return el('div', { class: 'note', 'data-id': note.id, 'data-sig': signature }, [
+      el('div', { class: 'body', text: noteHeading(note.body), title: note.body }),
+    ]);
+  }
+  return el('div', { class: 'note', 'data-id': note.id, 'data-sig': signature }, [
+    // Plain text, not markdown: the frontend is embedded in the binary with no
+    // bundler, and rendering markdown means vendoring a parser and then owning
+    // a sanitiser for text only its author will read.
+    el('div', { class: 'body', text: note.body, onclick: () => startEdit(note.id) }),
+    el('button', { class: 'del', text: '×', title: 'Delete this note', onclick: () => removeNote(note) }),
+  ]);
+}
+
+/// One editor, one code path: a new note and an edit are the same row.
+///
+/// Blur saves and Escape cancels, so there is no third button to aim at. The
+/// blur that the teardown itself causes is not a save — a detached row has
+/// nothing to commit.
+function noteEditor(id, body) {
+  const area = el('textarea', { rows: '3' });
+  area.value = body;
+  const row = el('div', { class: 'note editing', 'data-id': id, 'data-sig': 'editing' }, [area]);
+  area.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    state.editing = null;
+    renderNotes();
+  });
+  area.addEventListener('blur', () => {
+    if (!row.isConnected) return;
+    commitEdit(id, area.value);
+  });
+  return row;
+}
+
+function renderNotes() {
+  $('notes-panel').classList.toggle('collapsed', !state.notesOpen);
+  $('notes-toggle').setAttribute('aria-expanded', String(state.notesOpen));
+  const host = $('notes');
+
+  // The row being typed into keeps its own node — and with it the caret and
+  // whatever has not been saved — however often the poll comes round. Every
+  // other row is reconciled the way the agent cards are.
+  const editingNode = state.editing ? host.querySelector('.note.editing') : null;
+  const wanted = state.notes.map((note) => [note.id, note]);
+  if (state.editing === NEW_NOTE) wanted.push([NEW_NOTE, null]);
+
+  const leftover = new Map([...host.children].map((node) => [node.dataset.id, node]));
+  let previous = null;
+  for (const [id, note] of wanted) {
+    let node;
+    if (id === state.editing) {
+      const old = leftover.get(id);
+      leftover.delete(id);
+      node = editingNode || noteEditor(id, note ? note.body : '');
+      if (old && old !== node) old.replaceWith(node);
+    } else {
+      const signature = noteSignature(note);
+      node = leftover.get(id);
+      if (node) {
+        leftover.delete(id);
+        if (node.dataset.sig !== signature) {
+          const fresh = noteRow(note, signature);
+          node.replaceWith(fresh);
+          node = fresh;
+        }
+      } else {
+        node = noteRow(note, signature);
+      }
+    }
+    if (node.parentNode !== host || node.previousElementSibling !== previous) {
+      if (previous) previous.after(node);
+      else host.prepend(node);
+    }
+    previous = node;
+  }
+  for (const gone of leftover.values()) gone.remove();
+
+  $('notes-count').textContent = state.notes.length ? `— ${state.notes.length}` : '';
+  $('notes-empty').classList.toggle('hidden', !!wanted.length || !state.notesOpen);
+}
+
+async function loadNotes() {
+  const data = await api('/api/notes').catch(() => null);
+  if (!data) return;
+  state.notes = data.notes;
+  renderNotes();
+}
+
+function setNotesOpen(open) {
+  state.notesOpen = open;
+  try {
+    localStorage.setItem(NOTES_OPEN_KEY, open ? '1' : '0');
+  } catch {
+    // A browser that refuses storage still gets the panel; it just forgets.
+  }
+  // Collapsed rows are an index, not a form: an editor left open in one would
+  // be a control the operator cannot see the rest of.
+  if (!open) state.editing = null;
+  renderNotes();
+}
+
+function startEdit(id) {
+  if (!state.notesOpen) return;
+  state.editing = id;
+  renderNotes();
+  const area = $('notes').querySelector('.note.editing textarea');
+  if (!area) return;
+  area.focus();
+  area.setSelectionRange(area.value.length, area.value.length);
+}
+
+function newNote() {
+  if (!state.notesOpen) setNotesOpen(true);
+  startEdit(NEW_NOTE);
+}
+
+async function commitEdit(id, raw) {
+  const body = raw.trim();
+  try {
+    if (id === NEW_NOTE) {
+      // Nothing typed: the row is dropped and the server is never told.
+      if (body) {
+        const data = await api('/api/notes', { method: 'POST', body: JSON.stringify({ body }) });
+        state.notes.push(data.note);
+      }
+    } else {
+      const note = state.notes.find((n) => n.id === id);
+      // An emptied body is not a delete — deleting is its own action, and it
+      // asks first. Left alone, the note keeps the text it had.
+      if (note && body && body !== note.body) {
+        const data = await api(`/api/notes/${id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ body }),
+        });
+        Object.assign(note, data.note);
+      }
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    // Clicking straight from one note into another blurs the first and opens
+    // the second before this settles; closing "the editor" then would shut the
+    // row the operator had just aimed at.
+    if (state.editing === id) state.editing = null;
+    renderNotes();
+  }
+}
+
+async function removeNote(note) {
+  // The body is text the operator typed and cannot get back.
+  if (!confirm(`Delete this note?\n\n${noteHeading(note.body)}`)) return;
+  try {
+    await api(`/api/notes/${note.id}`, { method: 'DELETE' });
+    state.notes = state.notes.filter((n) => n.id !== note.id);
+    renderNotes();
+  } catch (err) {
+    toast(err.message, 'error');
   }
 }
 
@@ -559,6 +762,8 @@ async function main() {
   applySpawnDefaults();
   await loadAgents();
   await loadLimits();
+  state.notesOpen = readNotesOpen();
+  await loadNotes();
   await loadRepos();
   // Nothing is reusable until a repository is picked, so the control starts
   // disabled rather than offering an empty list.
@@ -567,6 +772,8 @@ async function main() {
   $('toggle-spawn').onclick = () => togglePanel('spawn-panel');
   $('toggle-clone').onclick = () => togglePanel('clone-panel');
   $('toggle-settings').onclick = () => togglePanel('settings-panel');
+  $('notes-toggle').onclick = () => setNotesOpen(!state.notesOpen);
+  $('note-new').onclick = newNote;
   $('task-name').oninput = updateBranchPreview;
   $('isolation').onchange = () => renderSpawnWarnings(state.repoInfo);
   $('branch-source').onchange = () => {
@@ -657,10 +864,14 @@ async function main() {
       }
     });
 
-  // Keep relative timestamps honest without a full re-render storm.
+  // Keep relative timestamps honest without a full re-render storm, and pick up
+  // notes written in another tab — or on a phone over Tailscale. Notes ride
+  // this poll rather than the socket: a wide broadcast would be real protocol
+  // work in service of a list of tens of rows.
   setInterval(() => {
     renderAgents();
     renderLimits();
+    loadNotes();
   }, 30000);
 }
 
