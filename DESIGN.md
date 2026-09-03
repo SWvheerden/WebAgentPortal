@@ -1179,3 +1179,142 @@ outcome than the dependency.
 
 The project directory is `~/Code/claude web` — **the space breaks `cargo init`'s default
 package name.** Use `cargo init --name claude-web`.
+
+---
+
+## 14. The sweep's CPU cost
+
+**Status: specified, not built.** Measured 2026-09-03 against the running
+server (`claude-web` at `e1714c6`) and the live `~/.claude-web/agents.db`.
+
+### What was measured
+
+The server is quiet at rest. Sampled for 60s with no agent running, it used
+0.26s of CPU (~0.4%), and a `sample(1)` call graph showed every worker thread
+parked in `kevent`/`__psynch_cvwait`. There is no spin loop, and the frontend's
+only timer is the 30s dashboard refresh (§7). All of the cost is load-driven.
+
+It is the process-table sweep of §4. `process_table` forks `ps -axo
+pid=,ppid=,pgid=,etime=,state=` over every process on the machine, and the
+cadence §4 describes fires it seven times per tool call, per agent:
+
+- `supervisor.rs`, on `EventKind::ToolUse` — six sweeps, at 0/8/20/45/90/250ms
+- `supervisor.rs`, on `EventKind::ToolResult` and `EventKind::Result` — one more
+
+Cost per call, on a machine with 558 processes, via `/usr/bin/time -l` over 100
+iterations:
+
+| operation | CPU per call |
+|---|---|
+| bare fork+exec (`/usr/bin/true`) | 1.6 ms |
+| `ps -p self` — process startup, no full scan | 2.4 ms |
+| **`ps -axo` — the full scan we actually run** | **16.3 ms** (0.33s user + 1.30s sys / 100) |
+
+That is ~114ms of CPU per tool call before any of the agent's work happens.
+Against the recorded history in the live database — 9385 events over 4 agents,
+of which 1468 `tool_use`, 1466 `tool_result` and 44 `result` — the cadence comes
+to **≈10,300 scans, ≈168 CPU-seconds** spent in `ps`.
+
+The bursts are the visible part. Modelling one tool call arriving across 4
+concurrent agents (24 simultaneous scans) took **0.54s of CPU in 0.57s of wall
+clock**: one core saturated, on `ps` alone, for as long as the burst lasts.
+
+### Why a cheaper scan is the wrong fix
+
+The obvious move — drop `ps` and read `KERN_PROC_ALL` through `libc::sysctl`
+directly — is not worth doing. The table above decomposes the 16.3ms: fork+exec
+is 1.6ms and `ps`'s own startup takes it to 2.4ms, so **~14ms of the 16.3ms is
+the scan itself**, the kernel copying 558 process records out. Removing the
+subprocess recovers about 2ms of 16ms and costs us a readable, portable
+implementation and its tests.
+
+The scans have to become fewer, not cheaper.
+
+### The change
+
+**A shared snapshot.** One process-table read, cached behind a short TTL
+(~100–250ms), which every sweep reads from instead of forking its own `ps`. This
+collapses a 24-scan burst to a single scan. It is close to free in correctness
+terms: the six samples at 0/8/20/45/90ms are already reading a table that has
+barely changed, and §4's ownership proof is built on start times and continuity,
+not on the snapshot being fresh to the millisecond. The 250ms sample and the
+`ToolResult` sweep sit outside a 250ms TTL and still read fresh tables, which is
+where the real evidence is.
+
+**A gate on having something to track.** `process::refresh_sweep` guards only
+`root_pid <= 0` and then calls `process_table()` unconditionally. The
+`ToolUse` arm calls it directly, bypassing the `tracking` check that
+`refresh_on_activity` already applies. An agent that never leaves a process
+group behind — the common case — pays the full 114ms per tool call for nothing.
+The gate `refresh_on_activity` uses should apply to every sweep that is not
+establishing a new group.
+
+**A note on the sample schedule.** The six samples do not land where §4 says
+they do. The `sweep` write lock is taken before `spawn_blocking` and held across
+the `.await`, so the sweeps serialize; at 16ms each, the samples nominally at
+8/20/45ms actually land near 16/32/48ms. §4 calls them "a cheap best effort" —
+they are not cheap, and the schedule is not the schedule. Once they share a
+snapshot they become genuinely cheap and the point is moot, but if the burst is
+reduced instead, reduce it on the evidence of what the samples *catch* (§4's
+table: 0 of 4 controlled trials for the `&` case), not on the stated timings.
+
+### What must not regress
+
+This is a performance change to safety machinery, so §4's invariants bound it.
+A shared snapshot must not weaken any of:
+
+- A group is recorded only when its **leader** is a descendant of the CLI,
+  pinned by pid *and* start time.
+- Ownership is re-proved from a live member predating the last proof; the proof
+  timestamp moves forward only on a scan that actually proved it. **A cached
+  table must not advance `proven_ms` twice from one observation** — that would
+  manufacture continuity the table never showed.
+- `ps`'s whole-second granularity is subtracted from the proof window, never
+  added. A TTL adds staleness on the same side, so it must be subtracted too, or
+  folded into `CLOCK_SLACK_MS`.
+- pid 1, the server's own pid, its own process group and other agents' groups
+  are never signalled.
+
+Teardown (`tear_down_groups`) and `stop_targets` must keep reading a **fresh**
+table, never a cached one. They decide what gets SIGKILLed, they run once per
+agent exit rather than per tool call, and they are not where the cost is.
+
+### Second-order, and deliberately ranked below the above
+
+Both are real and neither is worth doing first.
+
+**Double serialization per socket.** `ws::send_server_msg` builds a throwaway
+`serde_json::Value` with `to_value` and then `send` serializes that to a string.
+With the `payload.clone()` in `persist` and broadcast's per-receiver clone, each
+event's payload is deep-copied roughly `2 + 2×sockets` times; `tool_result`
+payloads average 3.9KB and reach 68KB. Serializing once into an `Arc<str>` and
+fanning that out is the fix. Scale: order 1 CPU-second across the recorded
+history, against the sweep's 168.
+
+**One SQLite connection under one mutex.** `Db` is an `Arc<Mutex<Connection>>`,
+so every append, every replay and every `list_agents` serializes through it on
+blocking threads. WAL is on and the queries are correctly indexed — both
+`MAX(seq) WHERE agent_id=?` and the replay query use
+`sqlite_autoindex_events_1`, so there is no O(n²) write path — and this is a
+thread-pileup and latency risk under many concurrent agents, not a CPU cost
+today. Left alone until it is measured as a problem.
+
+### Out of scope
+
+Rewriting `process_table` against `libc::sysctl`, for the reason above.
+Reducing the sampling cadence on timing grounds alone. Anything that trades a
+§4 ownership invariant for throughput.
+
+### Tasks
+
+1. Shared process-table snapshot with a TTL, read by every non-teardown sweep.
+2. Apply `refresh_on_activity`'s tracking gate to the `ToolUse` sweeps.
+3. Fold the TTL into the proof window so staleness is subtracted, not added;
+   ensure one observation cannot advance `proven_ms` twice.
+4. Keep `tear_down_groups` and `stop_targets` on fresh reads.
+5. **Amend §4** — its cadence description ("snapshotted … several times in the
+   first quarter-second of each tool call") and its "cheap best effort" wording
+   both become wrong when this lands.
+6. Re-run the §4 sweep measurement table afterwards. This changes when groups
+   are observed, so the swept/not-swept results are not inherited.
+7. Re-measure per-tool-call CPU against the numbers above.
