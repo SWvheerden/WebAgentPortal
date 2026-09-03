@@ -592,6 +592,7 @@ impl Supervisor {
             last_stderr: None,
             sweep: Arc::new(RwLock::new(Sweep::default())),
             last_refresh: std::time::Instant::now(),
+            seen_table_ms: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             grace: STOP_GRACE,
             recently_sent: std::collections::VecDeque::new(),
             rate_limit: self.rate_limit.clone(),
@@ -1184,6 +1185,11 @@ struct Runner {
     /// When the sweep was last refreshed, so activity can keep the ownership
     /// proof fresh without a `ps` per event.
     last_refresh: std::time::Instant,
+    /// The `read_ms` of the newest process table this agent's sweeps have used.
+    /// A sweep that is meant to discover a group refuses to be handed that same
+    /// table again (`process::shared_process_table_after`). Shared with the
+    /// refresher tasks.
+    seen_table_ms: Arc<std::sync::atomic::AtomicI64>,
     /// How long a process group gets between SIGTERM and SIGKILL. A field so
     /// tests can drive the escalation without waiting out the real grace.
     grace: Duration,
@@ -1335,19 +1341,26 @@ impl Runner {
 
     /// Run a snapshot cycle and fold the result into what we already know.
     ///
-    /// Scheduled off the runner loop so a `ps` never delays event handling.
-    /// Several snapshots follow each tool call starting. The later ones do the
-    /// real work — they record a child that is still running, which is what
-    /// makes it reachable at teardown. The earliest are a cheap best effort at
-    /// a shell that exits immediately; they occasionally win, but they do not
-    /// close the backgrounded-job case (DESIGN.md §4).
-    fn refresh_sweep(&self, delay: Duration) {
+    /// Scheduled off the runner loop so a table read never delays event
+    /// handling. The read itself goes through the process-wide shared snapshot
+    /// (`process::shared_process_table`), so the samples that follow a tool
+    /// call — and the bursts of several agents arriving at once — cost one `ps`
+    /// between them rather than one each (DESIGN.md §4).
+    ///
+    /// `establishing` marks a sweep that can discover a group we do not yet
+    /// know about — one that will read a table no earlier sweep has seen. The
+    /// rest re-prove what we already hold, and are skipped when we hold
+    /// nothing: the same gate `refresh_on_activity` applies, moved inside the
+    /// spawned task so it is judged when the sweep runs rather than when it is
+    /// scheduled.
+    fn refresh_sweep(&self, delay: Duration, establishing: bool) {
         let pid = self.child.pid as i32;
         if pid <= 0 {
             return;
         }
         let shared = self.sweep.clone();
         let siblings = self.agent_pids.clone();
+        let seen = self.seen_table_ms.clone();
         tokio::spawn(async move {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
@@ -1356,10 +1369,14 @@ impl Runner {
             // each other's pruning.
             let forbidden: Vec<i32> = siblings.read().await.iter().copied().collect();
             let mut guard = shared.write().await;
+            if !establishing && guard.is_empty() {
+                return;
+            }
             let known = guard.clone();
-            if let Ok(updated) =
-                tokio::task::spawn_blocking(move || process::refresh_sweep(known, pid, &forbidden))
-                    .await
+            if let Ok(updated) = tokio::task::spawn_blocking(move || {
+                process::refresh_sweep(known, pid, &forbidden, &seen, establishing)
+            })
+            .await
             {
                 *guard = updated;
             }
@@ -1439,7 +1456,7 @@ impl Runner {
             return;
         }
         self.last_refresh = std::time::Instant::now();
-        self.refresh_sweep(Duration::ZERO);
+        self.refresh_sweep(Duration::ZERO, false);
     }
 
     async fn on_action(&mut self, action: Action) {
@@ -1452,21 +1469,42 @@ impl Runner {
                 match kind {
                     // A tool call is starting. Sample a few times over the
                     // first quarter-second: what matters is catching a child
-                    // that is still running later, and the early samples are a
-                    // cheap best effort at a shell that exits at once. They are
-                    // NOT a fix for a job backgrounded with `&` — measured
-                    // against the real CLI those reparent to pid 1 before the
-                    // first sample can run and are not swept (DESIGN.md §4).
+                    // that is still running later.
+                    //
+                    // Which of these can *discover* a group decides which are
+                    // gated, and the answer falls out of the snapshot TTL. The
+                    // samples at 8/20/45/90ms land inside the TTL of the one at
+                    // 0ms, so they read the identical table and structurally
+                    // cannot see anything new — they are pure re-proof, and are
+                    // skipped when there is nothing to keep proof of.
+                    //
+                    // The last one is the sample that catches a long-running
+                    // *foreground* tool call on an agent tracking nothing — the
+                    // case with no `tool_result` to fall back on — so it is
+                    // never gated. It also carries a watermark, because "the
+                    // TTL will have expired by 250ms" is not a guarantee: the
+                    // TTL runs from the moment a read *completes*, so under
+                    // load this sample can land back inside it and re-read the
+                    // table the sample at 0ms took.
+                    //
+                    // None of them are a fix for a job backgrounded with `&` —
+                    // measured against the real CLI those reparent to pid 1
+                    // before the first sample can run and are not swept.
                     EventKind::ToolUse => {
-                        for ms in [0, 8, 20, 45, 90, 250] {
-                            self.refresh_sweep(Duration::from_millis(ms));
+                        self.refresh_sweep(Duration::ZERO, true);
+                        for ms in [8, 20, 45, 90] {
+                            self.refresh_sweep(Duration::from_millis(ms), false);
                         }
+                        self.refresh_sweep(Duration::from_millis(250), true);
                     }
                     // A tool call returned, or the turn ended. Anything still
                     // running under the CLI now — a dev server, a build — is
                     // exactly what has to be caught, and is what the teardown
-                    // reliably reaches.
-                    EventKind::ToolResult | EventKind::Result => self.refresh_sweep(Duration::ZERO),
+                    // reliably reaches. This is where a group is actually
+                    // established, so it is never gated.
+                    EventKind::ToolResult | EventKind::Result => {
+                        self.refresh_sweep(Duration::ZERO, true)
+                    }
                     _ => {}
                 }
                 if kind == EventKind::Stderr {
@@ -1872,6 +1910,9 @@ mod tests {
     struct Harness {
         db: Db,
         id: String,
+        /// The runner's accumulated sweep, so a test can watch what the
+        /// snapshot cycles actually recorded.
+        sweep: Arc<RwLock<Sweep>>,
         msgs: mpsc::UnboundedSender<ProcessMsg>,
         cmds: Option<mpsc::UnboundedSender<AgentCommand>>,
         events: Receiver<ServerMsg>,
@@ -1900,6 +1941,7 @@ mod tests {
             let (msg_tx, msg_rx) = mpsc::unbounded_channel();
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
+            let sweep = Arc::new(RwLock::new(sweep));
             let runner = Runner {
                 id: record.id.clone(),
                 db: db.clone(),
@@ -1919,8 +1961,9 @@ mod tests {
                 commands: Arc::new(RwLock::new(Vec::new())),
                 stop_requested: false,
                 last_stderr: None,
-                sweep: Arc::new(RwLock::new(sweep)),
+                sweep: sweep.clone(),
                 last_refresh: std::time::Instant::now(),
+                seen_table_ms: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
                 grace,
                 recently_sent: std::collections::VecDeque::new(),
                 rate_limit: Arc::new(RwLock::new(None)),
@@ -1929,6 +1972,7 @@ mod tests {
             Self {
                 db,
                 id: record.id,
+                sweep,
                 msgs: msg_tx,
                 cmds: Some(cmd_tx),
                 events,
@@ -2439,6 +2483,53 @@ mod tests {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    /// Some of a tool call's samples are gated on there already being something
+    /// to keep proof of, and four of them read a snapshot the first one took.
+    /// The ungated, past-the-TTL sample has to be enough on its own, or an
+    /// agent that is tracking nothing — where every session starts — never
+    /// records the group at all, and a CLI that then crashes leaves it running.
+    ///
+    /// The first sample is denied any sight of the group on purpose: the shared
+    /// snapshot is warmed *before* the group exists, so the sample at 0ms reads
+    /// a table without it and the four gated samples read that same table. Only
+    /// the last sample can see it, and only because it refuses a table it has
+    /// already been given. That is the CLI-crash case in miniature — a long
+    /// foreground tool call, no `tool_result` to fall back on (DESIGN.md §4).
+    #[tokio::test]
+    async fn a_group_that_appears_after_the_first_sample_is_still_recorded() {
+        let warm = |()| crate::agent::process::shared_process_table();
+        tokio::task::spawn_blocking(move || warm(()))
+            .await
+            .expect("a table read");
+
+        let Some(leader) = GroupLeader::start() else {
+            return;
+        };
+        let harness = Harness::start_with(std::process::id(), Sweep::default());
+        assert!(
+            harness.sweep.read().await.is_empty(),
+            "the agent starts out tracking nothing"
+        );
+        harness.action(Action::Persist {
+            kind: EventKind::ToolUse,
+            payload: json!({"tool_name": "Bash"}),
+        });
+
+        let mut found = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            found = harness.sweep.read().await.group_ids();
+            if found.contains(&leader.pid()) {
+                break;
+            }
+        }
+        assert!(
+            found.contains(&leader.pid()),
+            "the last sample must record the group; saw {found:?}"
+        );
+        harness.finish().await;
     }
 
     #[tokio::test]

@@ -8,8 +8,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
@@ -732,6 +733,26 @@ pub struct Sweep {
 /// second as an observation can look marginally younger than it was.
 const CLOCK_SLACK_MS: i64 = 1_500;
 
+/// How long one process-table read may be shared between sweeps (§4).
+///
+/// Every sweep that is not a teardown reads through [`shared_process_table`]
+/// instead of forking its own `ps`, which collapses the burst that follows each
+/// tool call — and, across concurrent agents, a burst per agent — into a single
+/// scan. 250ms is short enough that the samples of a single tool call still
+/// straddle it. What guarantees a *discovering* sweep a table it has not seen
+/// is not the TTL, though — see [`shared_process_table_after`].
+pub const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Slack subtracted from the continuity proof window.
+///
+/// Two sources of imprecision, both handled the same way. `ps` truncates
+/// elapsed seconds, so a process can look up to a second younger than it is; a
+/// shared snapshot can additionally be up to [`SNAPSHOT_TTL`] old by the time a
+/// sweep reads it. Both are *subtracted* from the window, never added: adding
+/// them would admit processes that genuinely started after the last proof,
+/// where subtracting only refuses a few that genuinely predate it.
+const PROOF_SLACK_MS: i64 = CLOCK_SLACK_MS + SNAPSHOT_TTL.as_millis() as i64;
+
 /// The most groups we will track. Only ever reached if an agent leaves this
 /// many *live* groups behind, which no ordinary session does.
 const MAX_GROUPS: usize = 128;
@@ -783,6 +804,11 @@ impl Sweep {
     /// that first recorded the group. Each fresh proof moves the group's
     /// `proven_ms` forward, so those workers — which were alive at that moment —
     /// can themselves carry the proof once the original is gone.
+    ///
+    /// `now_ms` must be the moment the *table* was read, not the current clock
+    /// ([`TableSnapshot`]). That makes this idempotent: confirming twice from
+    /// one snapshot writes the same timestamp twice, so a shared table can
+    /// never advance the proof further than the observation supports.
     pub fn confirm(&mut self, table: &[ProcEntry], now_ms: i64) {
         for group in &mut self.groups {
             if owns(group, table, now_ms) {
@@ -838,16 +864,13 @@ fn owns(group: &GroupRecord, table: &[ProcEntry], now_ms: i64) -> bool {
     // Or a live member that was already running when we last proved the group
     // was ours, which means it has been non-empty ever since.
     //
-    // The slack is *subtracted*: `ps` truncates elapsed seconds, so a process
-    // can look up to a second younger than it is. Adding the slack would admit
-    // processes that genuinely started after the proof; subtracting it only
-    // refuses a few that genuinely predate it.
+    // The slack is *subtracted* — see [`PROOF_SLACK_MS`] for what goes into it.
     table
         .iter()
         .filter(|e| e.pgid == group.pgid && e.pid > 1 && !e.zombie)
         .any(|e| {
             e.started_ms(now_ms)
-                .is_some_and(|started| started + CLOCK_SLACK_MS <= group.proven_ms)
+                .is_some_and(|started| started + PROOF_SLACK_MS <= group.proven_ms)
         })
 }
 
@@ -962,6 +985,102 @@ pub fn stop_targets(
     groups_to_kill(&sweep, table, now_ms)
 }
 
+/// One process-table read, together with the moment it was taken.
+///
+/// Everything derived from a table — a process's start time, and the
+/// `proven_ms` a successful ownership proof writes back — is computed against
+/// `read_ms` rather than the current clock. That is what makes a *shared*
+/// table safe:
+///
+/// * start times do not drift as the snapshot ages, so the witness test stays
+///   exact and the continuity test stays anchored to the table's own instant;
+/// * `proven_ms` is set with `max(proven_ms, read_ms)`, so two sweeps reading
+///   the same snapshot write the same value. **One observation cannot advance
+///   the proof twice**, which would manufacture continuity the table never
+///   showed.
+#[derive(Debug, Clone)]
+pub struct TableSnapshot {
+    pub table: Arc<Vec<ProcEntry>>,
+    /// Epoch ms at which the read completed. Taken *after* `ps` returns, so a
+    /// process never looks older than the table can justify.
+    pub read_ms: i64,
+    /// The same instant on the monotonic clock, for the TTL. A wall clock that
+    /// steps backwards must not pin a snapshot forever.
+    read_at: Instant,
+}
+
+impl TableSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    #[cfg(test)]
+    fn for_test(table: Vec<ProcEntry>, read_ms: i64) -> Self {
+        Self {
+            table: Arc::new(table),
+            read_ms,
+            read_at: Instant::now(),
+        }
+    }
+}
+
+/// The one shared snapshot. `None` until the first read, and never populated
+/// with an empty table — an unreadable `ps` must not be pinned for a TTL.
+static SHARED_TABLE: Mutex<Option<TableSnapshot>> = Mutex::new(None);
+
+/// Read the process table, reusing a recent read if there is one.
+///
+/// The lock is deliberately held across the `ps`: when a burst of sweeps
+/// arrives together, the first forks `ps` and the rest wait for it and then
+/// read its result, rather than each forking their own. That is the whole
+/// point — 24 simultaneous scans become one.
+///
+/// Blocking: call from `spawn_blocking`. Never used by teardown, which reads
+/// fresh (§4).
+pub fn shared_process_table() -> TableSnapshot {
+    shared_process_table_after(i64::MIN)
+}
+
+/// As [`shared_process_table`], but never hands back a table the caller has
+/// already been given.
+///
+/// A sweep whose job is to *discover* a group has to see something new, and
+/// "the TTL will have expired by now" is not a guarantee: the TTL runs from the
+/// moment a read completes, and under load a scan takes long enough that a
+/// sample scheduled to land past the TTL lands back inside it and re-reads the
+/// table it already had. That matters most for a long foreground tool call,
+/// which has no `tool_result` sweep to fall back on.
+///
+/// So the caller passes the `read_ms` of the last table it used, and a cached
+/// table at or before that watermark forces a fresh read. Concurrent agents
+/// still share: whichever of them reads first leaves a table newer than all the
+/// others' watermarks, and they take it.
+pub fn shared_process_table_after(seen_ms: i64) -> TableSnapshot {
+    let mut guard = SHARED_TABLE.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(cached) = guard.as_ref()
+        && cached.read_at.elapsed() < SNAPSHOT_TTL
+        && cached.read_ms > seen_ms
+    {
+        return cached.clone();
+    }
+    let fresh = fresh_process_table();
+    if !fresh.is_empty() {
+        *guard = Some(fresh.clone());
+    }
+    fresh
+}
+
+/// Read the process table now, bypassing (and not disturbing) the shared
+/// snapshot. Blocking: call from `spawn_blocking`.
+pub fn fresh_process_table() -> TableSnapshot {
+    let table = process_table();
+    TableSnapshot {
+        table: Arc::new(table),
+        read_ms: crate::db::now_ms(),
+        read_at: Instant::now(),
+    }
+}
+
 /// Read the process table. Blocking: call from `spawn_blocking`.
 pub fn process_table() -> Vec<ProcEntry> {
     let output = match std::process::Command::new("ps")
@@ -1028,46 +1147,87 @@ pub fn parse_etime(text: &str) -> Option<i64> {
 /// One snapshot cycle: walk the tree, fold it into what we know, pick up the
 /// current members of groups we still own, and drop the ones that are gone.
 ///
+/// Reads through the *shared* snapshot, so the samples that follow a tool call
+/// — and the bursts of several concurrent agents arriving together — cost one
+/// `ps` between them rather than one each.
+///
+/// `seen` is the caller's watermark: the `read_ms` of the last table its sweeps
+/// used, updated here. An `establishing` sweep — one whose job is to find a
+/// group nobody has recorded yet — refuses a table at or before it and reads a
+/// fresh one; the rest take whatever is current.
+///
 /// Blocking: call from `spawn_blocking`.
-pub fn refresh_sweep(mut known: Sweep, root_pid: i32, forbidden: &[i32]) -> Sweep {
+pub fn refresh_sweep(
+    known: Sweep,
+    root_pid: i32,
+    forbidden: &[i32],
+    seen: &std::sync::atomic::AtomicI64,
+    establishing: bool,
+) -> Sweep {
     if root_pid <= 0 {
         return known;
     }
-    let table = process_table();
-    if table.is_empty() {
+    let snapshot = if establishing {
+        shared_process_table_after(seen.load(Ordering::Acquire))
+    } else {
+        shared_process_table()
+    };
+    seen.fetch_max(snapshot.read_ms, Ordering::AcqRel);
+    refresh_sweep_with(known, root_pid, forbidden, &snapshot)
+}
+
+/// [`refresh_sweep`] against a table already read. Pure, so the cycle can be
+/// tested without spawning anything.
+pub fn refresh_sweep_with(
+    mut known: Sweep,
+    root_pid: i32,
+    forbidden: &[i32],
+    snapshot: &TableSnapshot,
+) -> Sweep {
+    if root_pid <= 0 || snapshot.is_empty() {
         return known;
     }
-    let now = crate::db::now_ms();
+    // The snapshot's own instant, not the current clock: see [`TableSnapshot`].
+    // Re-running this against the same snapshot is a no-op.
+    let now = snapshot.read_ms;
+    let table = snapshot.table.as_slice();
     let own_pid = std::process::id() as i32;
     let own_pgid = nix::unistd::getpgrp().as_raw();
     known.merge(sweep_targets(
-        &table, root_pid, own_pid, own_pgid, forbidden, now,
+        table, root_pid, own_pid, own_pgid, forbidden, now,
     ));
-    known.confirm(&table, now);
-    known.prune(&table, now);
+    known.confirm(table, now);
+    known.prune(table, now);
     known
 }
 
-/// [`groups_to_kill`] against the live process table. Blocking.
+/// [`groups_to_kill`] against a **freshly read** process table. Blocking.
+///
+/// Teardown decides what gets SIGKILLed and runs once per agent exit rather
+/// than per tool call, so it never reads the shared snapshot (§4).
 pub fn surviving_groups(sweep: &Sweep) -> Vec<i32> {
-    groups_to_kill(sweep, &process_table(), crate::db::now_ms())
+    let snapshot = fresh_process_table();
+    groups_to_kill(sweep, &snapshot.table, snapshot.read_ms)
 }
 
-/// [`stop_targets`] against the live process table. Blocking.
+/// [`stop_targets`] against a **freshly read** process table. Blocking.
+///
+/// Fresh for the same reason as [`surviving_groups`].
 pub fn stop_targets_now(known: &Sweep, root_pid: i32, forbidden: &[i32]) -> Vec<i32> {
     if root_pid <= 0 {
         return Vec::new();
     }
     let own_pid = std::process::id() as i32;
     let own_pgid = nix::unistd::getpgrp().as_raw();
+    let snapshot = fresh_process_table();
     stop_targets(
         known,
-        &process_table(),
+        &snapshot.table,
         root_pid,
         own_pid,
         own_pgid,
         forbidden,
-        crate::db::now_ms(),
+        snapshot.read_ms,
     )
 }
 
@@ -2392,9 +2552,279 @@ mod tests {
     #[test]
     fn a_refresh_of_a_nonsense_pid_changes_nothing() {
         let known = observed_group();
-        assert_eq!(refresh_sweep(known.clone(), 0, &[]), known);
-        assert_eq!(refresh_sweep(known.clone(), -1, &[]), known);
+        let seen = std::sync::atomic::AtomicI64::new(i64::MIN);
+        assert_eq!(refresh_sweep(known.clone(), 0, &[], &seen, true), known);
+        assert_eq!(refresh_sweep(known.clone(), -1, &[], &seen, true), known);
         assert!(stop_targets_now(&known, 0, &[]).is_empty());
+    }
+
+    // -- the shared snapshot -------------------------------------------------
+
+    /// The invariant a shared table has to carry: **one observation cannot
+    /// advance `proven_ms` twice**. Two sweeps reading the same snapshot must
+    /// leave the sweep exactly where one did — otherwise the second sweep
+    /// manufactures continuity that the table never showed, and a group could
+    /// stay "proved" on the strength of a single old look.
+    #[test]
+    fn a_shared_snapshot_cannot_advance_the_proof_twice() {
+        // The tree as it was when the snapshot was taken, one second ago.
+        let snapshot = TableSnapshot::for_test(realistic_table(), NOW - 1_000);
+        let once = refresh_sweep_with(Sweep::default(), 200, &[], &snapshot);
+        let twice = refresh_sweep_with(once.clone(), 200, &[], &snapshot);
+        assert_eq!(once, twice, "a re-read of one snapshot must change nothing");
+        assert_eq!(
+            group(&once, 300).proven_ms,
+            NOW - 1_000,
+            "the proof is stamped with the moment the table was read, not with now"
+        );
+
+        // And a third pass, however much later it happens, still cannot move
+        // the proof past what that one observation supports.
+        let thrice = refresh_sweep_with(twice, 200, &[], &snapshot);
+        assert_eq!(group(&thrice, 300).proven_ms, NOW - 1_000);
+    }
+
+    /// A snapshot's staleness lands on the same side as `ps`'s whole-second
+    /// truncation: subtracted from the proof window, never added. A process
+    /// that could have started after the last proof — anywhere inside the
+    /// truncation *or* the TTL — must not carry it.
+    #[test]
+    fn snapshot_staleness_narrows_the_proof_window_rather_than_widening_it() {
+        assert!(
+            PROOF_SLACK_MS >= CLOCK_SLACK_MS + SNAPSHOT_TTL.as_millis() as i64,
+            "the TTL has to be inside the slack that is subtracted"
+        );
+        let known = observed_group(); // proven at NOW - 60_000, witness gone
+        let secs = PROOF_SLACK_MS / 1_000;
+
+        // A member young enough to fall inside the combined slack is refused:
+        // it cannot be told apart from one that started after the proof.
+        let inside = vec![entry(1, 0, 1), aged(301, 1, 300, 60 + secs)];
+        assert!(
+            groups_to_kill(&known, &inside, NOW).is_empty(),
+            "a member inside the slack must not carry the proof"
+        );
+
+        // Comfortably older than the proof, and it does.
+        let outside = vec![entry(1, 0, 1), aged(301, 1, 300, 60 + secs + 2)];
+        assert_eq!(groups_to_kill(&known, &outside, NOW), vec![300]);
+    }
+
+    /// The shared snapshot is process-wide, so any other test reading it can
+    /// land between two observations here. Each property below holds of a
+    /// single uninterrupted observation, so retry rather than assert on the
+    /// first attempt.
+    fn eventually(what: &str, mut observe: impl FnMut() -> bool) {
+        assert!((0..16).any(|_| observe()), "{what}");
+    }
+
+    /// Sweeps arriving together share one read. This is the whole change: a
+    /// burst of six samples per tool call, times however many agents are
+    /// running, collapses to a single `ps`.
+    #[test]
+    fn sweeps_within_the_ttl_share_one_process_table_read() {
+        eventually("two reads inside the TTL must be the same read", || {
+            let first = shared_process_table();
+            let second = shared_process_table();
+            Arc::ptr_eq(&first.table, &second.table)
+        });
+    }
+
+    /// What DESIGN.md §4's cost table was produced with. Ignored by default: it
+    /// forks several hundred `ps` processes and takes the best part of a
+    /// minute. Re-run it, on an idle machine, whenever the cadence changes:
+    ///
+    /// ```text
+    /// cargo test --release measure_the_sweep_cost -- --ignored --nocapture --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "a measurement, not a check — see DESIGN.md §4"]
+    fn measure_the_sweep_cost() {
+        /// CPU consumed by this process *and* by every child it has reaped —
+        /// which is where a forked `ps` shows up.
+        fn cpu_ms() -> f64 {
+            let mut total = 0.0;
+            for who in [nix::libc::RUSAGE_SELF, nix::libc::RUSAGE_CHILDREN] {
+                let mut usage: nix::libc::rusage = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { nix::libc::getrusage(who, &mut usage) }, 0);
+                for time in [usage.ru_utime, usage.ru_stime] {
+                    total += time.tv_sec as f64 * 1e3 + time.tv_usec as f64 / 1e3;
+                }
+            }
+            total
+        }
+
+        fn measure(label: &str, iters: usize, mut body: impl FnMut()) -> f64 {
+            let (cpu, wall) = (cpu_ms(), Instant::now());
+            for _ in 0..iters {
+                body();
+            }
+            let per_call = (cpu_ms() - cpu) / iters as f64;
+            let wall_per_call = wall.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            println!("{label:<46} {per_call:>7.2} ms CPU  {wall_per_call:>8.2} ms wall");
+            per_call
+        }
+
+        fn run(program: &str, args: &[&str]) {
+            let _ = std::process::Command::new(program).args(args).output();
+        }
+
+        let table = process_table();
+        let own = std::process::id().to_string();
+        println!("\nprocesses on this machine: {}\n", table.len());
+
+        println!("-- what one scan costs -------------------------------------");
+        measure("bare fork+exec (/usr/bin/true)", 100, || {
+            run("/usr/bin/true", &[])
+        });
+        measure("ps -p self (startup, no full scan)", 100, || {
+            run("ps", &["-p", &own, "-o", "pid="])
+        });
+        let scan = measure("ps -axo (the scan we actually run)", 100, || {
+            let _ = process_table();
+        });
+
+        // Each tool call is measured starting from an *expired* snapshot, so
+        // nothing is credited to a read the previous iteration happened to
+        // leave warm.
+        let cold = || std::thread::sleep(SNAPSHOT_TTL + std::time::Duration::from_millis(20));
+
+        println!("\n-- what one tool call costs --------------------------------");
+        // The cadence before the shared snapshot: six samples over the first
+        // quarter-second, then one when the call returns. Seven fresh reads.
+        measure("before: 7 fresh reads per tool call", 20, || {
+            cold();
+            for ms in [0, 8, 20, 45, 90, 250] {
+                if ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                let _ = fresh_process_table();
+            }
+            let _ = fresh_process_table();
+        });
+
+        // After. One agent's watermark, exactly as the supervisor keeps it: the
+        // discovering sweeps refuse a table they have already been given, the
+        // rest take whatever is current.
+        let seen = std::sync::atomic::AtomicI64::new(i64::MIN);
+        let discover = || {
+            let snapshot = shared_process_table_after(seen.load(Ordering::Acquire));
+            seen.fetch_max(snapshot.read_ms, Ordering::AcqRel);
+        };
+
+        // An agent that *is* tracking a group: every sample runs.
+        measure("after, tracking: 6 samples + result", 20, || {
+            cold();
+            for ms in [0, 8, 20, 45, 90, 250] {
+                if ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                if ms == 0 || ms == 250 {
+                    discover();
+                } else {
+                    let _ = shared_process_table();
+                }
+            }
+            discover();
+        });
+
+        // And the common case: nothing tracked, so the four gated samples do
+        // nothing at all and only the discovering sweeps run.
+        measure("after, nothing tracked: 2 samples + result", 20, || {
+            cold();
+            discover();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            discover();
+            discover();
+        });
+
+        println!("\n-- a burst: one tool call across 4 concurrent agents -------");
+        // The whole schedule, on four agents at once — what actually arrives
+        // when four agents make a tool call in the same instant.
+        for (label, shared) in [("before (a read per sweep)", false), ("after", true)] {
+            cold();
+            let (cpu, wall) = (cpu_ms(), Instant::now());
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    // One watermark per agent, as the supervisor keeps them.
+                    let seen = std::sync::atomic::AtomicI64::new(i64::MIN);
+                    scope.spawn(move || {
+                        for ms in [0, 8, 20, 45, 90, 250] {
+                            if ms > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(ms));
+                            }
+                            if !shared {
+                                let _ = fresh_process_table();
+                            } else if ms == 0 || ms == 250 {
+                                let snapshot =
+                                    shared_process_table_after(seen.load(Ordering::Acquire));
+                                seen.fetch_max(snapshot.read_ms, Ordering::AcqRel);
+                            } else {
+                                let _ = shared_process_table();
+                            }
+                        }
+                        if shared {
+                            let snapshot = shared_process_table_after(seen.load(Ordering::Acquire));
+                            seen.fetch_max(snapshot.read_ms, Ordering::AcqRel);
+                        } else {
+                            let _ = fresh_process_table();
+                        }
+                    });
+                }
+            });
+            println!(
+                "{label:<46} {:>7.2} ms CPU  {:>8.2} ms wall",
+                cpu_ms() - cpu,
+                wall.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        println!("\n(one scan = {scan:.2} ms CPU)\n");
+    }
+
+    /// A sweep that has to *discover* something is never handed a table it has
+    /// already seen, however recently that table was read. Waiting out the TTL
+    /// is not good enough: the TTL runs from the moment a read completes, and
+    /// under load a scan takes long enough that a sample scheduled to land past
+    /// the TTL lands back inside it.
+    #[test]
+    fn a_discovering_sweep_refuses_a_table_it_has_already_been_given() {
+        eventually("a discovering read must force a fresh table", || {
+            let first = shared_process_table();
+            // Same watermark, well inside the TTL: a plain shared read hands
+            // back the identical table, and the discovering read refuses to.
+            if !Arc::ptr_eq(&shared_process_table().table, &first.table) {
+                return false;
+            }
+            let second = shared_process_table_after(first.read_ms);
+            assert!(
+                !Arc::ptr_eq(&second.table, &first.table),
+                "a table at the watermark must never be handed back"
+            );
+            assert!(second.read_ms >= first.read_ms);
+            // And having taken that one, a caller still behind it may share it.
+            Arc::ptr_eq(
+                &shared_process_table_after(first.read_ms).table,
+                &second.table,
+            )
+        });
+    }
+
+    /// Teardown decides what gets SIGKILLed, so it never reads the shared
+    /// snapshot — and never disturbs it either, so a fresh read on the way out
+    /// cannot leave a stale table behind for the sweeps.
+    #[test]
+    fn a_fresh_read_neither_uses_nor_replaces_the_shared_snapshot() {
+        eventually("a fresh read must not become the cached table", || {
+            let before = shared_process_table();
+            let fresh = fresh_process_table();
+            let after = shared_process_table();
+            assert!(
+                !Arc::ptr_eq(&fresh.table, &before.table),
+                "a fresh read must never hand back the cached table"
+            );
+            assert!(!fresh.is_empty(), "ps should have told us about something");
+            Arc::ptr_eq(&before.table, &after.table)
+        });
     }
 
     /// A stub that backgrounds a process inheriting its stdout and then exits —

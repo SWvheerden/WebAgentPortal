@@ -244,19 +244,60 @@ live against `claude` 2.1.241 — the CLI led group *N*, its Bash descendant led
 group *M*, unrelated to *N*.
 
 So the supervisor keeps a running list of those groups instead of trying to find
-them after the fact. The process tree under the CLI is snapshotted (`ps -axo
-pid,ppid,pgid,etime`, walked breadth-first with a visited set, in
-`spawn_blocking`) several times in the first quarter-second of each tool call,
-again when it returns or the turn ends, and every couple of seconds while the
-agent is otherwise busy and there is something to keep track of. The groups found
-are accumulated over the session; a group is dropped only once nothing of it is
-left, never because it is old, because a group recorded early and still running
-is precisely the one worth keeping.
+them after the fact. The process tree under the CLI is walked (breadth-first
+with a visited set, in `spawn_blocking`) over a table read with `ps -axo
+pid,ppid,pgid,etime,state`. It is walked six times over the first
+quarter-second of each tool call (0/8/20/45/90/250ms), again when it returns or
+the turn ends, and every couple of seconds while the agent is otherwise busy and
+there is something to keep track of. The groups found are accumulated over the session; a group is
+dropped only once nothing of it is left, never because it is old, because a
+group recorded early and still running is precisely the one worth keeping.
 
-The early samples in that first quarter-second are a cheap best effort at
-catching a tool call whose shell exits immediately. They are kept because they
-cost little and occasionally win, but they are **not** a fix for backgrounded
-jobs — see the measurements below.
+**Those walks share one table read.** A full `ps -axo` scan is not cheap —
+measured at 19.7ms of CPU on a machine with 592 processes, of which only about
+2ms is the subprocess and the rest is the kernel copying out every process
+record — and a scan per walk put ~140ms of CPU into every tool call, per agent,
+before the agent's own work started. So there is one process-wide snapshot
+behind a 250ms TTL (`process::shared_process_table`), and every sweep that is
+not a teardown reads from it. Within one tool call that takes the seven sweeps
+down to the three that have to see something new; across agents it is better
+still, since four agents making a tool call at the same instant share those
+reads between them rather than each forking their own (§14).
+
+Sharing a table is safe because of *how* a table is timestamped, not because
+staleness is small. Everything a walk derives — a process's start time, and the
+`proven_ms` a successful ownership proof writes back — is computed against the
+moment the table was **read**, never against the current clock. So confirming
+twice from one snapshot writes the same timestamp twice: **one observation
+cannot advance the proof twice**, which would manufacture continuity the table
+never showed. And the TTL is added to the slack that is *subtracted* from the
+proof window (`PROOF_SLACK_MS = CLOCK_SLACK_MS + SNAPSHOT_TTL`), on the same
+side as `ps`'s whole-second truncation, so a stale table can only ever refuse a
+group, never adopt one. Teardown (`tear_down_groups`) and `stop_targets` never
+read the snapshot: they decide what gets SIGKILLed, they run once per agent exit
+rather than once per tool call, and they are not where the cost was.
+
+Those samples are a best effort at catching a tool call whose shell exits
+immediately. Which of them can *discover* a group, rather than merely re-prove
+one, follows from the TTL: the samples at 8/20/45/90ms land inside the TTL of
+the sample at 0ms and so read the identical table, which means they structurally
+cannot see anything new. Those are skipped when there is nothing to keep proof
+of — the same gate the every-couple-of-seconds refresh applies. The sample at
+0ms and the one at 250ms are never gated.
+
+The last sample is the one that catches a long-running *foreground* tool call —
+where the child appears a beat after the call is announced and there is no
+`tool_result` for minutes. On an agent tracking nothing it is the only sweep
+that will run, so it must read a table no earlier sample saw, and "the TTL will
+have expired by 250ms" does **not** deliver that: the TTL runs from the moment a
+read *completes*, so under load the sample lands back inside it and re-reads the
+table the first sample took. So a discovering sweep carries a watermark — the
+`read_ms` of the last table it used — and `shared_process_table_after` refuses
+to hand back a table at or before it. Concurrent agents still share one read:
+whoever reads first leaves a table newer than all the others' watermarks. These
+samples occasionally win, but they are **not** a fix for backgrounded jobs, nor
+for a tool call whose command does not start within the window — see the
+measurements below.
 
 Nothing is signalled on the strength of a group id alone, and nothing is
 *adopted* on the strength of a descendant merely being in a group. The server
@@ -276,9 +317,10 @@ members. Pid identity alone is deliberately not proof: pids recycle too (macOS
 wraps at 99998, and a session of parallel agents shelling out to builds churns
 them), so a recorded pid can come back as something else entirely — which is why
 the witness is pinned by start time as well. A zombie never counts as the group
-being alive, and the whole-second granularity of `ps` is *subtracted* from the
-proof window, never added, so a process that genuinely started after the last
-proof can never carry it. Each snapshot
+being alive, and the whole-second granularity of `ps` — together with the age a
+shared snapshot may have reached — is *subtracted* from the proof window, never
+added, so a process that genuinely started after the last proof can never carry
+it. Each snapshot
 re-proves what it can and moves that timestamp forward, which is what keeps a
 `npm run dev` reachable after it has forked workers and lost its original
 parent.
@@ -291,25 +333,49 @@ finish shutting down — until it has completed. Without that, shutdown returned
 soon as the CLI died and the escalation was cancelled with the runtime. pid 1,
 the server's own pid and the server's own process group are never signalled.
 
-**What is reliably swept, and what is not.** Measured against `claude` 2.1.241
-on 2026-08-24, with an unrelated decoy process running throughout to check for
-over-signalling:
+**What is reliably swept, and what is not.** Re-measured 2026-09-03 against
+`claude` **2.1.259** after the shared-snapshot change of §14, with an unrelated
+decoy process running throughout to check for over-signalling. Each trial is a
+fresh server, a fresh agent and a fresh database; the tool call runs `tail -f`
+on a marker file, and the agent is stopped, crashed or shut down while it is
+still running. The earlier 2026-08-24 figures against 2.1.241 are superseded:
+the change alters when groups are observed, so they were not inherited.
 
 | case | result |
 |---|---|
-| A tool call's child still running when the agent is **stopped** | swept |
-| …when the CLI **crashes** (SIGKILL to the CLI) | swept |
-| …when the **server shuts down** | swept |
-| A job backgrounded with `&` inside a tool call (`sleep 1201 &`, `bash -c "sleep 1117 &"`) | **not swept** — 0 of 4 controlled trials, and at best 1 of 8 overall |
-| An unrelated process of the user's, on any path | never signalled, ~10 trials (see the ownership rules below for what makes this hold against a *hostile* agent, which those trials did not test) |
+| A tool call's child still running when the agent is **stopped** | swept, 3 of 3 |
+| …when the CLI **crashes** (SIGKILL to the CLI) | swept, 3 of 3 — but see below |
+| …when the **server shuts down** | swept, 3 of 3 |
+| A job backgrounded with `&` inside a tool call (`tail -f … &`) | **not swept** — 0 of 4 |
+| An unrelated process of the user's, on any path | never signalled, 13 trials (see the ownership rules below for what makes this hold against a *hostile* agent, which those trials did not test) |
+
+**The crash row is a statement about the sampling window, not about teardown.**
+A Stop and a server shutdown both re-walk the tree at the moment they signal
+(`stop_targets_now`), so they catch the child whether or not a sample recorded
+it. A CLI killed with SIGKILL has no such walk: teardown can act only on what
+the samples accumulated, so that row is exactly "did a sample land while the
+child was there". Measured, the answer turns on one thing — how long the CLI
+takes to actually start the command after announcing the `tool_use`:
+
+| condition | child visible after `tool_use` | crash row |
+|---|---|---|
+| the **first** Bash call of a session (the CLI is still building its shell) | 417 / 450 / 475ms | not swept, 0 of 3 |
+| any Bash call after that | 139–230ms (9 trials) | swept, 9 of 9 |
+
+The cold figures are past the last sample at 250ms, so the group is never
+recorded at all. That is not a property of the shared snapshot: the build
+*before* this change measures identically — 0 of 3 cold (417/450/475ms), 3 of 3
+warm (208/223/261ms). A long-running build or dev server is rarely a session's
+first Bash call, which is why the warm row is the representative one; widening
+the sampling window to cover the cold case is a separate change from this one.
 
 The first three are the case this machinery exists for: a `cargo build`, an
 `npm run dev`, anything still holding the worktree open at the moment the agent
 goes away. Those are descendants of the CLI when we look, and they are reliably
 caught.
 
-A job backgrounded with `&` is, in practice, **not** caught, and no sampling
-cadence fixes that. The tool's shell exits within a few milliseconds of starting
+A job backgrounded with `&` is, in practice, **not** caught — 0 of 4 again on
+2026-09-03 — and no sampling cadence fixes that. The tool's shell exits within a few milliseconds of starting
 the job, and our first sample cannot run until we have already observed the
 `tool_use` event — by which time the shell is usually gone and the job has
 reparented to pid 1, in neither the CLI's process group nor its subtree. macOS
@@ -1184,8 +1250,10 @@ package name.** Use `cargo init --name claude-web`.
 
 ## 14. The sweep's CPU cost
 
-**Status: specified, not built.** Measured 2026-09-03 against the running
-server (`claude-web` at `e1714c6`) and the live `~/.claude-web/agents.db`.
+**Status: built.** The original measurement was taken 2026-09-03 against the
+running server (`claude-web` at `e1714c6`) and the live `~/.claude-web/agents.db`.
+What landed, and what it measures at now, is in *After* at the end of this
+section; §4 carries the design.
 
 ### What was measured
 
@@ -1256,7 +1324,8 @@ the `.await`, so the sweeps serialize; at 16ms each, the samples nominally at
 they are not cheap, and the schedule is not the schedule. Once they share a
 snapshot they become genuinely cheap and the point is moot, but if the burst is
 reduced instead, reduce it on the evidence of what the samples *catch* (§4's
-table: 0 of 4 controlled trials for the `&` case), not on the stated timings.
+table: 0 of 4 controlled trials for the `&` case, reconfirmed after the change),
+not on the stated timings.
 
 ### What must not regress
 
@@ -1318,3 +1387,63 @@ Reducing the sampling cadence on timing grounds alone. Anything that trades a
 6. Re-run the §4 sweep measurement table afterwards. This changes when groups
    are observed, so the swept/not-swept results are not inherited.
 7. Re-measure per-tool-call CPU against the numbers above.
+
+### After
+
+All seven landed. The shared snapshot lives in `process::shared_process_table`,
+behind `SNAPSHOT_TTL` (250ms); `TableSnapshot` carries the moment of the read,
+and every walk is computed against that moment rather than the current clock,
+which is what makes confirming twice from one snapshot a no-op. The TTL is added
+to the slack that is *subtracted* from the proof window (`PROOF_SLACK_MS`).
+`surviving_groups` and `stop_targets_now` call `fresh_process_table`, which
+neither reads nor replaces the snapshot. The tracking gate is applied to the
+four samples that land inside the TTL of the first one and therefore read the
+same table; the samples at 0ms and 250ms, and the sweep when the call returns,
+are not gated, and carry a watermark that refuses a table they have already been
+given.
+
+**Re-measured cost.** Same method as above but in-process, via
+`getrusage(RUSAGE_SELF) + getrusage(RUSAGE_CHILDREN)`; the harness is
+`measure_the_sweep_cost` in `agent/process.rs` (`#[ignore]`d — run it with
+`cargo test --release measure_the_sweep_cost -- --ignored --nocapture
+--test-threads=1`). Taken 2026-09-03 on a machine with **592** processes, so the
+scan is dearer than the 558-process baseline above. Every tool call in the table
+starts from an expired snapshot, so nothing is credited to a warm read.
+
+| operation | CPU per call |
+|---|---|
+| bare fork+exec (`/usr/bin/true`) | 2.3 ms |
+| `ps -p self` — process startup, no full scan | 4.2 ms |
+| `ps -axo` — one full scan | 19.7 ms |
+
+| one tool call, one agent | scans | CPU |
+|---|---|---|
+| before — a fresh read per sweep | 7 | **139.9 ms** |
+| after, agent tracking a group — all six samples run | 3 | **63.1 ms** |
+| after, nothing tracked — the four gated samples do nothing | 3 | **62.3 ms** |
+
+The three scans left are the three sweeps that have to see something new: the
+sample at 0ms, the sample at 250ms, and the sweep when the call returns. The
+four samples in between cost nothing at all. A tool call whose `tool_result`
+lands inside the window costs two.
+
+The burst is where it shows most, because a shared read is shared *across*
+agents. Four agents making a tool call in the same instant, the whole schedule
+on each — 28 sweeps:
+
+| | CPU | wall |
+|---|---|---|
+| before | 591 ms | 680 ms |
+| after | 110 ms | 606 ms |
+
+Five or six scans for the whole burst instead of 28, and no longer a core
+saturated on `ps` for as long as it lasts. The per-agent cost of a burst now
+*falls* as agents are added, because they share the reads.
+
+**Re-run of the swept/not-swept table.** In §4, replacing the 2026-08-24
+figures. Not inherited: the change alters when groups are observed. Stop,
+crash and shutdown all came back swept 3 of 3, the backgrounded `&` case not
+swept 0 of 4, and the decoy was never signalled across 13 trials. The crash
+row turned out to depend on the CLI's tool-start latency rather than on
+anything this change touches — the build before it measures identically — and
+§4 now records that, with the measured latencies.
