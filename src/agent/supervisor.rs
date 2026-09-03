@@ -2499,10 +2499,10 @@ mod tests {
     /// foreground tool call, no `tool_result` to fall back on (DESIGN.md §4).
     #[tokio::test]
     async fn a_group_that_appears_after_the_first_sample_is_still_recorded() {
-        let warm = |()| crate::agent::process::shared_process_table();
-        tokio::task::spawn_blocking(move || warm(()))
-            .await
-            .expect("a table read");
+        // The shared snapshot is a singleton, and this test both perturbs it
+        // and asserts on what the sweeps were given.
+        let _observing = crate::agent::process::SNAPSHOT_OBSERVERS.lock().await;
+        crate::agent::process::shared_process_table();
 
         let Some(leader) = GroupLeader::start() else {
             return;
@@ -2517,8 +2517,10 @@ mod tests {
             payload: json!({"tool_name": "Bash"}),
         });
 
+        // The sample that can see this group runs at 250ms; give it a few
+        // times that and no more, so a genuine failure is quick.
         let mut found = Vec::new();
-        for _ in 0..150 {
+        for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(20)).await;
             found = harness.sweep.read().await.group_ids();
             if found.contains(&leader.pid()) {

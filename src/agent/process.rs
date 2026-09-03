@@ -1028,6 +1028,32 @@ impl TableSnapshot {
 /// with an empty table — an unreadable `ps` must not be pinned for a TTL.
 static SHARED_TABLE: Mutex<Option<TableSnapshot>> = Mutex::new(None);
 
+/// Serialises the tests that *observe* the shared snapshot.
+///
+/// The snapshot is a singleton, so two tests watching it at once each perturb
+/// what the other sees. That is not a hypothetical: those tests used to retry
+/// until they got an uninterrupted look, every retry forked another `ps`, and
+/// the fork load was enough to push the wall-clock-bounded tests elsewhere in
+/// the suite past their deadlines — 9 failures in 40 runs of `agent::`, against
+/// 0 in 40 before the snapshot landed. Holding this makes each observation
+/// uninterrupted, so the tests can assert outright instead of retrying.
+///
+/// Only observers need it. Everything that merely *uses* the snapshot is
+/// already correct under concurrency; this is about tests that assert on which
+/// read they were given.
+///
+/// A `tokio` mutex so an async observer can hold it across an `.await`; it also
+/// does not poison, so a test that panics while holding it fails alone.
+#[cfg(test)]
+pub(crate) static SNAPSHOT_OBSERVERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Take [`SNAPSHOT_OBSERVERS`] from a synchronous test. An async one awaits
+/// `SNAPSHOT_OBSERVERS.lock()` instead.
+#[cfg(test)]
+pub(crate) fn observe_snapshot() -> tokio::sync::MutexGuard<'static, ()> {
+    SNAPSHOT_OBSERVERS.blocking_lock()
+}
+
 /// Read the process table, reusing a recent read if there is one.
 ///
 /// The lock is deliberately held across the `ps`: when a burst of sweeps
@@ -2610,24 +2636,26 @@ mod tests {
         assert_eq!(groups_to_kill(&known, &outside, NOW), vec![300]);
     }
 
-    /// The shared snapshot is process-wide, so any other test reading it can
-    /// land between two observations here. Each property below holds of a
-    /// single uninterrupted observation, so retry rather than assert on the
-    /// first attempt.
-    fn eventually(what: &str, mut observe: impl FnMut() -> bool) {
-        assert!((0..16).any(|_| observe()), "{what}");
-    }
-
     /// Sweeps arriving together share one read. This is the whole change: a
     /// burst of six samples per tool call, times however many agents are
     /// running, collapses to a single `ps`.
     #[test]
     fn sweeps_within_the_ttl_share_one_process_table_read() {
-        eventually("two reads inside the TTL must be the same read", || {
-            let first = shared_process_table();
-            let second = shared_process_table();
-            Arc::ptr_eq(&first.table, &second.table)
-        });
+        let _observing = observe_snapshot();
+        // The first read may hand back a snapshot already near the end of its
+        // TTL, so start from one we know is new.
+        let first = fresh_and_shared();
+        let second = shared_process_table();
+        assert!(
+            Arc::ptr_eq(&first.table, &second.table),
+            "two reads inside the TTL must be the same read"
+        );
+    }
+
+    /// A snapshot that has just been taken, so a test measuring TTL behaviour
+    /// starts from a known age rather than from whatever was left behind.
+    fn fresh_and_shared() -> TableSnapshot {
+        shared_process_table_after(i64::MAX - 1)
     }
 
     /// What DESIGN.md §4's cost table was produced with. Ignored by default: it
@@ -2640,6 +2668,8 @@ mod tests {
     #[test]
     #[ignore = "a measurement, not a check — see DESIGN.md §4"]
     fn measure_the_sweep_cost() {
+        let _observing = observe_snapshot();
+
         /// CPU consumed by this process *and* by every child it has reaped —
         /// which is where a forked `ps` shows up.
         fn cpu_ms() -> f64 {
@@ -2788,25 +2818,25 @@ mod tests {
     /// the TTL lands back inside it.
     #[test]
     fn a_discovering_sweep_refuses_a_table_it_has_already_been_given() {
-        eventually("a discovering read must force a fresh table", || {
-            let first = shared_process_table();
-            // Same watermark, well inside the TTL: a plain shared read hands
-            // back the identical table, and the discovering read refuses to.
-            if !Arc::ptr_eq(&shared_process_table().table, &first.table) {
-                return false;
-            }
-            let second = shared_process_table_after(first.read_ms);
-            assert!(
-                !Arc::ptr_eq(&second.table, &first.table),
-                "a table at the watermark must never be handed back"
-            );
-            assert!(second.read_ms >= first.read_ms);
-            // And having taken that one, a caller still behind it may share it.
+        let _observing = observe_snapshot();
+        let first = fresh_and_shared();
+        // Same watermark, well inside the TTL: a plain shared read hands back
+        // the identical table, and the discovering read refuses to.
+        assert!(Arc::ptr_eq(&shared_process_table().table, &first.table));
+        let second = shared_process_table_after(first.read_ms);
+        assert!(
+            !Arc::ptr_eq(&second.table, &first.table),
+            "a table at the watermark must never be handed back"
+        );
+        assert!(second.read_ms >= first.read_ms);
+        // And having taken that one, a caller still behind it may share it.
+        assert!(
             Arc::ptr_eq(
                 &shared_process_table_after(first.read_ms).table,
-                &second.table,
-            )
-        });
+                &second.table
+            ),
+            "a caller still behind the newest read may share it"
+        );
     }
 
     /// Teardown decides what gets SIGKILLed, so it never reads the shared
@@ -2814,17 +2844,19 @@ mod tests {
     /// cannot leave a stale table behind for the sweeps.
     #[test]
     fn a_fresh_read_neither_uses_nor_replaces_the_shared_snapshot() {
-        eventually("a fresh read must not become the cached table", || {
-            let before = shared_process_table();
-            let fresh = fresh_process_table();
-            let after = shared_process_table();
-            assert!(
-                !Arc::ptr_eq(&fresh.table, &before.table),
-                "a fresh read must never hand back the cached table"
-            );
-            assert!(!fresh.is_empty(), "ps should have told us about something");
-            Arc::ptr_eq(&before.table, &after.table)
-        });
+        let _observing = observe_snapshot();
+        let before = fresh_and_shared();
+        let fresh = fresh_process_table();
+        let after = shared_process_table();
+        assert!(
+            !Arc::ptr_eq(&fresh.table, &before.table),
+            "a fresh read must never hand back the cached table"
+        );
+        assert!(!fresh.is_empty(), "ps should have told us about something");
+        assert!(
+            Arc::ptr_eq(&before.table, &after.table),
+            "a fresh read must not become the cached table"
+        );
     }
 
     /// A stub that backgrounds a process inheriting its stdout and then exits —

@@ -1402,6 +1402,27 @@ same table; the samples at 0ms and 250ms, and the sweep when the call returns,
 are not gated, and carry a watermark that refuses a table they have already been
 given.
 
+**What the gate is worth, and what it is not.** §14 justified it as sparing an
+agent that leaves no process group behind "the full 114ms per tool call"; that
+is no longer what it does, and the numbers below say so — 63.1ms tracking
+against 62.3ms untracked. The reason is that the gate and the sharing act on
+disjoint sets. The four samples it skips are exactly the ones that land inside
+the first sample's TTL, so they were already reading a cached table and forking
+nothing; skipping something that costs no scan cannot save a scan. All three
+scans that remain belong to sweeps that are allowed to *discover*, and
+discovery requires a scan — a new group can appear at any tool call, and macOS
+offers no "children of pid X" query, only a walk of the whole table.
+
+So the gate's value is not CPU. Per tool call it removes four `tokio::spawn`s,
+four acquisitions of the agent's sweep lock, four `Sweep` clones and four
+`spawn_blocking` hops, and it states the invariant in the code: those samples
+cannot see anything new. The CPU win came entirely from sharing. Making the
+untracked case materially cheaper than this would mean either fewer discovery
+opportunities — a cadence change, which trades away discovery — or a cheaper
+scan, which the decomposition above rules out. What does amortise is agent
+count: a scan is per-machine, so four agents making a tool call at once cost
+about 1.4 scans each rather than three.
+
 **Re-measured cost.** Same method as above but in-process, via
 `getrusage(RUSAGE_SELF) + getrusage(RUSAGE_CHILDREN)`; the harness is
 `measure_the_sweep_cost` in `agent/process.rs` (`#[ignore]`d — run it with
