@@ -738,9 +738,13 @@ const CLOCK_SLACK_MS: i64 = 1_500;
 /// Every sweep that is not a teardown reads through [`shared_process_table`]
 /// instead of forking its own `ps`, which collapses the burst that follows each
 /// tool call — and, across concurrent agents, a burst per agent — into a single
-/// scan. 250ms is short enough that the samples of a single tool call still
-/// straddle it. What guarantees a *discovering* sweep a table it has not seen
-/// is not the TTL, though — see [`shared_process_table_after`].
+/// scan. The length is chosen so a shared table's staleness stays inside the
+/// slack that is *subtracted* from the proof window ([`PROOF_SLACK_MS`]).
+///
+/// It is deliberately **not** what gets a discovering sweep a table it has not
+/// seen. The TTL runs from the moment a read *completes*, so a sample scheduled
+/// at 250ms can land back inside it and be handed the 0ms sample's table; that
+/// is what [`shared_process_table_after`] exists for.
 pub const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Slack subtracted from the continuity proof window.
@@ -1071,11 +1075,13 @@ pub fn shared_process_table() -> TableSnapshot {
 /// already been given.
 ///
 /// A sweep whose job is to *discover* a group has to see something new, and
-/// "the TTL will have expired by now" is not a guarantee: the TTL runs from the
-/// moment a read completes, and under load a scan takes long enough that a
-/// sample scheduled to land past the TTL lands back inside it and re-reads the
-/// table it already had. That matters most for a long foreground tool call,
-/// which has no `tool_result` sweep to fall back on.
+/// "the TTL will have expired by now" is not a guarantee. The TTL runs from the
+/// moment a read *completes*, so a sample scheduled exactly one TTL after an
+/// earlier one lands back inside it by however long that earlier scan took —
+/// which is the ordinary case, not a rare one, whenever the earlier sample took
+/// a fresh read of its own. It then re-reads the table it already had. That
+/// matters most for a long foreground tool call, which has no `tool_result`
+/// sweep to fall back on.
 ///
 /// So the caller passes the `read_ms` of the last table it used, and a cached
 /// table at or before that watermark forces a fresh read. Concurrent agents

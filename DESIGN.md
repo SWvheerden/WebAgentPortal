@@ -254,8 +254,9 @@ dropped only once nothing of it is left, never because it is old, because a
 group recorded early and still running is precisely the one worth keeping.
 
 **Those walks share one table read.** A full `ps -axo` scan is not cheap —
-measured at 19.7ms of CPU on a machine with 592 processes, of which only about
-2ms is the subprocess and the rest is the kernel copying out every process
+measured at 19.7ms of CPU on a machine with 592 processes, of which about 4ms
+is the subprocess (2.3ms to fork and exec anything at all, the rest `ps`'s own
+startup) and the remaining ~15ms is the kernel copying out every process
 record — and a scan per walk put ~140ms of CPU into every tool call, per agent,
 before the agent's own work started. So there is one process-wide snapshot
 behind a 250ms TTL (`process::shared_process_table`), and every sweep that is
@@ -290,8 +291,10 @@ where the child appears a beat after the call is announced and there is no
 `tool_result` for minutes. On an agent tracking nothing it is the only sweep
 that will run, so it must read a table no earlier sample saw, and "the TTL will
 have expired by 250ms" does **not** deliver that: the TTL runs from the moment a
-read *completes*, so under load the sample lands back inside it and re-reads the
-table the first sample took. So a discovering sweep carries a watermark — the
+read *completes*, so a sample one TTL after an earlier one lands back inside it
+by however long that earlier scan took. That is the ordinary case rather than a
+rare one — whenever the sample at 0ms takes a fresh read, the sample at 250ms is
+handed it back. So a discovering sweep carries a watermark — the
 `read_ms` of the last table it used — and `shared_process_table_after` refuses
 to hand back a table at or before it. Concurrent agents still share one read:
 whoever reads first leaves a table newer than all the others' watermarks. These
@@ -1405,19 +1408,42 @@ given.
 **What the gate is worth, and what it is not.** §14 justified it as sparing an
 agent that leaves no process group behind "the full 114ms per tool call"; that
 is no longer what it does, and the numbers below say so — 63.1ms tracking
-against 62.3ms untracked. The reason is that the gate and the sharing act on
-disjoint sets. The four samples it skips are exactly the ones that land inside
-the first sample's TTL, so they were already reading a cached table and forking
-nothing; skipping something that costs no scan cannot save a scan. All three
+against 62.3ms untracked. The reason is that the sharing got there first: the
+four samples the gate skips are exactly the ones that land inside the first
+sample's TTL, so they were already reading a cached table and forking nothing.
+Skipping something that costs no scan cannot save a scan. All three
 scans that remain belong to sweeps that are allowed to *discover*, and
-discovery requires a scan — a new group can appear at any tool call, and macOS
-offers no "children of pid X" query, only a walk of the whole table.
+discovery requires reading the table — a new group can appear at any tool call,
+and the ownership proof needs each candidate's group id *and* start time, which
+means a walk of the whole table rather than a lookup. (macOS does have
+`proc_listchildpids`, but it yields direct children as bare pids and nothing
+else, so the tree and the two fields the proof rests on would still have to be
+assembled a syscall at a time. Rewriting the read against either that or
+`sysctl` is out of scope for this change — see *Why a cheaper scan is the wrong
+fix* above.)
 
-So the gate's value is not CPU. Per tool call it removes four `tokio::spawn`s,
-four acquisitions of the agent's sweep lock, four `Sweep` clones and four
-`spawn_blocking` hops, and it states the invariant in the code: those samples
-cannot see anything new. The CPU win came entirely from sharing. Making the
-untracked case materially cheaper than this would mean either fewer discovery
+So the gate's value is not CPU, and it is worth being exact about how little
+else it is. The gate sits *inside* the already-spawned task, after the delay —
+it has to, because the group it would be re-proving may not have been recorded
+when the sample was scheduled, and judging it any earlier reopens the discovery
+hole the late-sample test guards. By the time it is judged, the `tokio::spawn`,
+the sleep, the `agent_pids` read and the `forbidden` vector have all already
+happened, and the sweep write lock is already held. What it skips is the
+`Sweep` clone, the `spawn_blocking` hop, and the snapshot cycle itself — the
+tree walk, which builds a child map over every process on the machine and
+breadth-first searches it, plus the `confirm` and `prune` passes. Nothing else.
+
+Moving it earlier to save more was considered and refused. It cannot precede
+the `tokio::spawn` without preceding the delay. It could precede the
+`agent_pids` read, but only by taking the sweep lock first and so holding it
+across that read — a new lock ordering inside the machinery §4 depends on, to
+save one read-lock acquisition and a vector holding one `i32` per other live
+agent. That is the wrong trade, and overstating the gate's mechanical savings is
+what put a false sentence here in the first place.
+
+The real reason to keep it is that it states an invariant in the code: those
+four samples cannot see anything new. The CPU win came entirely from sharing.
+Making the untracked case materially cheaper would mean either fewer discovery
 opportunities — a cadence change, which trades away discovery — or a cheaper
 scan, which the decomposition above rules out. What does amortise is agent
 count: a scan is per-machine, so four agents making a tool call at once cost
