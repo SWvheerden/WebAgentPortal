@@ -490,6 +490,20 @@ async function rename() {
   }
 }
 
+/// The markup's placeholder, kept so the running state can be restored without
+/// the copy living in two files.
+const composerPlaceholder = $('input').placeholder;
+
+/// Whether the agent can be talked to at all.
+///
+/// A terminal agent has no CLI process behind it, so there is nothing to hand a
+/// message to — the header and the composer both hang off this one answer so
+/// they can never disagree about it.
+function isRunning() {
+  const agent = state.agent;
+  return !!agent && agent.status !== 'stopped' && agent.status !== 'failed';
+}
+
 function renderHeader() {
   const agent = state.agent;
   if (!agent) return;
@@ -501,10 +515,18 @@ function renderHeader() {
   // The mode is the picker's job now; repeating it in the meta line would let
   // the two disagree.
   $('agent-meta').textContent = `${where} · ${fmtCost(agent.cost_usd)} · ${agent.work_path}`;
-  const running = agent.status !== 'stopped' && agent.status !== 'failed';
+  const running = isRunning();
   $('btn-interrupt').disabled = !running;
   $('btn-stop').disabled = !running;
   $('btn-resume').disabled = running;
+  // Grey out Send rather than the box itself: a draft typed against an agent
+  // that has since exited stays typed, and Resume makes it sendable again.
+  const sendButton = $('send');
+  sendButton.disabled = !running;
+  sendButton.title = running ? '' : 'The agent is not running. Resume it to send.';
+  $('input').placeholder = running
+    ? composerPlaceholder
+    : 'The agent is not running — Resume it to send. Anything typed here is kept.';
   const picker = $('agent-mode');
   picker.value = agent.permission_mode;
   for (const option of picker.options) {
@@ -581,6 +603,13 @@ function send() {
   const input = $('input');
   const text = input.value.trim();
   if (!text || !state.agent) return;
+  // Nothing is listening, so the send would come straight back as an error
+  // notice — and the old code had already cleared the box by then, losing what
+  // was typed. Bail before the clear: the draft survives until Resume.
+  if (!isRunning()) {
+    toast('The agent is not running — resume it first. Your message has been kept.', 'warn');
+    return;
+  }
   socket.send({ type: 'send_message', agent_id: state.agent.id, text });
   // The CLI queues messages received during a turn (F6); show that.
   if (state.agent.status === 'working' || state.agent.status === 'awaiting_approval') {

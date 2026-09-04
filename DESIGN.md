@@ -812,6 +812,13 @@ refuses them if typed anyway (F16).
 The input stays live while `Working`; messages queue natively (F6) and render greyed with
 an ✕ to cancel. Interrupt cancels the turn only and reports what remains queued.
 
+### Sending to a stopped agent
+`Stopped` and `Failed` have no CLI process behind them, so Send greys out alongside
+Interrupt and Stop, and Enter refuses too. What it does **not** do is clear the box: a draft
+typed against an agent that exited while it was being written is kept, and Resume makes it
+sendable. Only the button is disabled, never the textarea — the point is to keep typing
+possible, not to block it.
+
 ---
 
 ## 8. Notes
