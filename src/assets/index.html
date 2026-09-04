@@ -163,12 +163,6 @@
     </section>
 
     <div class="board">
-      <section class="panel agents">
-        <h2>Agents <span class="muted" id="agent-count"></span></h2>
-        <div class="cards" id="cards"></div>
-        <p class="muted small" id="empty">No agents yet. Spawn one above.</p>
-      </section>
-
       <section class="panel notes" id="notes-panel">
         <h2>
           <button id="notes-toggle" class="disclosure" aria-expanded="true">Notes</button>
@@ -179,7 +173,27 @@
         <div class="note-list" id="notes"></div>
         <p class="muted small" id="notes-empty">Nothing noted.</p>
       </section>
+
+      <section class="panel agents">
+        <h2>Agents <span class="muted" id="agent-count"></span></h2>
+        <div class="cards" id="cards"></div>
+        <p class="muted small" id="empty">No agents yet. Spawn one above.</p>
+      </section>
     </div>
+
+    <!-- The workbench: one note at a time, the width of the page and tall
+         enough to write in. Sits under the board so opening it never moves
+         the list you clicked from. -->
+    <section class="panel note-editor hidden" id="note-editor">
+      <h2>
+        <span id="note-editor-title">Note</span>
+        <span class="spacer"></span>
+        <button id="note-save" class="primary">Save</button>
+        <button id="note-close" title="Save and close">Close</button>
+      </h2>
+      <textarea id="note-editor-area" spellcheck="true"></textarea>
+      <p class="muted small">Esc closes without saving. Cmd/Ctrl+Enter saves and closes.</p>
+    </section>
   </main>
 
   <script type="module" src="/assets/dashboard.js"></script>

@@ -14,8 +14,9 @@ const state = {
   rateLimitAt: null,
   notes: [],
   notesOpen: true,
-  /// The id of the note being typed into, `NEW_NOTE` for one that has never
-  /// been saved, or null. Exactly one row can be in the editor at a time.
+  /// The id of the note open in the editor below the board, `NEW_NOTE` for one
+  /// that has never been saved, or null when the editor is shut. One at a time:
+  /// the editor is a place to work, not a stack of them.
   editing: null,
 };
 
@@ -287,7 +288,7 @@ async function remove(agent) {
 // A note is inert text: no repo, no branch, no spawn parameters. Retyping a
 // task into the spawn form costs seconds and keeps the note a memo.
 
-/// The row that has been appended but never saved. Held client-side until it
+/// The note opened in the editor but never saved. Held client-side until it
 /// has a body, so the database never sees a blank.
 const NEW_NOTE = '\u0000new';
 
@@ -310,47 +311,23 @@ function noteHeading(body) {
   return String(body).split('\n')[0] || '(empty)';
 }
 
-/// Collapsed and expanded are different rows, so the mode belongs in the
-/// signature — otherwise toggling the panel leaves every row as it was.
+/// A row stands for a note, and the only thing that changes it is the text it
+/// shows and whether it is the one open below.
 function noteSignature(note) {
-  return JSON.stringify([state.notesOpen, note.body]);
+  return JSON.stringify([noteHeading(note.body), state.editing === note.id]);
 }
 
+/// The list is an index: one heading per row, whatever the body runs to. The
+/// body itself is read and written in the editor under the board.
 function noteRow(note, signature) {
-  if (!state.notesOpen) {
-    return el('div', { class: 'note', 'data-id': note.id, 'data-sig': signature }, [
-      el('div', { class: 'body', text: noteHeading(note.body), title: note.body }),
-    ]);
-  }
-  return el('div', { class: 'note', 'data-id': note.id, 'data-sig': signature }, [
+  const classes = state.editing === note.id ? 'note selected' : 'note';
+  return el('div', { class: classes, 'data-id': note.id, 'data-sig': signature }, [
     // Plain text, not markdown: the frontend is embedded in the binary with no
     // bundler, and rendering markdown means vendoring a parser and then owning
     // a sanitiser for text only its author will read.
-    el('div', { class: 'body', text: note.body, onclick: () => startEdit(note.id) }),
+    el('div', { class: 'body', text: noteHeading(note.body), title: note.body, onclick: () => openNote(note.id) }),
     el('button', { class: 'del', text: '×', title: 'Delete this note', onclick: () => removeNote(note) }),
   ]);
-}
-
-/// One editor, one code path: a new note and an edit are the same row.
-///
-/// Blur saves and Escape cancels, so there is no third button to aim at. The
-/// blur that the teardown itself causes is not a save — a detached row has
-/// nothing to commit.
-function noteEditor(id, body) {
-  const area = el('textarea', { rows: '3' });
-  area.value = body;
-  const row = el('div', { class: 'note editing', 'data-id': id, 'data-sig': 'editing' }, [area]);
-  area.addEventListener('keydown', (event) => {
-    if (event.key !== 'Escape') return;
-    event.preventDefault();
-    state.editing = null;
-    renderNotes();
-  });
-  area.addEventListener('blur', () => {
-    if (!row.isConnected) return;
-    commitEdit(id, area.value);
-  });
-  return row;
 }
 
 function renderNotes() {
@@ -358,35 +335,22 @@ function renderNotes() {
   $('notes-toggle').setAttribute('aria-expanded', String(state.notesOpen));
   const host = $('notes');
 
-  // The row being typed into keeps its own node — and with it the caret and
-  // whatever has not been saved — however often the poll comes round. Every
-  // other row is reconciled the way the agent cards are.
-  const editingNode = state.editing ? host.querySelector('.note.editing') : null;
-  const wanted = state.notes.map((note) => [note.id, note]);
-  if (state.editing === NEW_NOTE) wanted.push([NEW_NOTE, null]);
-
+  // Rows are reconciled the way the agent cards are; nothing here is typed
+  // into, so a poll landing mid-edit cannot take anything away.
   const leftover = new Map([...host.children].map((node) => [node.dataset.id, node]));
   let previous = null;
-  for (const [id, note] of wanted) {
-    let node;
-    if (id === state.editing) {
-      const old = leftover.get(id);
-      leftover.delete(id);
-      node = editingNode || noteEditor(id, note ? note.body : '');
-      if (old && old !== node) old.replaceWith(node);
-    } else {
-      const signature = noteSignature(note);
-      node = leftover.get(id);
-      if (node) {
-        leftover.delete(id);
-        if (node.dataset.sig !== signature) {
-          const fresh = noteRow(note, signature);
-          node.replaceWith(fresh);
-          node = fresh;
-        }
-      } else {
-        node = noteRow(note, signature);
+  for (const note of state.notes) {
+    const signature = noteSignature(note);
+    let node = leftover.get(note.id);
+    if (node) {
+      leftover.delete(note.id);
+      if (node.dataset.sig !== signature) {
+        const fresh = noteRow(note, signature);
+        node.replaceWith(fresh);
+        node = fresh;
       }
+    } else {
+      node = noteRow(note, signature);
     }
     if (node.parentNode !== host || node.previousElementSibling !== previous) {
       if (previous) previous.after(node);
@@ -397,7 +361,29 @@ function renderNotes() {
   for (const gone of leftover.values()) gone.remove();
 
   $('notes-count').textContent = state.notes.length ? `— ${state.notes.length}` : '';
-  $('notes-empty').classList.toggle('hidden', !!wanted.length || !state.notesOpen);
+  $('notes-empty').classList.toggle('hidden', !!state.notes.length);
+  renderEditor();
+}
+
+/// The editor's textarea is never rebuilt — it holds the caret and text that
+/// has not been saved, so a render only decides whether the panel is shown and
+/// what it is titled.
+function renderEditor() {
+  const panel = $('note-editor');
+  if (state.editing === null) {
+    panel.classList.add('hidden');
+    return;
+  }
+  const note = state.editing === NEW_NOTE ? null : state.notes.find((n) => n.id === state.editing);
+  // Deleted in another tab while it was open here: there is nothing left to
+  // write into, so the panel goes rather than saving the text back.
+  if (state.editing !== NEW_NOTE && !note) {
+    state.editing = null;
+    panel.classList.add('hidden');
+    return;
+  }
+  $('note-editor-title').textContent = note ? noteHeading(note.body) : 'New note';
+  panel.classList.remove('hidden');
 }
 
 async function loadNotes() {
@@ -414,57 +400,82 @@ function setNotesOpen(open) {
   } catch {
     // A browser that refuses storage still gets the panel; it just forgets.
   }
-  // Collapsed rows are an index, not a form: an editor left open in one would
-  // be a control the operator cannot see the rest of.
-  if (!open) state.editing = null;
   renderNotes();
 }
 
-function startEdit(id) {
-  if (!state.notesOpen) return;
+/// Opening a note saves the one already open: clicking straight from one to
+/// another is the ordinary way to move on, and it should not cost the text.
+async function openNote(id) {
+  if (state.editing === id) return;
+  if (state.editing !== null) await saveNote(state.editing, $('note-editor-area').value);
   state.editing = id;
+  const note = id === NEW_NOTE ? null : state.notes.find((n) => n.id === id);
+  const area = $('note-editor-area');
+  area.value = note ? note.body : '';
   renderNotes();
-  const area = $('notes').querySelector('.note.editing textarea');
-  if (!area) return;
   area.focus();
   area.setSelectionRange(area.value.length, area.value.length);
+  area.scrollIntoView({ block: 'nearest' });
 }
 
 function newNote() {
+  // The row lands in the list only once it has a body, so the list is opened
+  // here rather than after the save that would otherwise reveal nothing.
   if (!state.notesOpen) setNotesOpen(true);
-  startEdit(NEW_NOTE);
+  openNote(NEW_NOTE);
 }
 
-async function commitEdit(id, raw) {
+/// Writes `raw` back under `id` and returns the stored note, or null if there
+/// was nothing to write. Says nothing about what the editor shows next — that
+/// is the caller's to decide.
+async function saveNote(id, raw) {
   const body = raw.trim();
   try {
     if (id === NEW_NOTE) {
       // Nothing typed: the row is dropped and the server is never told.
-      if (body) {
-        const data = await api('/api/notes', { method: 'POST', body: JSON.stringify({ body }) });
-        state.notes.push(data.note);
-      }
-    } else {
-      const note = state.notes.find((n) => n.id === id);
-      // An emptied body is not a delete — deleting is its own action, and it
-      // asks first. Left alone, the note keeps the text it had.
-      if (note && body && body !== note.body) {
-        const data = await api(`/api/notes/${id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ body }),
-        });
-        Object.assign(note, data.note);
-      }
+      if (!body) return null;
+      const data = await api('/api/notes', { method: 'POST', body: JSON.stringify({ body }) });
+      state.notes.push(data.note);
+      return data.note;
     }
+    const note = state.notes.find((n) => n.id === id);
+    // An emptied body is not a delete — deleting is its own action, and it
+    // asks first. Left alone, the note keeps the text it had.
+    if (!note || !body || body === note.body) return note || null;
+    const data = await api(`/api/notes/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ body }),
+    });
+    Object.assign(note, data.note);
+    return note;
   } catch (err) {
     toast(err.message, 'error');
-  } finally {
-    // Clicking straight from one note into another blurs the first and opens
-    // the second before this settles; closing "the editor" then would shut the
-    // row the operator had just aimed at.
-    if (state.editing === id) state.editing = null;
-    renderNotes();
+    return null;
   }
+}
+
+/// Save, and either stay in the note or close it. Saving a new note without
+/// closing hands the editor the id it was given, so a second save edits the
+/// note rather than writing another one.
+async function saveOpenNote({ close }) {
+  const id = state.editing;
+  if (id === null) return;
+  const saved = await saveNote(id, $('note-editor-area').value);
+  if (close) {
+    state.editing = null;
+    $('note-editor-area').value = '';
+  } else if (id === NEW_NOTE) {
+    state.editing = saved ? saved.id : null;
+  }
+  renderNotes();
+}
+
+/// Escape is the way out without saving, so it is the only path that drops
+/// what was typed.
+function closeEditor() {
+  state.editing = null;
+  $('note-editor-area').value = '';
+  renderNotes();
 }
 
 async function removeNote(note) {
@@ -473,7 +484,8 @@ async function removeNote(note) {
   try {
     await api(`/api/notes/${note.id}`, { method: 'DELETE' });
     state.notes = state.notes.filter((n) => n.id !== note.id);
-    renderNotes();
+    if (state.editing === note.id) closeEditor();
+    else renderNotes();
   } catch (err) {
     toast(err.message, 'error');
   }
@@ -778,6 +790,17 @@ async function main() {
   $('toggle-settings').onclick = () => togglePanel('settings-panel');
   $('notes-toggle').onclick = () => setNotesOpen(!state.notesOpen);
   $('note-new').onclick = newNote;
+  $('note-save').onclick = () => saveOpenNote({ close: false });
+  $('note-close').onclick = () => saveOpenNote({ close: true });
+  $('note-editor-area').addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeEditor();
+    } else if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      saveOpenNote({ close: true });
+    }
+  });
   $('task-name').oninput = updateBranchPreview;
   $('isolation').onchange = () => renderSpawnWarnings(state.repoInfo);
   $('branch-source').onchange = () => {

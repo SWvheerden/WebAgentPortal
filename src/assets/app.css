@@ -117,12 +117,12 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 /* A refused request is not a footnote: outline the whole panel. */
 .panel.warn-tint { border-color: var(--err); }
 
-/* The board: the agent list with the notes panel beside it. Notes take a
-   narrow column and wrap underneath on a phone rather than squeezing the
-   cards down to one per row. */
+/* The board: the notes index down the left with the agent list beside it.
+   Notes take a narrow column and wrap above the cards on a phone rather than
+   squeezing them down to one per row. */
 .board { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.board > .notes { flex: 1 1 240px; }
 .board > .agents { flex: 3 1 520px; }
-.board > .notes { flex: 1 1 260px; }
 
 /* notes */
 .notes h2 { display: flex; align-items: center; gap: 8px; }
@@ -152,19 +152,39 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
   padding: 6px 8px;
   margin-bottom: 6px;
 }
-.note .body { flex: 1; white-space: pre-wrap; word-break: break-word; cursor: text; }
-.note .del { border: none; background: none; color: var(--dim); padding: 0 4px; }
-.note .del:hover { color: var(--err); }
-.note textarea { min-height: 66px; resize: vertical; }
-/* Collapsed, each note is one line of its own text: enough to see what is on
-   the list without the panel taking the height of every body. */
-.notes.collapsed .note { padding: 3px 8px; }
-.notes.collapsed .body {
+/* Every row is one line of its own text: the list is an index of headings,
+   and the body it stands for is read in the editor below the board. */
+.note .body {
+  flex: 1;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  cursor: default;
+  cursor: pointer;
 }
+.note.selected { border-color: var(--accent-2); }
+.note .del { border: none; background: none; color: var(--dim); padding: 0 4px; }
+.note .del:hover { color: var(--err); }
+.notes.collapsed .note-list, .notes.collapsed #notes-empty { display: none; }
+
+/* The editor: a note gets the whole width of the page and most of the window
+   to be written in, which is the point of keeping the list to headings. */
+.note-editor h2 { display: flex; align-items: center; gap: 8px; }
+.note-editor h2 .spacer { flex: 1; }
+.note-editor h2 #note-editor-title {
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--fg);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.note-editor textarea {
+  min-height: 55vh;
+  resize: vertical;
+  line-height: 1.6;
+}
+.note-editor p { margin: 6px 0 0; }
 
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
