@@ -490,15 +490,7 @@ impl Supervisor {
         let spawn_config = SpawnConfig {
             claude_bin: cfg.claude_bin.clone(),
             cwd: work_path,
-            args: LaunchArgs {
-                session_id: record.id.clone(),
-                resume,
-                permission_mode: record.permission_mode,
-                model: record.model.clone(),
-                effort: record.effort.clone(),
-                max_budget_usd: record.max_budget_usd,
-                add_dirs: record.add_dirs.clone(),
-            },
+            args: launch_args(record, &cfg, resume),
         };
 
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
@@ -1871,6 +1863,29 @@ impl Runner {
     }
 }
 
+/// The launch argument list for `record` under `cfg`.
+///
+/// Split out of [`Supervisor::launch`] so the config-to-command-line wiring can
+/// be asserted without spawning anything — the process itself is [`process`]'s
+/// business, and the argv's shape is [`LaunchArgs::to_argv`]'s.
+fn launch_args(record: &AgentRecord, cfg: &Config, resume: bool) -> LaunchArgs {
+    LaunchArgs {
+        session_id: record.id.clone(),
+        resume,
+        permission_mode: record.permission_mode,
+        model: record.model.clone(),
+        effort: record.effort.clone(),
+        max_budget_usd: record.max_budget_usd,
+        add_dirs: record.add_dirs.clone(),
+        // Read from the config at launch rather than stored on the agent: the
+        // toggle is a property of this machine's deployment, so an agent
+        // resumed after it is turned off comes back without it — and one
+        // resumed after it is turned on picks it up. The slug is already
+        // `[a-z0-9_]{1,40}`, so it needs no laundering before the command line.
+        remote_control: cfg.remote_control.then(|| record.slug.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2177,6 +2192,41 @@ mod tests {
         Some(path.to_string_lossy().to_string())
     }
 
+    /// The config toggle of §9 is only worth anything if it reaches the command
+    /// line, and the *name* is the part that is easy to lose: without it every
+    /// agent on this machine would offer itself under the same hostname.
+    ///
+    /// Asserted on the argument list rather than on a spawned child, because a
+    /// child that outlives the assertion is a stray process the rest of the
+    /// suite has to sweep, and the sweeps are what starve its wall-clock tests.
+    #[test]
+    fn the_remote_control_toggle_reaches_the_launch_named_after_the_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = agent_record("agent-rc", dir.path());
+        let off = Config::default();
+        let on = Config {
+            remote_control: true,
+            ..Config::default()
+        };
+
+        assert!(
+            !launch_args(&record, &off, false)
+                .to_argv()
+                .iter()
+                .any(|a| a == "--remote-control"),
+            "off by default, and off means absent"
+        );
+
+        for resume in [false, true] {
+            let argv = launch_args(&record, &on, resume).to_argv();
+            assert!(
+                argv.windows(2)
+                    .any(|w| w == ["--remote-control", record.slug.as_str()]),
+                "resume = {resume}: {argv:?}"
+            );
+        }
+    }
+
     /// A CLI that answers the `initialize` handshake and nothing else — which
     /// is exactly what a resumed session does until it is sent a message.
     fn handshake_only_cli(dir: &Path) -> Option<String> {
@@ -2241,6 +2291,7 @@ mod tests {
     #[tokio::test]
     async fn a_resume_reaches_idle_without_a_message() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _no_crossfire = crate::agent::process::CHILD_SPAWNERS.lock().await;
         let Some(bin) = handshake_only_cli(dir.path()) else {
             return;
         };
@@ -2286,6 +2337,7 @@ mod tests {
     #[tokio::test]
     async fn two_concurrent_resumes_start_exactly_one_child() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _no_crossfire = crate::agent::process::CHILD_SPAWNERS.lock().await;
         let Some(bin) = stub_cli(dir.path()) else {
             return;
         };
@@ -2380,6 +2432,7 @@ mod tests {
             effort: stored.effort.clone(),
             max_budget_usd: stored.max_budget_usd,
             add_dirs: stored.add_dirs.clone(),
+            remote_control: None,
         }
         .to_argv();
         assert_eq!(argv.iter().filter(|a| *a == "--add-dir").count(), 2);
@@ -2504,6 +2557,7 @@ mod tests {
         let _observing = crate::agent::process::SNAPSHOT_OBSERVERS.lock().await;
         crate::agent::process::shared_process_table();
 
+        let _no_crossfire = crate::agent::process::CHILD_SPAWNERS.lock().await;
         let Some(leader) = GroupLeader::start() else {
             return;
         };
@@ -2536,6 +2590,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cli_that_exits_on_its_own_still_gets_its_tool_groups_swept() {
+        let _no_crossfire = crate::agent::process::CHILD_SPAWNERS.lock().await;
         let Some(mut leader) = GroupLeader::start() else {
             return;
         };
@@ -2585,6 +2640,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_teardown_finishes_before_the_runner_reports_itself_done() {
+        let _no_crossfire = crate::agent::process::CHILD_SPAWNERS.lock().await;
         let Some(mut leader) = GroupLeader::start() else {
             return;
         };
@@ -2746,6 +2802,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_group_that_ignores_sigterm_is_killed() {
+        let _no_crossfire = crate::agent::process::CHILD_SPAWNERS.lock().await;
         let Some(mut leader) = stubborn_leader() else {
             return;
         };
@@ -2772,6 +2829,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_group_that_obeys_sigterm_is_not_waited_out() {
+        let _no_crossfire = crate::agent::process::CHILD_SPAWNERS.lock().await;
         let Some(mut leader) = GroupLeader::start() else {
             return;
         };
@@ -3142,6 +3200,7 @@ mod tests {
     #[tokio::test]
     async fn dangerous_cannot_be_applied_to_a_running_agent() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _no_crossfire = crate::agent::process::CHILD_SPAWNERS.lock().await;
         let Some(bin) = stub_cli(dir.path()) else {
             return;
         };

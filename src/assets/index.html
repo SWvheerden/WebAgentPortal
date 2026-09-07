@@ -150,6 +150,8 @@
         <div class="field"><label for="cfg-hostnames">Extra hostnames (read-only)</label><input id="cfg-hostnames" readonly disabled></div>
       </div>
       <div class="field inline"><input type="checkbox" id="cfg-open"><label for="cfg-open" style="margin:0">Open a browser on startup</label></div>
+      <div class="field inline"><input type="checkbox" id="cfg-remote-control"><label for="cfg-remote-control" style="margin:0">Remote Control: launch every agent with <code>--remote-control &lt;name&gt;</code></label></div>
+      <p class="small muted">Offers each agent to claude.ai and the Claude mobile app under its own slug, from the next launch onwards. <strong>Verified inert on the pinned CLI</strong>: the flag is accepted alongside <code>-p</code> but only ever reaches the interactive REPL's bridge, which a headless agent never builds — nothing connects and nothing is said about it. Left here so it works the day the CLI honours it; see DESIGN §9. The portal itself already does messages, streaming, approvals and interrupt over §12.</p>
       <button id="cfg-save" class="primary">Save</button>
       <span class="small muted">Port changes take effect on restart. Where the server listens is
         editable only on the machine itself, in config.toml — a client that could widen its own

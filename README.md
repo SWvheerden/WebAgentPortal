@@ -49,6 +49,14 @@ so the file is not itself a working credential. Pairing again replaces it
 everywhere; `claude-web unpair` deletes it, which also stops a non-loopback bind
 from starting — that is the lost-phone procedure. See DESIGN §12.
 
+That is the phone story. Claude's own Remote Control is a different one:
+`remote_control = true` (Settings, or `config.toml`) launches every agent with
+`--remote-control <slug>`, offering it to claude.ai and the Claude mobile app.
+**Verified inert on the pinned CLI** — the flag is accepted alongside `-p` and
+silently ignored, because it only ever reaches the interactive REPL's bridge,
+which a headless agent never builds. It is passed anyway, so the portal is ready
+the day the CLI honours it. See DESIGN §9 and F12a.
+
 ## Development
 
 ```sh

@@ -759,6 +759,9 @@ pub struct LaunchArgs {
     pub effort: Option<String>,
     pub max_budget_usd: Option<f64>,
     pub add_dirs: Vec<String>,
+    /// The name to offer this session under, when `remote_control` is on (§9).
+    /// `None` leaves the flag off entirely.
+    pub remote_control: Option<String>,
 }
 
 impl LaunchArgs {
@@ -795,6 +798,15 @@ impl LaunchArgs {
         for dir in &self.add_dirs {
             args.push("--add-dir".into());
             args.push(dir.clone());
+        }
+        // Always with a name. `--remote-control` takes an *optional* value, so
+        // a bare one is a flag whose argument is whatever follows it — safe
+        // only for as long as it stays last in the list. The name is also what
+        // tells one agent from another on claude.ai, where the default is the
+        // hostname and every agent on this machine would share it.
+        if let Some(name) = &self.remote_control {
+            args.push("--remote-control".into());
+            args.push(name.clone());
         }
         args
     }
@@ -1242,6 +1254,7 @@ mod tests {
             effort: None,
             max_budget_usd: None,
             add_dirs: vec![],
+            remote_control: None,
         };
         let argv = base.to_argv();
         assert!(argv.starts_with(&[
@@ -1279,6 +1292,7 @@ mod tests {
             effort: Some("high".into()),
             max_budget_usd: Some(2.5),
             add_dirs: vec!["/a".into(), "/b".into()],
+            remote_control: None,
         };
         let argv = args.to_argv();
         assert!(!argv.iter().any(|a| a == "--model"));
@@ -1287,6 +1301,33 @@ mod tests {
         assert_eq!(argv.iter().filter(|a| *a == "--add-dir").count(), 2);
         assert!(argv.iter().any(|a| a == "--dangerously-skip-permissions"));
         assert!(!argv.iter().any(|a| a == "--permission-mode"));
+        assert!(!argv.iter().any(|a| a == "--remote-control"));
+    }
+
+    /// `--remote-control` takes an optional value, so a bare one would swallow
+    /// whatever token came next. It is always named, and always last.
+    #[test]
+    fn remote_control_is_named_and_comes_last() {
+        let args = LaunchArgs {
+            session_id: "u".into(),
+            resume: false,
+            permission_mode: PermissionMode::Ask,
+            model: None,
+            effort: None,
+            max_budget_usd: None,
+            add_dirs: vec!["/a".into()],
+            remote_control: Some("fix_the_parser".into()),
+        };
+        let argv = args.to_argv();
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--remote-control", "fix_the_parser"])
+        );
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("fix_the_parser"),
+            "an optional-argument flag must not be followed by another argument: {argv:?}"
+        );
     }
 
     #[test]

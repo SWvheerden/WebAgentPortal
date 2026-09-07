@@ -1051,6 +1051,25 @@ static SHARED_TABLE: Mutex<Option<TableSnapshot>> = Mutex::new(None);
 #[cfg(test)]
 pub(crate) static SNAPSHOT_OBSERVERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Serialises the tests that spawn a real child against those that sweep from
+/// the test binary's own pid.
+///
+/// `Harness::start_with(std::process::id(), …)` makes the test binary itself
+/// the CLI whose tree is walked, which is how the group-leader tests get a real
+/// process to find. The cost is that *every* other test's stub child is a
+/// descendant of the test binary too, each in its own process group, and a stop
+/// signals every group the walk turned up — so an unrelated child that happened
+/// to be alive at that moment was SIGTERMed out from under its own test. It
+/// showed up as `Failed` / "terminated by signal 15" in whichever spawning test
+/// overlapped, at a rate that moved with nothing but the number of tests in the
+/// binary: 0 failures in 12 runs of the suite, 3 in 12 after four unrelated
+/// tests were added to it.
+///
+/// Held by both sides, so the two never overlap. Nothing asserts on it; it only
+/// keeps the tests out of each other's process trees.
+#[cfg(test)]
+pub(crate) static CHILD_SPAWNERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Take [`SNAPSHOT_OBSERVERS`] from a synchronous test. An async one awaits
 /// `SNAPSHOT_OBSERVERS.lock()` instead.
 #[cfg(test)]
@@ -2898,8 +2917,10 @@ mod tests {
                 effort: None,
                 max_budget_usd: None,
                 add_dirs: Vec::new(),
+                remote_control: None,
             },
         };
+        let _no_crossfire = CHILD_SPAWNERS.lock().await;
         let (handle, mut msgs) = spawn(&config).expect("spawn");
 
         // Bounded so a regression fails the test instead of hanging it. The

@@ -1109,6 +1109,27 @@ mod tests {
         }
     }
 
+    /// A checkbox the panel fills but never sends back is a setting that
+    /// silently reverts on every save, so both halves are asserted.
+    #[test]
+    fn the_settings_panel_reads_and_writes_the_remote_control_toggle() {
+        let html = std::str::from_utf8(&Assets::get("index.html").expect("index.html").data)
+            .expect("utf-8")
+            .to_string();
+        let js = std::str::from_utf8(&Assets::get("dashboard.js").expect("dashboard.js").data)
+            .expect("utf-8")
+            .to_string();
+        assert!(html.contains("id=\"cfg-remote-control\""), "no checkbox");
+        assert!(
+            js.contains("$('cfg-remote-control').checked = cfg.remote_control"),
+            "the panel never shows the saved value"
+        );
+        assert!(
+            js.contains("remote_control: $('cfg-remote-control').checked"),
+            "the panel never sends the value back"
+        );
+    }
+
     #[test]
     fn every_permission_picker_offers_every_mode() {
         let html = std::str::from_utf8(&Assets::get("index.html").expect("index.html").data)
@@ -1573,6 +1594,7 @@ mod tests {
         body["bind"] = json!("0.0.0.0");
         body["hostnames"] = json!(["evil.example"]);
         body["max_agents"] = json!(3);
+        body["remote_control"] = json!(true);
         let mut request = axum::http::Request::builder()
             .method("PUT")
             .uri("/api/config")
@@ -1592,13 +1614,16 @@ mod tests {
         let saved: Config = serde_json::from_slice(&bytes).expect("config");
         assert_eq!(saved.bind, crate::config::DEFAULT_BIND);
         assert!(saved.hostnames.is_empty());
-        // The rest of the panel still works.
+        // The rest of the panel still works, Remote Control included: unlike
+        // the bind, it is an ordinary setting the panel owns (§9).
         assert_eq!(saved.max_agents, 3);
+        assert!(saved.remote_control);
         let on_disk = Config::from_toml_str(
             &std::fs::read_to_string(dir.path().join("config.toml")).expect("read"),
         )
         .expect("parse");
         assert_eq!(on_disk.bind, crate::config::DEFAULT_BIND);
+        assert!(on_disk.remote_control, "and it survives the round trip");
     }
 
     /// "Open the link claude-web printed when it started" is useless advice on

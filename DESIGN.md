@@ -34,7 +34,8 @@ These are load-bearing — several contradict what the published docs imply.
 | F15 | An API failure **does not stop the turn from looking like a success**. The CLI synthesises an `assistant` line with `is_api_error_message: true`, `error: "rate_limit"` and `model: "<synthetic>"` carrying the human text, then closes the turn with a `result` whose `subtype` is still **`"success"`** while `is_error: true` and `api_error_status: 429`. So `subtype` must never be keyed off; `is_error` is the flag that means it and `result` carries the wording. The agent is genuinely `Idle` afterwards — the process is alive and can be spoken to. | A session that hit its five-hour limit mid-task on 2.1.246: two synthetic `assistant` lines, then `result` with `subtype: "success"`, `is_error: true`, `api_error_status: 429`. |
 | F16 | **Built-in TUI slash commands are not in the `initialize` list and are refused if typed.** `/resume`, `/status`, `/cost` and `/help` are absent from the 74 commands 2.1.247 advertised; sending `/resume` returns a `<synthetic>` assistant line — *"/resume isn't available in this environment."* — and a `result` with `is_error: false`. Skills, plugin and project commands do resolve (F8). | The advertised list inspected; `/resume` sent and refused. |
 | F17 | The **Agent/Task tool is asynchronous**. The parent is handed its tool result — *"Async agent launched successfully … you will be notified automatically when it completes"* — the moment the subagent **starts**, and closes its turn with an ordinary `result` while the subagent runs on. The lifecycle arrives as `system` lines: `background_tasks_changed` (the **complete live list**, emptied when the last one ends), `task_started` (`task_id`, `tool_use_id`, `description`, `subagent_type`, `is_backgrounded`), `task_progress` (`description`, `last_tool_name`), `task_updated` (`patch.status`) and `task_notification` (`status`, `summary`). The notification then **wakes the parent into a fresh turn with no user message**. So `result` is not proof the agent has finished, and the first line of a turn is not always a reply to something we sent. | 2.1.251, one backgrounded `general-purpose` subagent: `task_started` → `result` ("I'll let you know as soon as it completes") → `background_tasks_changed: []` → `task_notification` → a second `system/init`, `assistant` lines and a second `result`, none of it prompted. |
-| F12 | Remote Control (`claude remote-control`) is a persistent server, ≤32 concurrent sessions, outbound-only, but **scoped to one directory** and requiring a full-scope subscription login. Compatibility with `-p` is **undocumented and untested** (testing would create a real session on the account). | `claude remote-control --help` + docs. |
+| F12 | Remote Control (`claude remote-control`) is a persistent server, ≤32 concurrent sessions, outbound-only, but **scoped to one directory** and requiring a full-scope subscription login. | `claude remote-control --help` + docs. |
+| F12a | **`--remote-control` is accepted next to `-p` and does nothing.** No conflict error, no warning, no refusal — the session runs normally and never mentions it. The flag only feeds `replBridgeEnabled` into the *interactive* app state, and a headless child builds no REPL, so the bridge is never started. There is also a one-time confirmation the CLI cannot show headlessly (*"Remote Control asks for a one-time confirmation before it's first enabled, and this session can't show it. Run /remote-control from an interactive Claude Code session."*). By F16 the `/remote-control` slash command is a built-in TUI command, so typing it is refused too. | 2.1.260, the portal's own argv plus `--remote-control <name>`: a full turn completed, and `--debug-file` recorded **zero** bridge lines. Cross-checked against the CLI's own startup resolver, which is called only from the interactive path. |
 
 ### Risk register
 
@@ -202,8 +203,11 @@ claude -p
   --session-id <uuid>            # first launch
   [--resume <uuid>]              # subsequent launches, replaces --session-id
   [--model X] [--effort X] [--max-budget-usd X] [--add-dir ...]
+  [--remote-control <slug>]      # only when remote_control = true (§9)
 cwd = work_path
 ```
+`--remote-control` is last on purpose: it takes an *optional* value, so a bare one would
+read whatever followed it as its name.
 `Dangerously skip all` substitutes `--dangerously-skip-permissions` for `--permission-mode`.
 `--permission-prompt-tool stdio` is passed in **every** mode, including the two that never
 ask. It only says a handler is reachable; a `bypass` or `dangerous` launch carrying it still
@@ -926,17 +930,37 @@ already takes: the token raises the bar, it does not build a wall.
 
 ## 9. Remote Control
 
-**Not integrated.** The portal already does what Remote Control does — messages, streaming
-output, approvals, interrupt — and keeps arbitrary per-agent directories, which Remote
-Control cannot (it is scoped to one directory). Phone access comes from §12: binding a
-tailnet or private address, behind a paired device key.
+`remote_control = true` launches every agent with `--remote-control <slug>`, offering it to
+claude.ai and the Claude mobile app. Off by default, and a Settings checkbox: unlike `bind`
+(§12) it is a launch flag rather than a listening address, so a client that flips it widens
+nothing about the control plane it is talking to.
 
-Deliberately avoided: an undocumented `-p` + `--remote-control` combination, a subscription
-coupling, and two competing permission handlers (our stdio handler vs the phone).
+**It does nothing on the CLI this pins, and that is not a bug in the wiring.** By F12a the
+flag is accepted beside `-p` and silently ignored: it reaches only the interactive REPL's
+bridge, which a headless child never builds. Nothing connects, nothing errors, nothing is
+said. The toggle is kept anyway, on the terms F12a states — the day the CLI honours the flag
+in print mode, the portal is already passing it — and the Settings panel says so in as many
+words rather than implying a connection that is not there.
 
-A later escape hatch — a button that launches a *separate* `claude remote-control` server in
-a chosen directory, with its own lifecycle and honestly labelled as not-our-agents — remains
-possible. The design does not depend on it.
+The name is not optional. `--remote-control` takes an optional value, and left bare it would
+default every agent on this machine to the same hostname; the agent's slug is already
+`[a-z0-9_]{1,40}`, so it reaches the command line unlaundered and tells one agent from
+another at the far end.
+
+Read from the config at launch, never stored on the agent: an agent resumed after the toggle
+is turned off comes back without it, and one resumed after it is turned on picks it up.
+
+None of this is the phone story. Phone access comes from §12 — binding a tailnet or private
+address behind a paired device key — and the portal already does what Remote Control does:
+messages, streaming output, approvals, interrupt, across arbitrary per-agent directories,
+which Remote Control cannot (it is scoped to one). Still deliberately avoided: a subscription
+coupling made mandatory, and two competing permission handlers (our stdio handler vs the
+phone).
+
+The other escape hatch — a button that launches a *separate* `claude remote-control` server
+in a chosen directory, with its own lifecycle and honestly labelled as not-our-agents —
+remains possible, and is the option that would actually work today. The design does not
+depend on it.
 
 ---
 
@@ -954,6 +978,7 @@ default_model   = "opus"
 default_permission_mode = "ask"
 claude_bin      = "claude"
 pinned_cli_version = "2.1.241"   # warn on mismatch
+remote_control  = false          # launch every agent with --remote-control (§9)
 ```
 
 ### The two defaults reach the spawn form
@@ -973,8 +998,8 @@ form cannot select is a default that cannot be honoured.
 
 ## 11. Out of scope (v1)
 
-Multi-user auth · auto-commit, auto-push, PR creation · Remote Control integration ·
-reading Claude's internal transcript files (F11) · agents surviving server death ·
+Multi-user auth · auto-commit, auto-push, PR creation · a Remote Control integration beyond
+the launch flag of §9 · reading Claude's internal transcript files (F11) · agents surviving server death ·
 virtualised scrollback · TLS termination in-process (§12 uses a VPN instead).
 
 ---

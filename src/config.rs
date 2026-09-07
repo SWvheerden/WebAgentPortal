@@ -35,6 +35,13 @@ pub struct Config {
     pub default_permission_mode: PermissionMode,
     pub claude_bin: String,
     pub pinned_cli_version: String,
+    /// Launch every agent with `--remote-control <slug>`, offering it to
+    /// claude.ai and the Claude mobile app (§9).
+    ///
+    /// Off by default, and **inert on the CLI this pins**: the flag is accepted
+    /// next to `-p` without complaint but only ever reaches the interactive
+    /// REPL's bridge, which a headless child never builds. See F12.
+    pub remote_control: bool,
 }
 
 impl Default for Config {
@@ -51,6 +58,7 @@ impl Default for Config {
             default_permission_mode: PermissionMode::Ask,
             claude_bin: "claude".to_string(),
             pinned_cli_version: "2.1.241".to_string(),
+            remote_control: false,
         }
     }
 }
@@ -281,6 +289,22 @@ pinned_cli_version = "2.1.241"
 "#;
         let cfg = Config::from_toml_str(text).expect("parse");
         assert_eq!(cfg, Config::default());
+    }
+
+    /// Off unless it is asked for: turning it on offers every agent to
+    /// claude.ai, which is not something a config file should acquire by
+    /// being old (§9).
+    #[test]
+    fn remote_control_is_off_unless_asked_for() {
+        assert!(!Config::default().remote_control);
+        assert!(
+            !Config::from_toml_str("port = 9000\n")
+                .expect("parse")
+                .remote_control
+        );
+        let on = Config::from_toml_str("remote_control = true\n").expect("parse");
+        assert!(on.remote_control);
+        assert!(on.validate().is_ok(), "it is a launch flag, not a bind");
     }
 
     #[test]

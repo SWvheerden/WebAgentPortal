@@ -735,6 +735,7 @@ function fillSettings() {
   $('cfg-mode').value = cfg.default_permission_mode;
   $('cfg-pin').value = cfg.pinned_cli_version;
   $('cfg-open').checked = cfg.open_browser;
+  $('cfg-remote-control').checked = cfg.remote_control;
   // Shown, never edited: the server keeps its own values whatever this panel
   // sends back (§12).
   $('cfg-bind').value = `${cfg.bind}:${cfg.port}`;
@@ -752,6 +753,7 @@ async function saveSettings() {
     default_permission_mode: $('cfg-mode').value,
     pinned_cli_version: $('cfg-pin').value,
     open_browser: $('cfg-open').checked,
+    remote_control: $('cfg-remote-control').checked,
   };
   try {
     state.config = await api('/api/config', { method: 'PUT', body: JSON.stringify(cfg) });
