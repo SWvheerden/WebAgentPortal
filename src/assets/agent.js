@@ -14,6 +14,9 @@ const state = {
   queued: [],
   acIndex: 0,
   acItems: [],
+  history: [],
+  historyAt: null,
+  historyEdits: new Map(),
 };
 
 // -- transcript -------------------------------------------------------------
@@ -541,13 +544,19 @@ function renderHeader() {
 
 // -- slash command autocomplete --------------------------------------------
 
+/// Close the box and forget what was in it, together: the keydown handler
+/// reads both, and a hidden box with live items still steals the arrow keys.
+function hideAutocomplete() {
+  $('autocomplete').classList.add('hidden');
+  state.acItems = [];
+}
+
 function updateAutocomplete() {
   const box = $('autocomplete');
   const value = $('input').value;
   const match = /(^|\n)\/([\w:.-]*)$/.exec(value);
   if (!match || !state.commands.length) {
-    box.classList.add('hidden');
-    state.acItems = [];
+    hideAutocomplete();
     return;
   }
   const query = match[2].toLowerCase();
@@ -555,7 +564,7 @@ function updateAutocomplete() {
     .filter((c) => c.name.replace(/^\//, '').toLowerCase().startsWith(query))
     .slice(0, 12);
   if (!state.acItems.length) {
-    box.classList.add('hidden');
+    hideAutocomplete();
     return;
   }
   state.acIndex = Math.min(state.acIndex, state.acItems.length - 1);
@@ -573,8 +582,83 @@ function updateAutocomplete() {
 function applyCommand(cmd) {
   const input = $('input');
   input.value = input.value.replace(/(^|\n)\/[\w:.-]*$/, `$1${cmd.name} `);
-  $('autocomplete').classList.add('hidden');
+  hideAutocomplete();
   input.focus();
+}
+
+// -- input history ----------------------------------------------------------
+
+/// Matches the server's cap (`INPUT_HISTORY` in db.rs). The list arrives with
+/// the page and is kept up to date here rather than refetched, so it has to
+/// stay the same length either way.
+const HISTORY_MAX = 50;
+
+/// Record a message that has just gone to the agent.
+///
+/// One entry per distinct text, newest last: an agent told "yes" a dozen times
+/// should not cost a dozen presses to walk past. Sending also ends any walk in
+/// progress — the box is empty again, and there is nothing left to come back
+/// to.
+function rememberInput(text) {
+  state.history = state.history.filter((t) => t !== text);
+  state.history.push(text);
+  if (state.history.length > HISTORY_MAX) state.history.shift();
+  state.historyAt = null;
+  state.historyEdits.clear();
+}
+
+/// Up recalls only from the first line and Down only from the last, so the
+/// arrows still move the caret through a multi-line message. Logical lines, not
+/// wrapped ones — a browser will not say where a soft wrap put the caret, and
+/// guessing it wrong would be worse than this.
+function caretLine(input, where) {
+  if (input.selectionStart !== input.selectionEnd) return false;
+  return where === 'first'
+    ? !input.value.slice(0, input.selectionStart).includes('\n')
+    : !input.value.slice(input.selectionEnd).includes('\n');
+}
+
+/// Walk the history: `step` of -1 goes older, +1 newer. Returns whether the key
+/// was used, so an unusable press still does whatever the browser would.
+///
+/// Position `history.length` is the draft — whatever was being typed when the
+/// walk started — which is why the walk stashes it as an edit before moving off
+/// it. Opening the history therefore never costs an unsent message.
+///
+/// `historyEdits` is what makes an entry editable: a recalled message that gets
+/// tweaked keeps the tweak at its own position, so walking away from it and
+/// back does not undo the typing, and walking on from it goes to the next entry
+/// rather than starting over. That is the shell's behaviour, and the reason it
+/// is worth the map: the whole point of recall is to send something *nearly*
+/// the same as last time.
+function recall(step) {
+  const input = $('input');
+  if (!state.history.length) return false;
+  if (state.historyAt === null) {
+    if (step > 0) return false; // already at the draft; nothing is newer
+    state.historyEdits.clear();
+    state.historyEdits.set(state.history.length, input.value);
+    state.historyAt = state.history.length;
+  } else if (step > 0 && state.historyAt === state.history.length) {
+    // Back at the draft and still going forward: the walk is over, and the key
+    // belongs to the caret again.
+    state.historyAt = null;
+    return false;
+  }
+  // The oldest entry is the end of the walk rather than a wrap round to the
+  // newest: a list you can fall off the end of is one you cannot read.
+  const next = Math.min(Math.max(state.historyAt + step, 0), state.history.length);
+  state.historyAt = next;
+  input.value = state.historyEdits.has(next) ? state.historyEdits.get(next) : state.history[next];
+  // Caret to the end, as a shell does. Further Up presses then walk this
+  // message's own lines before carrying on into older ones, which is what makes
+  // repeated presses reach every entry.
+  input.selectionStart = input.selectionEnd = input.value.length;
+  input.scrollTop = input.scrollHeight;
+  // A recalled `/command` must not reopen the autocomplete: it would swallow
+  // the next Up press and strand the walk.
+  hideAutocomplete();
+  return true;
 }
 
 // -- composer ---------------------------------------------------------------
@@ -611,6 +695,7 @@ function send() {
     return;
   }
   socket.send({ type: 'send_message', agent_id: state.agent.id, text });
+  rememberInput(text);
   // The CLI queues messages received during a turn (F6); show that.
   if (state.agent.status === 'working' || state.agent.status === 'awaiting_approval') {
     state.queued.push({ text });
@@ -636,6 +721,9 @@ async function main() {
   const data = await api(`/api/agents/${encodeURIComponent(slug)}`);
   state.agent = data.agent;
   state.commands = data.agent.commands || [];
+  // Oldest first, as the walk indexes it. Read from the event log, so a phone
+  // opening this page recalls what was typed on the laptop.
+  state.history = data.input_history || [];
   for (const request of data.agent.pending_permissions || []) {
     state.pending.set(request.request_id, request);
   }
@@ -661,7 +749,13 @@ async function main() {
   $('agent-mode').onchange = (event) => changeMode(event.target.value);
   $('send').onclick = send;
   $('load-earlier').onclick = () => loadEarlier().catch((e) => toast(e.message, 'error'));
-  $('input').addEventListener('input', updateAutocomplete);
+  $('input').addEventListener('input', () => {
+    updateAutocomplete();
+    // Typing over a recalled message keeps the change at that position for as
+    // long as the walk lasts. Programmatic writes do not fire `input`, so this
+    // only ever records what a person typed.
+    if (state.historyAt !== null) state.historyEdits.set(state.historyAt, $('input').value);
+  });
   $('input').addEventListener('keydown', (event) => {
     const box = $('autocomplete');
     if (!box.classList.contains('hidden') && state.acItems.length) {
@@ -683,7 +777,18 @@ async function main() {
         return;
       }
       if (event.key === 'Escape') {
-        box.classList.add('hidden');
+        hideAutocomplete();
+        return;
+      }
+    }
+    // Shell-style recall, once the autocomplete above has had its say. The
+    // modifiers are left alone: Cmd/Alt+Up are the browser's own jumps to the
+    // top of the text, and Shift+Up is a selection.
+    const plain = !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
+    if (plain && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+      const up = event.key === 'ArrowUp';
+      if (caretLine($('input'), up ? 'first' : 'last') && recall(up ? -1 : 1)) {
+        event.preventDefault();
         return;
       }
     }

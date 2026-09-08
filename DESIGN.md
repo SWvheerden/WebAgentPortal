@@ -677,6 +677,7 @@ GET  /agent/:slug               detail view
 GET  /api/repos                 scan + recency ordering
 POST /api/repos/clone           clone into a root
 GET  /api/agents                registry
+GET  /api/agents/:id            one agent, plus its composer history
 POST /api/agents                spawn
 POST /api/agents/:id/{interrupt|stop|resume|rename}
 DEL  /api/agents/:id            with ?force=
@@ -811,6 +812,46 @@ somewhere else is never swallowed by a noisy one, and the table of paths is capp
 Typing `/` opens an autocomplete fed by the `initialize` command list (F9): name,
 description, argument hint. Built-in TUI commands are absent from that list, and the CLI
 refuses them if typed anyway (F16).
+
+### Recalling what was sent
+Driving an agent means saying nearly the same thing over and over — *run the tests*, *now fix
+the failure*, *keep going* — and retyping it is the sort of friction that makes the portal
+feel worse than a terminal. So the composer has a shell's history: **↑ walks back through
+what you have sent this agent, ↓ walks forward again.**
+
+**The event log is the history.** A message typed into the composer is persisted as a `user`
+event whose content is a bare string, while the `user` lines the CLI writes back for tool
+results carry an array of blocks — that difference is the entire filter, and no second table
+is needed. It also means the history is the *agent's*, not the browser's: a phone opening
+the page recalls what the laptop typed, and a page reloaded across a server restart still
+has it. The last 50 distinct messages travel with the detail payload, and the page keeps
+that list up to date as it sends rather than refetching it.
+
+Two things are left out. Blank messages, and any single message over 10 KB — a pasted stack
+trace is not something anyone walks back to with the arrow keys, and truncating it would
+hand back something that is *not* what was sent, to a feature whose whole purpose is sending
+it again. Repeats collapse to one entry at their newest position: an agent told *yes* forty
+times should not cost forty presses to walk past.
+
+**The arrows still belong to the caret.** ↑ recalls only when the caret is on the first line
+and ↓ only when it is on the last, so a multi-line message is still navigable. Logical lines,
+not wrapped ones — a browser will not say where a soft wrap put the caret, and guessing wrong
+would strand the caret mid-message. Because the caret lands at the *end* of a recalled
+message, walking further back through a multi-line entry takes a press per line first; that
+is the property that makes repeated ↑ eventually reach every entry rather than sticking.
+Cmd/Alt/Shift+↑ are left alone: those are the browser's own jumps and selections.
+
+**Editing a recalled message keeps the edit at its position**, as a shell does, and the draft
+that was in the box when the walk started is stashed at the far end of it. So opening the
+history never costs an unsent message, and tweaking a recalled one then walking on does not
+throw the tweak away — which is the case the whole feature exists for, since the message you
+want is usually *nearly* the last one. Sending clears both.
+
+The autocomplete gets the arrow keys first while it is open, and a recalled `/command` closes
+it explicitly: left open it would swallow the next ↑ and strand the walk.
+
+Phones have no arrow keys, so this is a keyboard affordance only. Nothing else is offered
+there yet.
 
 ### Message queueing
 The input stays live while `Working`; messages queue natively (F6) and render greyed with

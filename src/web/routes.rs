@@ -778,8 +778,19 @@ async fn get_agent(
     AxPath(id): AxPath<String>,
 ) -> ApiResult<Json<Value>> {
     let record = resolve(&state, &id).await?;
+    // The composer's recall list (§7). It rides on the detail payload rather
+    // than the agent view because only this page wants it: the dashboard
+    // renders the same view for every agent at once, and would pay for a
+    // history query per card to show none of them.
+    let agent_id = record.id.clone();
+    let history = state
+        .sup
+        .db()
+        .run(move |db| db.recent_user_inputs(&agent_id))
+        .await
+        .map_err(ApiError::from)?;
     let view = state.sup.view(record).await?;
-    Ok(Json(json!({ "agent": view })))
+    Ok(Json(json!({ "agent": view, "input_history": history })))
 }
 
 /// Accept either an id or a slug, so `/agent/<slug>` pages can use one path.
@@ -1624,6 +1635,71 @@ mod tests {
         .expect("parse");
         assert_eq!(on_disk.bind, crate::config::DEFAULT_BIND);
         assert!(on_disk.remote_control, "and it survives the round trip");
+    }
+
+    #[tokio::test]
+    async fn the_detail_payload_carries_the_composer_history() {
+        use tower::ServiceExt;
+        let state = test_state().await;
+        let record = {
+            let db = state.sup.db().clone();
+            db.run(|db| {
+                let record = crate::db::AgentRecord {
+                    id: "agent-1".to_string(),
+                    name: "Fix the parser".to_string(),
+                    slug: "fix_the_parser".to_string(),
+                    repo_path: "/repos/thing".to_string(),
+                    work_path: "/repos/thing".to_string(),
+                    is_git: false,
+                    branch: None,
+                    base_ref: None,
+                    uses_worktree: false,
+                    branch_is_new: false,
+                    permission_mode: crate::agent::state::PermissionMode::Ask,
+                    model: None,
+                    effort: None,
+                    max_budget_usd: None,
+                    add_dirs: Vec::new(),
+                    status: crate::agent::state::Status::Stopped,
+                    status_detail: None,
+                    exit_code: None,
+                    last_stderr: None,
+                    cost_usd: 0.0,
+                    created_at: 1,
+                    last_active_at: 1,
+                };
+                db.insert_agent(&record)?;
+                for text in ["run the tests", "now fix the failure"] {
+                    db.append_event(
+                        &record.id,
+                        crate::agent::protocol::EventKind::User,
+                        &json!({"type": "user", "message": {"role": "user", "content": text}}),
+                    )?;
+                }
+                Ok(record)
+            })
+            .await
+            .expect("seed")
+        };
+
+        let mut request = api_request(&format!("/api/agents/{}", record.slug))
+            .header(TOKEN_HEADER, TEST_TOKEN)
+            .body(axum::body::Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(
+            LOOPBACK_PEER.parse::<SocketAddr>().expect("peer"),
+        ));
+        let response = router(state).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        // Oldest first, which is the order the composer walks backwards through.
+        assert_eq!(
+            body["input_history"],
+            json!(["run the tests", "now fix the failure"])
+        );
     }
 
     /// "Open the link claude-web printed when it started" is useless advice on

@@ -103,6 +103,16 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// How many of the operator's own messages [`Db::recent_user_inputs`] offers
+/// back for recall. Deep enough to cover a session's worth of repeated
+/// instructions, short enough to travel with the agent's detail payload.
+const INPUT_HISTORY: i64 = 50;
+
+/// Entries longer than this are left out of the recall list rather than
+/// truncated: a pasted stack trace is not something anyone walks back to with
+/// the arrow keys, and it would dominate the payload if it were.
+const MAX_INPUT_HISTORY_BYTES: usize = 10_000;
+
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -458,6 +468,53 @@ impl Db {
     /// `window` events. Same `seq > ?` query either way (§7).
     pub fn tail_cursor(&self, agent_id: &str, window: i64) -> Result<i64> {
         Ok((self.max_seq(agent_id)? - window).max(0))
+    }
+
+    /// The operator's own recent messages to one agent, oldest last.
+    ///
+    /// No new table: the event log already holds them. A message typed into the
+    /// composer is persisted as a `user` event whose content is a bare string,
+    /// while the `user` lines the CLI writes back for tool results carry an
+    /// array of blocks — that difference is the entire filter. Reading it from
+    /// the log rather than the browser also means the history a phone opens is
+    /// the history the laptop typed (§7).
+    ///
+    /// Newest first, deduplicated, oldest last on the way out.
+    pub fn recent_user_inputs(&self, agent_id: &str) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT json_extract(payload, '$.message.content') FROM events
+                 WHERE agent_id = ?1 AND kind = 'user'
+                   AND json_valid(payload)
+                   AND json_type(payload, '$.message.content') = 'text'
+                 ORDER BY seq DESC LIMIT ?2",
+            )?;
+            // Deduplication only ever shortens the answer, so the scan reaches
+            // past the cap: an agent told "yes" forty times still offers more
+            // than one entry to recall.
+            let rows = stmt.query_map(params![agent_id, INPUT_HISTORY * 4], |r| {
+                r.get::<_, Option<String>>(0)
+            })?;
+            let mut out: Vec<String> = Vec::new();
+            for row in rows {
+                let Some(text) = row? else { continue };
+                // Truncating an entry would hand back a message that is not the
+                // one that was sent, and the recall walk exists to send it
+                // again. Something this large is dropped instead.
+                if text.trim().is_empty() || text.len() > MAX_INPUT_HISTORY_BYTES {
+                    continue;
+                }
+                if out.contains(&text) {
+                    continue;
+                }
+                out.push(text);
+                if out.len() as i64 >= INPUT_HISTORY {
+                    break;
+                }
+            }
+            out.reverse();
+            Ok(out)
+        })
     }
 
     /// Permission requests with no matching decision, per agent.
@@ -923,6 +980,72 @@ mod tests {
 
         // Fewer events than the window: start from the beginning.
         assert_eq!(db.tail_cursor("a", 500).expect("cursor"), 0);
+    }
+
+    /// A message typed into the composer, as `send_user_message` persists it.
+    fn typed(text: &str) -> Value {
+        json!({"type": "user", "message": {"role": "user", "content": text}})
+    }
+
+    #[test]
+    fn input_history_holds_only_what_the_operator_typed() {
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&sample_agent("a", "a")).expect("insert");
+        db.append_event("a", EventKind::User, &typed("first"))
+            .expect("append");
+        // The CLI's own `user` line for a tool result: same kind, blocks rather
+        // than a string, and nobody ever typed it.
+        db.append_event(
+            "a",
+            EventKind::User,
+            &json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+            ]}}),
+        )
+        .expect("append");
+        db.append_event("a", EventKind::Assistant, &json!({"i": 1}))
+            .expect("append");
+        db.append_event("a", EventKind::User, &typed("second"))
+            .expect("append");
+        // Blank and oversized entries are no use to a recall walk.
+        db.append_event("a", EventKind::User, &typed("   "))
+            .expect("append");
+        db.append_event("a", EventKind::User, &typed(&"x".repeat(20_000)))
+            .expect("append");
+
+        assert_eq!(
+            db.recent_user_inputs("a").expect("history"),
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn input_history_deduplicates_and_caps() {
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&sample_agent("a", "a")).expect("insert");
+        db.insert_agent(&sample_agent("b", "b")).expect("insert");
+        for i in 1..=80 {
+            db.append_event("a", EventKind::User, &typed(&format!("msg {i}")))
+                .expect("append");
+            // Said over and over, it is still worth exactly one entry.
+            db.append_event("a", EventKind::User, &typed("yes"))
+                .expect("append");
+        }
+        db.append_event("b", EventKind::User, &typed("someone else's"))
+            .expect("append");
+
+        let history = db.recent_user_inputs("a").expect("history");
+        assert_eq!(history.len(), INPUT_HISTORY as usize);
+        // Oldest first, newest last, one "yes".
+        assert_eq!(history.last().expect("last"), "yes");
+        assert_eq!(history.iter().filter(|t| *t == "yes").count(), 1);
+        assert_eq!(history[history.len() - 2], "msg 80");
+        assert!(!history.iter().any(|t| t == "someone else's"));
+
+        assert_eq!(
+            db.recent_user_inputs("b").expect("history"),
+            vec!["someone else's".to_string()]
+        );
     }
 
     #[test]
