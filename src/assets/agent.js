@@ -1,5 +1,5 @@
 // Agent detail: transcript, approvals, composer, slash commands.
-import { api, el, statusEl, fmtCost, setAttention, setTitle, Socket, toast } from '/assets/common.js';
+import { api, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
@@ -507,6 +507,31 @@ function isRunning() {
   return !!agent && agent.status !== 'stopped' && agent.status !== 'failed';
 }
 
+// What the spawn had to say, shown once on arrival (§6).
+//
+// A warnbox rather than a toast: the operator got here by spawning, and what
+// this says — that the agent can reach other agents' worktrees, or that the
+// soft cap was passed — is worth reading after the first three seconds. It is
+// removed from the store as it is read, so a reload does not re-raise a warning
+// about a spawn that happened an hour ago; a dismiss button clears it for good.
+function renderSpawnWarning() {
+  const host = $('spawn-warning');
+  if (!host) return;
+  const text = takeSpawnWarning(slug);
+  if (!text) return;
+  host.replaceChildren(
+    el('div', { class: 'warnbox small' }, [
+      el('span', { text }),
+      ' ',
+      el('button', {
+        class: 'small',
+        text: 'Dismiss',
+        onclick: () => host.replaceChildren(),
+      }),
+    ]),
+  );
+}
+
 function renderHeader() {
   const agent = state.agent;
   if (!agent) return;
@@ -732,6 +757,7 @@ async function main() {
     state.pending.set(request.request_id, request);
   }
   renderHeader();
+  renderSpawnWarning();
   renderApprovals();
 
   $('btn-interrupt').onclick = () => socket.send({ type: 'interrupt', agent_id: state.agent.id });

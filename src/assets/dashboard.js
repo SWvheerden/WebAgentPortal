@@ -1,6 +1,6 @@
 // Dashboard: the agent registry, account usage, notes, the spawn form, cloning
 // and settings.
-import { api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, toast } from '/assets/common.js';
+import { api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast } from '/assets/common.js';
 
 const state = {
   agents: new Map(),
@@ -718,7 +718,10 @@ async function spawn() {
   button.disabled = true;
   try {
     const data = await api('/api/agents', { method: 'POST', body: JSON.stringify(body) });
-    if (data.warning) toast(data.warning, 'warn');
+    // Not a toast: the navigation below tears this document down before one
+    // could be read. It is handed to the agent page, which shows it as a
+    // warnbox that stays.
+    stashSpawnWarning(data.agent.slug, data.warning);
     $('first-message').value = '';
     location.href = `/agent/${data.agent.slug}`;
   } catch (err) {

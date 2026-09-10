@@ -467,21 +467,32 @@ impl Supervisor {
         }
         // A root agent's cwd contains `<root>/.worktrees`, so it can reach the
         // in-flight checkouts of every other agent in that root (§6, "What a
-        // root agent can reach"). The operator is told at the moment it
-        // matters, naming the agents actually at risk — the scanner skips
+        // root agent can reach"). Named here because the scanner skips
         // dot-directories, so this is otherwise invisible.
+        //
+        // Returned to the caller only, never broadcast. `Notice` is not
+        // subscription-filtered, so broadcasting would toast this at every open
+        // socket — including clients watching an unrelated agent — while the
+        // one operator who needs it navigates away before the toast is read.
+        // The spawn response carries it to the agent page instead, which shows
+        // it as a warnbox that stays put.
         if record.is_root {
-            let agents = self.db.run(|db| db.list_agents()).await.unwrap_or_default();
-            let neighbours = worktrees_under_root(&repo_path, &agents, &record.id);
+            let neighbours = match self.db.run(|db| db.list_agents()).await {
+                Ok(agents) => worktrees_under_root(&repo_path, &agents, &record.id),
+                Err(err) => {
+                    // A safety warning that cannot be computed must not read as
+                    // "there is nothing to warn about".
+                    tracing::warn!(
+                        agent = %record.slug,
+                        ?err,
+                        "could not check for other agents' worktrees under the root; \
+                         spawning without that warning"
+                    );
+                    Vec::new()
+                }
+            };
             if let Some(text) = root_worktree_warning(&record.repo_path, &neighbours) {
-                warnings.push(text.clone());
-                // Broadcast as well as returned: the spawning page navigates
-                // straight to the agent view, where the toast is what is left.
-                self.broadcast(ServerMsg::Notice {
-                    agent_id: Some(record.id.clone()),
-                    level: "warn".to_string(),
-                    text,
-                });
+                warnings.push(text);
             }
         }
         let warning = (!warnings.is_empty()).then(|| warnings.join(" "));
@@ -1116,10 +1127,14 @@ fn prepare_workspace(
         // The one git question a root spawn does ask, and it reads config files
         // only. A root that is itself a working tree can declare a
         // command-valued key we cannot disarm, and the agent's CLI runs git in
-        // its cwd the moment it starts — so a root that refuses inspection is
-        // refused a spawn too, exactly as a repository under it would be (§7).
-        // Without this the guard is never built for a root and never fires.
-        git::RepoGuard::read(repo_path).check(repo_path)?;
+        // its cwd the moment it starts — so a root that declares one is refused
+        // a spawn, exactly as a repository under it would be (§7). Without this
+        // the guard is never built for a root and never fires.
+        //
+        // Only the declared commands, though: we run no git here ourselves, and
+        // a config git will not open is one git will not honour for the child
+        // either. See [`git::RepoGuard::check_declared_commands`].
+        git::RepoGuard::read(repo_path).check_declared_commands(repo_path)?;
         let slug = git::unique_name(&git::slugify(task_name), |c| taken_slugs.contains(c));
         return Ok(Prepared {
             slug,
@@ -3189,6 +3204,35 @@ mod tests {
         assert!(text.contains("sometool"), "{text}");
     }
 
+    /// `is_git_repo` is only "`.git` exists", so a directory git will not open
+    /// reaches the guard and fails the config read. That is not a directory
+    /// that runs commands, and it stays spawnable: before the guard reached
+    /// roots at all, a root spawn ran zero git and this worked.
+    #[test]
+    fn a_root_whose_git_cannot_be_opened_is_still_spawnable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // Enough for `is_git_repo`, not enough for git — the shape a submodule
+        // checkout moved out of its superproject leaves behind.
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir");
+        assert!(
+            git::RepoGuard::read(root).unreadable.is_some(),
+            "the fixture must actually trip the config read"
+        );
+
+        let prepared = prepare_workspace(
+            root,
+            "Sweep",
+            "sw_",
+            &HashSet::new(),
+            &spawn_req(root),
+            SpawnTarget::Root,
+        )
+        .expect("an unreadable config is not a refusal for a root");
+        assert!(prepared.is_root);
+        assert!(!prepared.is_git);
+    }
+
     /// And the vet costs a plain root nothing it would not already pay: a root
     /// with no `.git` is spawnable as before.
     #[test]
@@ -3270,46 +3314,78 @@ mod tests {
     }
 
     /// End to end: spawning on a root while another agent holds a worktree
-    /// under it warns, and both the returned warning and the broadcast Notice
-    /// carry it.
+    /// under it warns — on the spawn response, which is what reaches the
+    /// operator, and *not* as a broadcast that would toast at every open
+    /// socket including clients watching an unrelated agent.
     #[tokio::test]
     async fn a_root_spawn_warns_about_other_agents_worktrees() {
         let Some((dir, repo)) = repo_with_a_spare_branch() else {
             return;
         };
+        // A binary that launches and exits at once: the spawn has to succeed
+        // for its `SpawnOutcome` to be readable, and nothing here needs the
+        // child to say anything.
+        let bin = Path::new("/usr/bin/true");
+        if !bin.exists() {
+            return;
+        }
         let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
         let cfg = Config {
             repo_roots: vec![root.to_string_lossy().to_string()],
-            claude_bin: "claude-web-no-such-binary".to_string(),
+            claude_bin: bin.to_string_lossy().to_string(),
             ..Config::default()
         };
         let db = Db::open_in_memory().expect("db");
         let sup = Supervisor::new(db, Arc::new(RwLock::new(cfg)));
 
-        // A neighbour with a real worktree under the root. Its launch fails
-        // (there is no such binary), but the record and the worktree are made
-        // before the child is started, which is all this needs.
-        assert!(sup.spawn_agent(spawn_req(&repo)).await.is_err());
-        let existing = sup.db().run(|db| db.list_agents()).await.expect("list");
-        assert_eq!(existing.len(), 1);
-        assert!(existing[0].uses_worktree);
+        // A neighbour, with a real worktree under the root.
+        let neighbour = sup.spawn_agent(spawn_req(&repo)).await.expect("neighbour");
+        assert!(neighbour.agent.uses_worktree);
+        assert_eq!(
+            neighbour.warning, None,
+            "an ordinary repo spawn has nothing to say"
+        );
 
         let mut events = sup.subscribe();
-        let outcome = sup.spawn_agent(spawn_req(&root)).await;
-        // The launch fails (no such binary), so read the warning off the
-        // broadcast, which is emitted before the child is started.
-        assert!(outcome.is_err(), "the fake binary cannot launch");
-        let mut notice = None;
+        let outcome = sup.spawn_agent(spawn_req(&root)).await.expect("root agent");
+        assert!(outcome.agent.is_root);
+        let warning = outcome.warning.expect("a warning about the neighbour");
+        assert!(warning.contains(".worktrees"), "{warning}");
+        assert!(warning.contains(&neighbour.agent.slug), "{warning}");
+
+        // Nothing about it went out over the bus.
         while let Ok(msg) = events.try_recv() {
-            if let ServerMsg::Notice { text, level, .. } = msg {
-                assert_eq!(level, "warn");
-                notice = Some(text);
-                break;
+            if let ServerMsg::Notice { text, .. } = msg {
+                assert!(
+                    !text.contains(".worktrees"),
+                    "the worktree warning must not be broadcast: {text}"
+                );
             }
         }
-        let notice = notice.expect("a notice about the neighbour's worktree");
-        assert!(notice.contains(".worktrees"), "{notice}");
-        assert!(notice.contains(&existing[0].slug), "{notice}");
+    }
+
+    /// And a root with the place to itself says nothing, so the warning stays
+    /// worth reading.
+    #[tokio::test]
+    async fn a_root_spawn_alone_under_its_root_warns_about_nothing() {
+        let bin = Path::new("/usr/bin/true");
+        if !bin.exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        let cfg = Config {
+            repo_roots: vec![root.to_string_lossy().to_string()],
+            claude_bin: bin.to_string_lossy().to_string(),
+            ..Config::default()
+        };
+        let sup = Supervisor::new(
+            Db::open_in_memory().expect("db"),
+            Arc::new(RwLock::new(cfg)),
+        );
+        let outcome = sup.spawn_agent(spawn_req(&root)).await.expect("root agent");
+        assert!(outcome.agent.is_root);
+        assert_eq!(outcome.warning, None);
     }
 
     /// Slugs are allocated from the same pool whatever the target, so two root

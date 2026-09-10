@@ -1708,8 +1708,12 @@ mod tests {
     #[tokio::test]
     async fn the_branch_endpoint_reports_a_root_as_rootless() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // The root is itself a checkout, which must not change the answer.
-        std::fs::create_dir_all(dir.path().join(".git")).expect("mkdir");
+        // The root is itself a checkout, which must not change the answer. A
+        // real one: a bare `.git` directory is enough for `is_git_repo` but not
+        // for git, and would exercise the unreadable-config path instead.
+        if crate::repo::git::git(dir.path(), &["init", "-q", "-b", "main", "."]).is_err() {
+            return;
+        }
         let state = test_state().await;
         let root = dir.path().to_string_lossy().to_string();
         state
@@ -1726,6 +1730,15 @@ mod tests {
         assert_eq!(body["dirty"], json!(false));
         assert_eq!(body["current"], Value::Null);
         assert_eq!(body["branches"], json!([]));
+
+        // And the picker agrees: a real repository as a root declares nothing
+        // that runs, so it is offered rather than badged "not inspected".
+        let listing = crate::repo::scan::scan_roots(
+            &[dir.path().to_path_buf()],
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(listing.roots.len(), 1);
+        assert_eq!(listing.roots[0].refused, None);
     }
 
     #[tokio::test]

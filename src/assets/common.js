@@ -398,3 +398,39 @@ export function toast(text, level = 'info') {
   host.append(node);
   setTimeout(() => node.remove(), level === 'error' ? 12000 : 6000);
 }
+
+// -- the spawn warning, handed from the form to the agent page ---------------
+//
+// A spawn can come back with something the operator has to read — the soft cap,
+// or the worktrees a root agent can reach (§6). It cannot be a toast on the
+// dashboard: `spawn()` navigates to the agent view on the very next line, and
+// the toast dies with the document milliseconds later. It cannot be a broadcast
+// either — `Notice` is not subscription-filtered, so it would toast at every
+// open socket, including clients watching an unrelated agent.
+//
+// So it travels in sessionStorage, which is scoped to this tab and survives the
+// navigation, and the agent page renders it once as a warnbox that stays put.
+// Read-and-remove, so a reload does not re-raise a warning about a spawn that
+// happened an hour ago.
+const SPAWN_WARNING_PREFIX = 'claude-web-spawn-warning:';
+
+export function stashSpawnWarning(slug, text) {
+  if (!slug || !text) return;
+  try {
+    sessionStorage.setItem(SPAWN_WARNING_PREFIX + slug, text);
+  } catch {
+    // A full or disabled store costs us the warning, not the spawn.
+  }
+}
+
+export function takeSpawnWarning(slug) {
+  if (!slug) return null;
+  try {
+    const key = SPAWN_WARNING_PREFIX + slug;
+    const text = sessionStorage.getItem(key);
+    if (text) sessionStorage.removeItem(key);
+    return text;
+  } catch {
+    return null;
+  }
+}

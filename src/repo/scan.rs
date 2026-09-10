@@ -112,8 +112,12 @@ fn root_entry(root: &Path, usage: &HashMap<String, i64>) -> RepoEntry {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.clone());
     // Free for a plain root: the guard short-circuits when there is no `.git`.
+    // Declared commands only — a config git will not read is not a config that
+    // runs, and refusing on it would make a moved submodule checkout or a root
+    // on a shared mount permanently unspawnable for a reason that is not true
+    // of it.
     let refused = git::RepoGuard::read(root)
-        .check(root)
+        .check_declared_commands(root)
         .err()
         .map(|err| format!("{err}"));
     RepoEntry {
@@ -352,11 +356,37 @@ mod tests {
     #[test]
     fn a_git_root_is_still_reported_as_rootless() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join(".git")).expect("mkdir");
+        // A *real* repository: a bare `.git` directory is enough for
+        // `is_git_repo` but not for git, which would send this down the
+        // unreadable-config path and test something else entirely.
+        if git::git(dir.path(), &["init", "-q", "-b", "main", "."]).is_err() {
+            return;
+        }
         let listing = scan_roots(&[dir.path().to_path_buf()], &HashMap::new());
         assert_eq!(listing.roots.len(), 1);
         assert!(!listing.roots[0].is_git);
         assert!(listing.roots[0].is_root);
+        assert_eq!(
+            listing.roots[0].refused, None,
+            "an ordinary repository declares nothing that runs"
+        );
+    }
+
+    /// `is_git_repo` is only "`.git` exists", so a directory git will not open
+    /// reaches the guard and fails the config read. That is not a repository
+    /// that runs commands, and it must not be badged as one: it was spawnable
+    /// before the guard reached roots at all, and it stays spawnable.
+    #[test]
+    fn a_root_whose_git_cannot_be_opened_is_not_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".git")).expect("mkdir");
+        let listing = scan_roots(&[dir.path().to_path_buf()], &HashMap::new());
+        assert_eq!(listing.roots.len(), 1);
+        assert!(listing.roots[0].is_root);
+        assert_eq!(
+            listing.roots[0].refused, None,
+            "\"we could not look\" is not \"it declares a command\""
+        );
     }
 
     /// A root that declares a command we cannot disarm is badged rather than

@@ -349,6 +349,17 @@ pub struct RepoGuard {
     /// Keys that execute something and that blanking would not disarm. A
     /// repository declaring one of these is not touched at all.
     pub refusals: Vec<String>,
+    /// Git would not open this repository, so its configuration could not be
+    /// read. Kept apart from [`RepoGuard::refusals`] because it is a different
+    /// finding with a different remedy: "we could not look" is not "it declares
+    /// a command", and telling the operator to remove keys from a config git
+    /// itself will not read sends them after a fault that is not there.
+    ///
+    /// A `.git` that exists is enough for [`is_git_repo`], so this is reachable
+    /// without anything hostile: a submodule checkout moved out of its
+    /// superproject, or a root on a shared mount that trips
+    /// `safe.directory`.
+    pub unreadable: Option<String>,
 }
 
 impl RepoGuard {
@@ -387,11 +398,14 @@ impl RepoGuard {
             Ok(listing) => listing,
             Err(err) => {
                 // A repository whose config git will not read is one we cannot
-                // vet. Running it under the fixed list alone is the fail-open
-                // case this guard exists to remove.
+                // vet. Running git in it under the fixed list alone is the
+                // fail-open case this guard exists to remove — see
+                // [`RepoGuard::check`] — but it is recorded as its own finding,
+                // not as a declared command.
                 return Self {
                     overrides: Vec::new(),
-                    refusals: vec![format!("its git config could not be read ({err})")],
+                    refusals: Vec::new(),
+                    unreadable: Some(format!("{err}")),
                 };
             }
         };
@@ -463,10 +477,36 @@ impl RepoGuard {
         args
     }
 
-    /// Refuse to touch a repository whose config runs something we cannot
-    /// disarm. Failing closed is the point: the operator is told which key,
-    /// rather than the command being run on their behalf.
+    /// The check for a caller that is about to run git here.
+    ///
+    /// Fails closed on both findings. A repository we could not vet is one we
+    /// do not run commands in: under the fixed `SAFE_CONFIG` list alone we
+    /// would be guessing, which is the fail-open case this guard exists to
+    /// remove.
     pub fn check(&self, repo: &Path) -> Result<()> {
+        self.check_declared_commands(repo)?;
+        if let Some(err) = &self.unreadable {
+            bail!(
+                "{} has a .git that git will not open ({err}), so its configuration could not \
+                 be vetted and claude-web will not run git in it.",
+                repo.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// The narrower check for a caller that will run no git of its own, and
+    /// only needs to know whether *entering the directory* sets something off.
+    ///
+    /// An unreadable configuration is deliberately not disqualifying here, and
+    /// the asymmetry is the whole point: this guard exists because a child
+    /// process starting in the directory will run git there. If git will not
+    /// open the repository for us it will not honour its keys for the child
+    /// either, so an unreadable config is precisely the case where nothing
+    /// executes. Failing closed on it would make a moved submodule checkout, or
+    /// a root on a shared mount, permanently unusable for a reason that does
+    /// not apply to it (§6, §7).
+    pub fn check_declared_commands(&self, repo: &Path) -> Result<()> {
         if self.refusals.is_empty() {
             return Ok(());
         }
@@ -1535,6 +1575,14 @@ mod tests {
         let err = git(&repo.path, &["status", "--porcelain"]).expect_err("must refuse");
         assert!(format!("{err:#}").contains("runs commands"), "{err:#}");
 
+        // And the narrow check refuses it too: this one really does run
+        // something, so a caller that merely starts a child here is no safer.
+        let narrow = guard
+            .check_declared_commands(&repo.path)
+            .expect_err("must refuse");
+        assert!(format!("{narrow:#}").contains("sometool"), "{narrow:#}");
+        assert_eq!(guard.unreadable, None, "the config was read fine");
+
         // The scanner reports it rather than running it.
         let meta = repo_metadata(&repo.path);
         assert!(meta.refused.is_some());
@@ -1639,9 +1687,23 @@ mod tests {
         .expect("write config");
 
         let guard = RepoGuard::read(&repo.path);
-        assert!(!guard.refusals.is_empty(), "{guard:?}");
+        assert!(guard.unreadable.is_some(), "{guard:?}");
+        assert!(
+            guard.refusals.is_empty(),
+            "an unreadable config declares nothing: {:?}",
+            guard.refusals
+        );
         let err = git(&repo.path, &["status", "--porcelain"]).expect_err("must refuse");
-        assert!(format!("{err:#}").contains("could not be read"), "{err:#}");
+        let text = format!("{err:#}");
+        assert!(text.contains("will not open"), "{text}");
+        assert!(
+            !text.contains("runs commands"),
+            "a config we could not read must not be reported as one that runs commands: {text}"
+        );
+
+        // And the narrow check — for a caller that runs no git of its own —
+        // lets it through, because git will not honour those keys either.
+        assert!(guard.check_declared_commands(&repo.path).is_ok());
 
         // A plain directory is not a repository and needs no guard at all.
         let plain = repo

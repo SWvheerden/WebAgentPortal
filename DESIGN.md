@@ -504,10 +504,24 @@ a working tree — one the operator added to `repo_roots` directly, or unpacked 
 somewhere — and declare a command-valued key we cannot disarm. The agent's own CLI runs git
 in its cwd the moment it starts, so *we* running no git is not the same as *no* git running,
 and the guard would otherwise never be built for a root at all. `RepoGuard::read` is
-therefore consulted in the picker and again at spawn: a refused root is badged
-"not inspected" and refused a spawn, exactly like a repository under one. `git config
---list` reads config files and no working tree, and short-circuits to nothing when there is
-no `.git`, so a plain root pays one existence check and the guarantee above stands.
+therefore consulted in the picker and again at spawn: a root that declares a command we
+cannot disarm is badged "not inspected" and refused a spawn, exactly like a repository under
+one. `git config --list` reads config files and no working tree, and short-circuits to
+nothing when there is no `.git`, so a plain root pays one existence check and the guarantee
+above stands.
+
+The root arm uses the *narrower* check, `check_declared_commands`, and the asymmetry is
+deliberate. `is_git_repo` is only "`.git` exists", so a directory git will not actually open
+— a submodule checkout moved out of its superproject, a root on a shared mount that trips
+`safe.directory` — reaches the guard and fails the `git config` read. For a repository under
+a root that is disqualifying and stays so: we go on to run git there ourselves, and §7 chose
+to fail closed rather than guess under `SAFE_CONFIG` alone. For a root it is not, because
+the vet exists only because the *child* runs git in its cwd — and a configuration git will
+not read for us is one git will not honour for the child either. Failing closed there would
+make such a root permanently unspawnable for a reason that is not true of it, and would tell
+the operator it "declares git config that runs commands" when it declares nothing of the
+kind. The two findings are kept apart on `RepoGuard` for exactly that reason, and the
+messages no longer share a sentence.
 
 Three rules make that predictable:
 
@@ -554,9 +568,17 @@ What we do instead, and what the operator therefore relies on:
 
 - The spawn form's warning names `.worktrees` and other agents' checkouts explicitly, so
   the reach is stated before the agent starts rather than discovered afterwards.
-- The spawn itself emits a **Notice** when other agents' worktrees exist under that root,
-  naming them and how many. It fires at the moment the risk becomes real, which a static
-  warning in a form cannot do.
+- The spawn **response** carries a warning when other agents' worktrees exist under that
+  root, naming them and how many — the concrete list a static form warning cannot give.
+
+  Deliberately *not* a broadcast `Notice`. `is_broadcast_wide` exempts everything except
+  `Event`/`Partial`/`Commands` from subscription filtering, so an `agent_id` on a `Notice`
+  does no routing: it would toast at every open socket, including a colleague watching an
+  unrelated agent, while the one operator who needs it is mid-navigation to the agent page
+  and would never read it. Instead the dashboard stashes the returned string in
+  `sessionStorage` (tab-scoped, survives the navigation) and the agent page renders it once,
+  on arrival, as a **warnbox that stays** rather than a toast that expires. Read-and-remove,
+  so a reload does not re-raise it.
 - There is **no interlock**. Nothing prevents the writes; the operator is informed and
   decides. Recorded here as an accepted limitation so it is a trade-off on the record and
   not an oversight, and so that a future decision to relocate `.worktrees` has this to
