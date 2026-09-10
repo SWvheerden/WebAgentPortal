@@ -355,12 +355,20 @@ impl Supervisor {
             .map(|d| crate::config::expand_tilde(d))
             .collect();
         let roots_for_check = roots.clone();
-        let (repo_path, add_dirs) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (repo_path, add_dirs, target) = tokio::task::spawn_blocking(move || -> Result<_> {
             let repo = crate::config::confine_to_roots(&requested, &roots_for_check)
                 .context("the repository")?;
             if !repo.is_dir() {
                 bail!("{} is not a directory", repo.display());
             }
+            // Pointing at a root itself is a rootless spawn (§6). Decided from
+            // the resolved path, so it is the same answer however the caller
+            // spelled it and whatever flags the request carried.
+            let target = if crate::config::is_configured_root(&repo, &roots_for_check) {
+                SpawnTarget::Root
+            } else {
+                SpawnTarget::Repo
+            };
             let mut dirs = Vec::with_capacity(extra.len());
             for dir in extra {
                 dirs.push(
@@ -370,7 +378,7 @@ impl Supervisor {
                         .to_string(),
                 );
             }
-            Ok((repo, dirs))
+            Ok((repo, dirs, target))
         })
         .await
         .context("path check panicked")??;
@@ -403,6 +411,7 @@ impl Supervisor {
                 &prefix,
                 &taken_slugs,
                 &req_for_prep,
+                target,
             )
         })
         .await
@@ -421,6 +430,7 @@ impl Supervisor {
             base_ref: prepared.base_ref,
             uses_worktree: prepared.uses_worktree,
             branch_is_new: prepared.branch_is_new,
+            is_root: prepared.is_root,
             permission_mode: req.permission_mode.unwrap_or(cfg.default_permission_mode),
             model: req
                 .model
@@ -969,6 +979,9 @@ impl std::fmt::Display for DeleteError {
 /// The safety check, with every failure mode folded into an unsafe report.
 ///
 /// A check that could not run must never read as "nothing would be lost".
+/// A rootless agent (§6) and a plain folder land in the same arm: neither has a
+/// branch, a worktree or a repository to ask, so there is nothing on disk that
+/// Delete would take away.
 async fn safety_for(record: &AgentRecord) -> git::SafetyReport {
     if !record.is_git {
         return git::SafetyReport {
@@ -1002,6 +1015,21 @@ struct Prepared {
     is_git: bool,
     uses_worktree: bool,
     branch_is_new: bool,
+    is_root: bool,
+}
+
+/// What the spawn was pointed at: one repository, or the folder they all sit in.
+///
+/// Derived from the resolved path rather than taken from the request — a client
+/// that could nominate either shape for any directory could ask for worktree
+/// work in a folder that is not a repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnTarget {
+    /// A directory under a configured root: the ordinary case.
+    Repo,
+    /// A configured root itself. The agent is tied to no repository, so no git
+    /// work is done for it at all (§6).
+    Root,
 }
 
 /// Blocking: allocate names and create the worktree or in-place branch.
@@ -1011,7 +1039,28 @@ fn prepare_workspace(
     prefix: &str,
     taken_slugs: &HashSet<String>,
     req: &SpawnRequest,
+    target: SpawnTarget,
 ) -> Result<Prepared> {
+    // A root is a container of repositories, not one of them. It gets the
+    // rootless workspace whatever it happens to contain: running git in it
+    // would either fail (a plain folder) or bind the agent to a repository the
+    // operator did not pick (a root that is itself a checkout). Every git
+    // option on the request is inert here, exactly as `no_branch` makes them
+    // inert — each one asks for the work this mode declines to do.
+    if target == SpawnTarget::Root {
+        let slug = git::unique_name(&git::slugify(task_name), |c| taken_slugs.contains(c));
+        return Ok(Prepared {
+            slug,
+            branch: None,
+            base_ref: None,
+            work_path: repo_path.to_path_buf(),
+            is_git: false,
+            uses_worktree: false,
+            branch_is_new: false,
+            is_root: true,
+        });
+    }
+
     let is_git = git::is_git_repo(repo_path);
     if !is_git {
         // Non-git folders spawn normally, with no branch. Never `git init` (§6).
@@ -1024,6 +1073,7 @@ fn prepare_workspace(
             is_git: false,
             uses_worktree: false,
             branch_is_new: false,
+            is_root: false,
         });
     }
 
@@ -1044,6 +1094,7 @@ fn prepare_workspace(
             is_git: true,
             uses_worktree: false,
             branch_is_new: false,
+            is_root: false,
         });
     }
 
@@ -1106,6 +1157,7 @@ fn prepare_workspace(
             is_git: true,
             uses_worktree: false,
             branch_is_new,
+            is_root: false,
         });
     }
 
@@ -1132,6 +1184,7 @@ fn prepare_workspace(
         is_git: true,
         uses_worktree: true,
         branch_is_new,
+        is_root: false,
     })
 }
 
@@ -1905,6 +1958,7 @@ mod tests {
             base_ref: None,
             uses_worktree: false,
             branch_is_new: true,
+            is_root: false,
             permission_mode: PermissionMode::Ask,
             model: None,
             effort: None,
@@ -2934,6 +2988,188 @@ mod tests {
         }
     }
 
+    /// The whole point of the mode: the agent runs in the folder every
+    /// repository sits in, and none of git's machinery is applied to it.
+    #[test]
+    fn a_root_spawn_touches_no_git_at_all() {
+        let Some((dir, repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let root = dir.path();
+        let before: HashSet<String> = git::list_branches(&repo).into_iter().collect();
+
+        let prepared = prepare_workspace(
+            root,
+            "Sweep every repo",
+            "sw_",
+            &HashSet::new(),
+            &spawn_req(root),
+            SpawnTarget::Root,
+        )
+        .expect("prepare");
+
+        assert!(prepared.is_root);
+        assert!(!prepared.is_git, "a root carries no repository identity");
+        assert!(!prepared.uses_worktree);
+        assert_eq!(prepared.branch, None);
+        assert_eq!(prepared.base_ref, None);
+        assert!(
+            !prepared.branch_is_new,
+            "there is no branch, so there is none to delete with the agent"
+        );
+        assert_eq!(prepared.work_path, root, "it works in the root itself");
+        assert_eq!(prepared.slug, "sweep_every_repo");
+        assert!(!root.join(".worktrees").exists(), "no worktree is made");
+        assert_eq!(
+            git::list_branches(&repo)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            before,
+            "no branch is created in any repository under the root"
+        );
+    }
+
+    /// Every git option on the request asks for exactly the work a root spawn
+    /// declines to do, so — as with `no_branch` (§6) — the mode wins over all
+    /// of them rather than half-honouring one.
+    #[test]
+    fn a_root_spawn_ignores_every_branch_option() {
+        let Some((dir, repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let root = dir.path();
+        let mut req = spawn_req(root);
+        req.in_place = true;
+        req.base_ref = Some("main".to_string());
+        req.existing_branch = Some("feature_login".to_string());
+        req.no_branch = true;
+
+        let prepared = prepare_workspace(
+            root,
+            "Sweep every repo",
+            "sw_",
+            &HashSet::new(),
+            &req,
+            SpawnTarget::Root,
+        )
+        .expect("a contradictory request is still spawnable as a root");
+        assert!(prepared.is_root);
+        assert_eq!(prepared.branch, None);
+        assert_eq!(prepared.base_ref, None);
+        assert!(!prepared.uses_worktree);
+        assert_eq!(
+            git::current_branch(&repo).as_deref(),
+            Some("main"),
+            "no checkout under the root was switched"
+        );
+    }
+
+    /// A root that happens to be a git repository is still a root. Reading its
+    /// branch would bind the agent to a repository the operator did not pick,
+    /// and would put a worktree beside the root rather than under it.
+    #[test]
+    fn a_root_that_is_itself_a_repository_is_still_rootless() {
+        let Some((_dir, repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let prepared = prepare_workspace(
+            &repo,
+            "Sweep",
+            "sw_",
+            &HashSet::new(),
+            &spawn_req(&repo),
+            SpawnTarget::Root,
+        )
+        .expect("prepare");
+        assert!(prepared.is_root);
+        assert!(!prepared.is_git);
+        assert!(!prepared.uses_worktree);
+        assert_eq!(prepared.branch, None);
+        assert_eq!(git::current_branch(&repo).as_deref(), Some("main"));
+    }
+
+    /// Slugs are allocated from the same pool whatever the target, so two root
+    /// agents with one task name do not collide.
+    #[test]
+    fn root_slugs_still_avoid_collisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let taken: HashSet<String> = ["sweep".to_string()].into_iter().collect();
+        let prepared = prepare_workspace(
+            dir.path(),
+            "Sweep",
+            "sw_",
+            &taken,
+            &spawn_req(dir.path()),
+            SpawnTarget::Root,
+        )
+        .expect("prepare");
+        assert_eq!(prepared.slug, "sweep_2");
+    }
+
+    /// The end-to-end wiring: what the operator picks is a path, and the
+    /// server decides from that path alone whether this is a root spawn. The
+    /// launch itself fails here (there is no such binary), which is fine — the
+    /// record is written before the child is started, and the record is what
+    /// this is about.
+    async fn spawn_and_read_back(root: &Path, target: &Path) -> AgentRecord {
+        let cfg = Config {
+            repo_roots: vec![root.to_string_lossy().to_string()],
+            claude_bin: "claude-web-no-such-binary".to_string(),
+            ..Config::default()
+        };
+        let db = Db::open_in_memory().expect("db");
+        let sup = Supervisor::new(db, Arc::new(RwLock::new(cfg)));
+        let _ = sup.spawn_agent(spawn_req(target)).await;
+        let agents = sup.db().run(|db| db.list_agents()).await.expect("list");
+        assert_eq!(agents.len(), 1, "the record is written before the launch");
+        agents.into_iter().next().expect("one agent")
+    }
+
+    #[tokio::test]
+    async fn spawning_on_the_root_path_records_a_rootless_agent() {
+        let Some((dir, _repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let record = spawn_and_read_back(dir.path(), dir.path()).await;
+        assert!(record.is_root);
+        assert!(!record.is_git);
+        assert!(!record.uses_worktree);
+        assert_eq!(record.branch, None);
+        assert_eq!(record.base_ref, None);
+        // The stored path is the canonical one, which on macOS is not the
+        // spelling the temp directory hands out.
+        let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        assert_eq!(record.work_path, canonical.to_string_lossy());
+        assert_eq!(record.repo_path, record.work_path);
+    }
+
+    /// The contrast: the same request against a repository *under* the root is
+    /// an ordinary spawn, so the root case cannot be reached by accident.
+    #[tokio::test]
+    async fn spawning_on_a_repo_under_the_root_is_not_rootless() {
+        let Some((dir, repo)) = repo_with_a_spare_branch() else {
+            return;
+        };
+        let record = spawn_and_read_back(dir.path(), &repo).await;
+        assert!(!record.is_root);
+        assert!(record.is_git);
+        assert!(record.uses_worktree);
+        assert_eq!(record.branch.as_deref(), Some("sw_fix_the_parser"));
+    }
+
+    /// Delete has nothing to take off disk for a rootless agent, and must not
+    /// read as "the check could not run".
+    #[tokio::test]
+    async fn deleting_a_root_agent_removes_no_worktree_and_no_branch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = agent_record("root-agent", dir.path());
+        record.is_root = true;
+        let report = safety_for(&record).await;
+        assert!(report.safe);
+        assert!(report.branch_empty_or_merged);
+        assert!(report.error.is_none(), "{:?}", report.error);
+    }
+
     #[test]
     fn a_new_branch_is_named_from_the_task_and_owned_by_the_agent() {
         let Some((_dir, repo)) = repo_with_a_spare_branch() else {
@@ -2945,6 +3181,7 @@ mod tests {
             "sw_",
             &HashSet::new(),
             &spawn_req(&repo),
+            SpawnTarget::Repo,
         )
         .expect("prepare");
         assert_eq!(prepared.branch.as_deref(), Some("sw_fix_the_parser"));
@@ -2963,8 +3200,15 @@ mod tests {
         };
         let mut req = spawn_req(&repo);
         req.existing_branch = Some("feature_login".to_string());
-        let prepared = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
-            .expect("prepare");
+        let prepared = prepare_workspace(
+            &repo,
+            "Fix the parser",
+            "sw_",
+            &HashSet::new(),
+            &req,
+            SpawnTarget::Repo,
+        )
+        .expect("prepare");
 
         assert_eq!(prepared.branch.as_deref(), Some("feature_login"));
         assert!(
@@ -2992,8 +3236,15 @@ mod tests {
         };
         let mut req = spawn_req(&repo);
         req.existing_branch = Some("invented".to_string());
-        let err = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
-            .expect_err("must refuse");
+        let err = prepare_workspace(
+            &repo,
+            "Fix the parser",
+            "sw_",
+            &HashSet::new(),
+            &req,
+            SpawnTarget::Repo,
+        )
+        .expect_err("must refuse");
         assert!(format!("{err:#}").contains("not a branch"), "{err:#}");
         assert_eq!(git::list_branches(&repo).len(), 2, "nothing may be created");
     }
@@ -3009,8 +3260,15 @@ mod tests {
         let mut req = spawn_req(&repo);
         req.existing_branch = Some("feature_login".to_string());
         req.base_ref = Some("main".to_string());
-        let prepared = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
-            .expect("prepare");
+        let prepared = prepare_workspace(
+            &repo,
+            "Fix the parser",
+            "sw_",
+            &HashSet::new(),
+            &req,
+            SpawnTarget::Repo,
+        )
+        .expect("prepare");
         assert_eq!(prepared.base_ref, None);
         assert_eq!(
             git::resolve_commit(&repo, "feature_login").expect("head after"),
@@ -3029,8 +3287,15 @@ mod tests {
         let before = git::list_branches(&repo);
         let mut req = spawn_req(&repo);
         req.no_branch = true;
-        let prepared = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
-            .expect("prepare");
+        let prepared = prepare_workspace(
+            &repo,
+            "Fix the parser",
+            "sw_",
+            &HashSet::new(),
+            &req,
+            SpawnTarget::Repo,
+        )
+        .expect("prepare");
 
         assert_eq!(prepared.work_path, repo);
         assert!(!prepared.uses_worktree);
@@ -3057,8 +3322,15 @@ mod tests {
         req.no_branch = true;
         req.existing_branch = Some("feature_login".to_string());
         req.base_ref = Some("feature_login".to_string());
-        let prepared = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
-            .expect("prepare");
+        let prepared = prepare_workspace(
+            &repo,
+            "Fix the parser",
+            "sw_",
+            &HashSet::new(),
+            &req,
+            SpawnTarget::Repo,
+        )
+        .expect("prepare");
 
         assert_eq!(
             prepared.branch.as_deref(),
@@ -3078,8 +3350,15 @@ mod tests {
         let mut req = spawn_req(&repo);
         req.existing_branch = Some("feature_login".to_string());
         req.in_place = true;
-        let prepared = prepare_workspace(&repo, "Fix the parser", "sw_", &HashSet::new(), &req)
-            .expect("prepare");
+        let prepared = prepare_workspace(
+            &repo,
+            "Fix the parser",
+            "sw_",
+            &HashSet::new(),
+            &req,
+            SpawnTarget::Repo,
+        )
+        .expect("prepare");
         assert!(!prepared.uses_worktree);
         assert_eq!(prepared.work_path, repo);
         assert_eq!(git::current_branch(&repo).as_deref(), Some("feature_login"));

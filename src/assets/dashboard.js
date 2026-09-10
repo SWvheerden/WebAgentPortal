@@ -5,7 +5,7 @@ import { api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, toas
 const state = {
   agents: new Map(),
   config: null,
-  repos: { recent: [], all: [], errors: [] },
+  repos: { roots: [], recent: [], all: [], errors: [] },
   selectedRepo: null,
   repoInfo: null,
   cloneId: null,
@@ -126,16 +126,23 @@ async function loadLimits() {
 function cardSignature(agent) {
   return JSON.stringify([
     agent.name, agent.slug, agent.status, agent.status_detail,
-    agent.repo_path, agent.is_git, agent.branch, agent.uses_worktree,
+    agent.repo_path, agent.is_git, agent.is_root, agent.branch, agent.uses_worktree,
     agent.permission_mode, fmtCost(agent.cost_usd), fmtAgo(agent.last_active_at),
     agent.status === 'failed' ? agent.last_stderr : null,
   ]);
 }
 
+// How the agent is attached to the filesystem, in one phrase. A root agent is
+// attached to no repository at all, which is a different thing from a folder
+// that merely has no VCS.
+function agentWhere(agent) {
+  if (agent.is_root) return 'whole folder · no repository';
+  if (!agent.is_git) return 'no VCS';
+  return `${agent.branch || 'detached'} · ${agent.uses_worktree ? 'worktree' : 'main checkout'}`;
+}
+
 function agentCard(agent, signature) {
-  const where = agent.is_git
-    ? `${agent.branch || 'detached'} · ${agent.uses_worktree ? 'worktree' : 'main checkout'}`
-    : 'no VCS';
+  const where = agentWhere(agent);
   const actions = el('div', { class: 'actions' });
   const running = agent.status !== 'stopped' && agent.status !== 'failed';
 
@@ -255,7 +262,10 @@ async function rename(agent) {
 }
 
 async function remove(agent) {
-  if (!confirm(`Delete "${agent.name}"? The branch is kept by default.`)) return;
+  // An agent with no branch — a plain folder or the whole root — has none to
+  // keep, so the promise is not made.
+  const keeps = agent.branch ? ' The branch is kept by default.' : '';
+  if (!confirm(`Delete "${agent.name}"?${keeps}`)) return;
   // A branch the agent did not create is not ours to destroy, so it is not
   // even offered — the server refuses it too.
   const deleteBranch = agent.branch && agent.branch_is_new !== false
@@ -494,8 +504,12 @@ async function removeNote(note) {
 // -- repo picker ------------------------------------------------------------
 
 function repoRow(repo) {
+  // A root is neither git nor plain: it is the folder the repositories sit in,
+  // and an agent spawned there is tied to none of them.
   const badges = [
-    el('span', { class: `badge ${repo.is_git ? 'git' : 'plain'}`, text: repo.is_git ? 'git' : 'plain' }),
+    repo.is_root
+      ? el('span', { class: 'badge plain', text: 'root', title: 'Every repository under this folder, and none in particular' })
+      : el('span', { class: `badge ${repo.is_git ? 'git' : 'plain'}`, text: repo.is_git ? 'git' : 'plain' }),
   ];
   if (repo.branch) badges.push(el('span', { class: 'badge', text: repo.branch }));
   if (repo.dirty) badges.push(el('span', { class: 'badge dirty', text: 'dirty' }));
@@ -521,6 +535,12 @@ function repoRow(repo) {
 function renderRepos() {
   const list = $('repo-list');
   list.replaceChildren();
+  // Offered first and always: the whole folder is a workspace in its own right,
+  // for an agent that has to touch several repositories or none.
+  if ((state.repos.roots || []).length) {
+    list.append(el('div', { class: 'group-label', text: 'Whole folder (no repository)' }));
+    for (const root of state.repos.roots) list.append(repoRow(root));
+  }
   if (state.repos.recent.length) {
     list.append(el('div', { class: 'group-label', text: 'Recent' }));
     for (const repo of state.repos.recent) list.append(repoRow(repo));
@@ -553,8 +573,9 @@ async function selectRepo(repo) {
     }
     if (info.current) base.value = info.current;
   } else {
-    base.append(el('option', { value: '', text: '(no VCS)' }));
-    existing.append(el('option', { value: '', text: '(no VCS)' }));
+    const label = info && info.is_root ? '(whole folder — no repository)' : '(no VCS)';
+    base.append(el('option', { value: '', text: label }));
+    existing.append(el('option', { value: '', text: label }));
   }
   renderBranchMode();
   renderSpawnWarnings(info);
@@ -570,7 +591,8 @@ async function selectRepo(repo) {
 // the Workspace control over and holds it there.
 function renderBranchMode() {
   const info = state.repoInfo;
-  const isGit = !!(info && info.is_git);
+  const isRoot = !!(info && info.is_root);
+  const isGit = !!(info && info.is_git) && !isRoot;
   const canReuse = isGit && !!info.branches.length;
   const source = $('branch-source');
   source.disabled = !isGit;
@@ -584,7 +606,14 @@ function renderBranchMode() {
 
   const isolation = $('isolation');
   if (untouched) isolation.value = 'in-place';
-  isolation.disabled = untouched;
+  // A root has no checkout to isolate from, so the control is held at the main
+  // checkout rather than left offering an option the spawn ignores.
+  if (isRoot) isolation.value = 'in-place';
+  isolation.disabled = untouched || isRoot;
+
+  // Nothing to fetch without a repository, so the button is disabled rather
+  // than left to fail against git.
+  $('fetch-btn').disabled = !isGit;
 }
 
 function renderSpawnWarnings(info) {
@@ -593,7 +622,7 @@ function renderSpawnWarnings(info) {
   if (!info) return;
   const source = $('branch-source').value;
   const inPlace = $('isolation').value === 'in-place';
-  if (source === 'none') {
+  if (!info.is_root && source === 'none') {
     host.append(el('div', {
       class: 'warnbox small',
       text: `No worktree and no new branch: the agent works directly in the main checkout on ${info.current || 'the current HEAD'}, so its changes land where you are working.`,
@@ -611,7 +640,12 @@ function renderSpawnWarnings(info) {
       text: 'Switching the main checkout to an existing branch with uncommitted changes: git will refuse if the switch would overwrite them.',
     }));
   }
-  if (!info.is_git) {
+  if (info.is_root) {
+    host.append(el('div', {
+      class: 'warnbox small',
+      text: 'The whole folder, not a repository. The agent starts in the root itself and can reach every repository under it — so no branch is created, no worktree is made, and nothing is checked out for you. Anything it changes lands in the checkouts you are working in.',
+    }));
+  } else if (!info.is_git) {
     host.append(el('div', {
       class: 'warnbox small',
       text: 'Not a git repository. The agent runs in place with no branch — nothing is ever git init-ed for you.',
@@ -623,6 +657,10 @@ function updateBranchPreview() {
   const prefix = state.config ? state.config.branch_prefix : 'sw_';
   const repo = state.selectedRepo;
   const name = $('task-name').value.trim();
+  if (repo && repo.is_root) {
+    $('branch-preview').value = '(whole folder — no branch)';
+    return;
+  }
   if (!repo || !repo.is_git) {
     $('branch-preview').value = repo ? '(no VCS — no branch)' : '';
     return;
@@ -647,19 +685,23 @@ async function loadRepos() {
 
 async function spawn() {
   if (!state.selectedRepo) {
-    toast('Pick a repository first', 'warn');
+    toast('Pick a repository, or the whole folder, first', 'warn');
     return;
   }
   const budget = parseFloat($('budget').value);
   const source = $('branch-source').value;
-  const reusing = source === 'existing';
-  const untouched = source === 'none';
+  // A root has no branch to create, reuse or stay on. The server decides this
+  // from the path either way, so these are left out rather than sent and
+  // dropped — the request says what it means.
+  const isRoot = !!state.selectedRepo.is_root;
+  const reusing = !isRoot && source === 'existing';
+  const untouched = !isRoot && source === 'none';
   const body = {
     repo_path: state.selectedRepo.path,
     task_name: $('task-name').value.trim() || state.selectedRepo.name,
     // A reused branch has its own head; a base ref would only move it, so it is
     // not sent at all rather than sent and ignored.
-    base_ref: reusing || untouched ? null : $('base-ref').value || null,
+    base_ref: isRoot || reusing || untouched ? null : $('base-ref').value || null,
     existing_branch: reusing ? $('existing-branch').value || null : null,
     no_branch: untouched,
     model: $('model').value.trim() || null,
@@ -668,7 +710,7 @@ async function spawn() {
     permission_mode: $('permission-mode').value,
     // Staying on the current branch means the main checkout by definition; the
     // control is held there, but the flag is sent explicitly all the same.
-    in_place: untouched || $('isolation').value === 'in-place',
+    in_place: !isRoot && (untouched || $('isolation').value === 'in-place'),
     add_dirs: $('add-dirs').value.split('\n').map((s) => s.trim()).filter(Boolean),
     first_message: $('first-message').value.trim() || null,
   };

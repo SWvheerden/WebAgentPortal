@@ -100,6 +100,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE agents ADD COLUMN branch_is_new INTEGER", [])
             .context("adding the branch_is_new column")?;
     }
+    // Root spawns did not exist before the column, so a NULL reads as `false`:
+    // every pre-existing agent was pointed at one repository.
+    if !existing.iter().any(|c| c == "is_root") {
+        conn.execute("ALTER TABLE agents ADD COLUMN is_root INTEGER", [])
+            .context("adding the is_root column")?;
+    }
     Ok(())
 }
 
@@ -133,6 +139,17 @@ pub struct AgentRecord {
     pub branch: Option<String>,
     pub base_ref: Option<String>,
     pub uses_worktree: bool,
+    /// Spawned on a configured repo root rather than on a repository under one
+    /// (§6): the agent's working directory is the folder every repository sits
+    /// in, so it is tied to none of them.
+    ///
+    /// Implies `is_git == false`, `uses_worktree == false` and `branch == None`
+    /// whatever the root directory itself contains — a root is a container, and
+    /// no branch or worktree work is ever done for one. Recorded rather than
+    /// re-derived from the path so that editing `repo_roots` afterwards cannot
+    /// silently change what an existing agent is.
+    #[serde(default)]
+    pub is_root: bool,
     /// We created `branch` for this agent, so deleting the agent may delete it.
     /// False when the agent was pointed at a branch that already existed, which
     /// is not ours to destroy.
@@ -239,9 +256,9 @@ impl Db {
                 "INSERT INTO agents (id, name, slug, repo_path, work_path, is_git, branch,
                      base_ref, uses_worktree, permission_mode, model, effort, max_budget_usd,
                      status, status_detail, exit_code, last_stderr, cost_usd, created_at,
-                     last_active_at, add_dirs, branch_is_new)
+                     last_active_at, add_dirs, branch_is_new, is_root)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18, ?19, ?20, ?21, ?22)",
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                 params![
                     a.id,
                     a.name,
@@ -265,6 +282,7 @@ impl Db {
                     a.last_active_at,
                     serde_json::to_string(&a.add_dirs).unwrap_or_else(|_| "[]".to_string()),
                     a.branch_is_new as i64,
+                    a.is_root as i64,
                 ],
             )
             .context("inserting agent")?;
@@ -713,7 +731,8 @@ fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
 
 const AGENT_COLUMNS: &str = "id, name, slug, repo_path, work_path, is_git, branch, base_ref, \
      uses_worktree, permission_mode, model, effort, max_budget_usd, status, status_detail, \
-     exit_code, last_stderr, cost_usd, created_at, last_active_at, add_dirs, branch_is_new";
+     exit_code, last_stderr, cost_usd, created_at, last_active_at, add_dirs, branch_is_new, \
+     is_root";
 
 fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let mode: String = row.get(9)?;
@@ -748,6 +767,7 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
             .get::<_, Option<i64>>(21)?
             .map(|v| v != 0)
             .unwrap_or(true),
+        is_root: row.get::<_, Option<i64>>(22)?.is_some_and(|v| v != 0),
     })
 }
 
@@ -778,6 +798,7 @@ mod tests {
             branch: Some("sw_fix_the_parser".to_string()),
             base_ref: Some("main".to_string()),
             uses_worktree: true,
+            is_root: false,
             branch_is_new: true,
             permission_mode: PermissionMode::Ask,
             model: Some("opus".to_string()),
@@ -1187,9 +1208,63 @@ mod tests {
         let agent = db.get_agent("old").expect("get").expect("present");
         assert_eq!(agent.name, "Old agent");
         assert!(agent.add_dirs.is_empty());
+        assert!(
+            agent.branch_is_new,
+            "an agent that predates the column created its own branch"
+        );
+        assert!(
+            !agent.is_root,
+            "root spawns did not exist, so every old agent is pointed at one repository"
+        );
         // And the migration is idempotent.
         drop(db);
         assert!(Db::open(&path).is_ok());
+    }
+
+    /// The rootless shape survives storage: nothing downstream re-derives it
+    /// from the path, so it has to come back out of the row.
+    #[test]
+    fn a_root_agent_round_trips() {
+        let db = Db::open_in_memory().expect("db");
+        let mut record = sample_agent("r", "r");
+        record.is_root = true;
+        record.is_git = false;
+        record.uses_worktree = false;
+        record.branch = None;
+        record.base_ref = None;
+        record.branch_is_new = false;
+        record.repo_path = "/repos".to_string();
+        record.work_path = "/repos".to_string();
+        db.insert_agent(&record).expect("insert");
+
+        let back = db.get_agent("r").expect("get").expect("present");
+        assert_eq!(back, record);
+        assert!(back.is_root);
+        assert!(!back.is_git);
+        assert_eq!(back.branch, None);
+
+        // And through the list query, which the dashboard reads.
+        let listed = db.list_agents().expect("list");
+        assert!(listed.iter().any(|a| a.id == "r" && a.is_root));
+
+        // A rootless agent contributes no branch name to the collision pool.
+        let taken = db.taken_names().expect("taken");
+        assert_eq!(taken, vec!["r".to_string()]);
+    }
+
+    /// The default is the safe one: a record deserialised from a payload that
+    /// predates the field is an ordinary repository agent, not a rootless one.
+    #[test]
+    fn is_root_defaults_to_false_when_absent() {
+        let mut value = serde_json::to_value(sample_agent("a", "a")).expect("serialise");
+        assert_eq!(value["is_root"], json!(false));
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("is_root")
+            .expect("present");
+        let back: AgentRecord = serde_json::from_value(value).expect("deserialise");
+        assert!(!back.is_root);
     }
 
     #[test]

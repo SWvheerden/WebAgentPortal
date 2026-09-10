@@ -614,6 +614,10 @@ struct BranchInfo {
     current: Option<String>,
     dirty: bool,
     is_git: bool,
+    /// The path is a configured root itself, so the spawn it describes is
+    /// rootless (§6): no branch, no worktree, and `is_git` reported as false
+    /// however the directory is laid out.
+    is_root: bool,
 }
 
 /// Resolve a caller-supplied repo path, refusing anything outside the roots.
@@ -634,7 +638,20 @@ async fn repo_branches(
     Query(q): Query<PathQuery>,
 ) -> ApiResult<Json<BranchInfo>> {
     let path = confined_repo(&state, &q.path).await?;
+    let roots = state.sup.config().await.roots();
     let info = tokio::task::spawn_blocking(move || {
+        // A root answers as a root and nothing else. Running git in it would
+        // describe branches the spawn will not touch, and the form would offer
+        // the operator choices nothing honours.
+        if crate::config::is_configured_root(&path, &roots) {
+            return BranchInfo {
+                branches: Vec::new(),
+                current: None,
+                dirty: false,
+                is_git: false,
+                is_root: true,
+            };
+        }
         let is_git = git::is_git_repo(&path);
         BranchInfo {
             branches: if is_git {
@@ -649,6 +666,7 @@ async fn repo_branches(
             },
             dirty: is_git && git::is_dirty(&path),
             is_git,
+            is_root: false,
         }
     })
     .await
@@ -1637,6 +1655,79 @@ mod tests {
         assert!(on_disk.remote_control, "and it survives the round trip");
     }
 
+    /// A GET through the whole stack, so the picker's payload is asserted as
+    /// the browser receives it rather than as `scan` builds it.
+    async fn get_json(state: AppState, path: &str) -> Value {
+        use tower::ServiceExt;
+        let mut request = api_request(path)
+            .header(TOKEN_HEADER, TEST_TOKEN)
+            .body(axum::body::Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(
+            LOOPBACK_PEER.parse::<SocketAddr>().expect("peer"),
+        ));
+        let response = router(state).oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    /// The root folder is offered in the picker as a workspace of its own, so
+    /// there is something to click for an agent that spans repositories (§6).
+    #[tokio::test]
+    async fn the_picker_offers_the_root_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("alpha")).expect("mkdir");
+        let state = test_state().await;
+        let root = dir.path().to_string_lossy().to_string();
+        state
+            .sup
+            .set_config(Config {
+                repo_roots: vec![root.clone()],
+                ..Config::default()
+            })
+            .await;
+
+        let body = get_json(state, "/api/repos").await;
+        let roots = body["roots"].as_array().expect("roots group");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["path"], json!(root));
+        assert_eq!(roots[0]["is_root"], json!(true));
+        assert_eq!(roots[0]["is_git"], json!(false));
+        // And it does not displace the repositories under it.
+        let all = body["all"].as_array().expect("all");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0]["name"], json!("alpha"));
+        assert_eq!(all[0]["is_root"], json!(false));
+    }
+
+    /// The branch endpoint answers a root as a root: no branches to choose
+    /// from, so the form has nothing to offer that the spawn would ignore.
+    #[tokio::test]
+    async fn the_branch_endpoint_reports_a_root_as_rootless() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The root is itself a checkout, which must not change the answer.
+        std::fs::create_dir_all(dir.path().join(".git")).expect("mkdir");
+        let state = test_state().await;
+        let root = dir.path().to_string_lossy().to_string();
+        state
+            .sup
+            .set_config(Config {
+                repo_roots: vec![root.clone()],
+                ..Config::default()
+            })
+            .await;
+
+        let body = get_json(state, &format!("/api/repos/branches?path={root}")).await;
+        assert_eq!(body["is_root"], json!(true));
+        assert_eq!(body["is_git"], json!(false));
+        assert_eq!(body["dirty"], json!(false));
+        assert_eq!(body["current"], Value::Null);
+        assert_eq!(body["branches"], json!([]));
+    }
+
     #[tokio::test]
     async fn the_detail_payload_carries_the_composer_history() {
         use tower::ServiceExt;
@@ -1655,6 +1746,7 @@ mod tests {
                     base_ref: None,
                     uses_worktree: false,
                     branch_is_new: false,
+                    is_root: false,
                     permission_mode: crate::agent::state::PermissionMode::Ask,
                     model: None,
                     effort: None,

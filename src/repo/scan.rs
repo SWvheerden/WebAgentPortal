@@ -23,6 +23,15 @@ pub struct RepoEntry {
     /// not inspected. Spawning into it is refused for the same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
+    /// This entry *is* a configured root, offered as a workspace in its own
+    /// right rather than as one of the repositories under it (§6).
+    ///
+    /// A root spawn is deliberately rootless: `is_git` is always false on these
+    /// entries, whatever the directory itself happens to contain, because a
+    /// root is a container of repositories and an agent given one is not tied
+    /// to any of them.
+    #[serde(default)]
+    pub is_root: bool,
     /// This tool's own last-used timestamp, not the filesystem's.
     pub last_used_at: Option<i64>,
 }
@@ -30,6 +39,11 @@ pub struct RepoEntry {
 /// The picker payload: a Recent group and everything, alphabetically.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepoListing {
+    /// The configured roots themselves, in configured order. Kept out of
+    /// `recent` and `all` because a root is not one of the repositories the
+    /// picker is ordering — it is the folder they all sit in.
+    #[serde(default)]
+    pub roots: Vec<RepoEntry>,
     pub recent: Vec<RepoEntry>,
     pub all: Vec<RepoEntry>,
     /// Roots that could not be read, surfaced rather than silently dropped.
@@ -46,6 +60,23 @@ pub fn scan_roots(roots: &[PathBuf], usage: &HashMap<String, i64>) -> RepoListin
     let mut errors = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
+    // The roots first, so a root nested inside another root is offered as the
+    // root it is configured as rather than as a repository under its parent.
+    // A root that is not a readable directory is left out here and reported as
+    // an error below: offering a workspace that cannot be entered would only
+    // fail at spawn time.
+    let mut root_entries: Vec<RepoEntry> = Vec::with_capacity(roots.len());
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        let entry = root_entry(root, usage);
+        if !seen.contains(&entry.path) {
+            seen.push(entry.path.clone());
+            root_entries.push(entry);
+        }
+    }
+
     for root in roots {
         match scan_root(root, usage) {
             Ok(found) => {
@@ -60,7 +91,31 @@ pub fn scan_roots(roots: &[PathBuf], usage: &HashMap<String, i64>) -> RepoListin
         }
     }
 
-    order(entries, errors)
+    order(entries, root_entries, errors)
+}
+
+/// The picker entry for a configured root itself (§6).
+///
+/// No git is run against it: a root spawn has no branch or worktree semantics
+/// whatever the directory contains, and reporting a branch here would offer the
+/// operator a choice the spawn does not honour.
+fn root_entry(root: &Path, usage: &HashMap<String, i64>) -> RepoEntry {
+    let path = root.to_string_lossy().to_string();
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+    RepoEntry {
+        name,
+        branch: None,
+        dirty: false,
+        refused: None,
+        is_git: false,
+        is_root: true,
+        last_used_at: usage.get(&path).copied(),
+        root: path.clone(),
+        path,
+    }
 }
 
 fn scan_root(root: &Path, usage: &HashMap<String, i64>) -> std::io::Result<Vec<RepoEntry>> {
@@ -91,6 +146,7 @@ fn scan_root(root: &Path, usage: &HashMap<String, i64>) -> std::io::Result<Vec<R
             dirty: meta.dirty,
             refused: meta.refused,
             is_git,
+            is_root: false,
             last_used_at: usage.get(&path_str).copied(),
             path: path_str,
             root: root.to_string_lossy().to_string(),
@@ -102,7 +158,11 @@ fn scan_root(root: &Path, usage: &HashMap<String, i64>) -> std::io::Result<Vec<R
 /// Split into a recency-ordered Recent group and an alphabetical All list.
 ///
 /// Pure, so the ordering rules are testable without a filesystem.
-pub fn order(mut entries: Vec<RepoEntry>, errors: Vec<String>) -> RepoListing {
+pub fn order(
+    mut entries: Vec<RepoEntry>,
+    roots: Vec<RepoEntry>,
+    errors: Vec<String>,
+) -> RepoListing {
     entries.sort_by_key(|e| e.name.to_lowercase());
 
     let mut recent: Vec<RepoEntry> = entries
@@ -119,6 +179,7 @@ pub fn order(mut entries: Vec<RepoEntry>, errors: Vec<String>) -> RepoListing {
     recent.truncate(RECENT_LIMIT);
 
     RepoListing {
+        roots,
         recent,
         all: entries,
         errors,
@@ -138,6 +199,7 @@ mod tests {
             branch: Some("main".to_string()),
             dirty: false,
             refused: None,
+            is_root: false,
             last_used_at,
         }
     }
@@ -151,6 +213,7 @@ mod tests {
                 entry("beta", None),
             ],
             vec![],
+            vec![],
         );
         let names: Vec<_> = listing.all.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["Alpha", "beta", "zeta"]);
@@ -161,7 +224,7 @@ mod tests {
         let entries = (1..=8)
             .map(|i| entry(&format!("repo{i}"), Some(i as i64 * 100)))
             .collect();
-        let listing = order(entries, vec![]);
+        let listing = order(entries, vec![], vec![]);
         assert_eq!(listing.recent.len(), RECENT_LIMIT);
         let names: Vec<_> = listing.recent.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["repo8", "repo7", "repo6", "repo5", "repo4"]);
@@ -170,14 +233,22 @@ mod tests {
 
     #[test]
     fn never_used_repos_are_absent_from_recent() {
-        let listing = order(vec![entry("used", Some(5)), entry("never", None)], vec![]);
+        let listing = order(
+            vec![entry("used", Some(5)), entry("never", None)],
+            vec![],
+            vec![],
+        );
         assert_eq!(listing.recent.len(), 1);
         assert_eq!(listing.recent[0].name, "used");
     }
 
     #[test]
     fn recency_ties_break_alphabetically() {
-        let listing = order(vec![entry("b", Some(10)), entry("a", Some(10))], vec![]);
+        let listing = order(
+            vec![entry("b", Some(10)), entry("a", Some(10))],
+            vec![],
+            vec![],
+        );
         let names: Vec<_> = listing.recent.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
     }
@@ -231,6 +302,101 @@ mod tests {
         let root = dir.path().to_path_buf();
         let listing = scan_roots(&[root.clone(), root], &HashMap::new());
         assert_eq!(listing.all.len(), 1);
+    }
+
+    #[test]
+    fn the_root_itself_is_offered_as_a_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("alpha")).expect("mkdir");
+
+        let listing = scan_roots(&[root.to_path_buf()], &HashMap::new());
+        assert_eq!(
+            listing.roots.len(),
+            1,
+            "the root is spawnable in its own right"
+        );
+        let entry = &listing.roots[0];
+        assert!(entry.is_root);
+        assert!(!entry.is_git, "a root carries no git identity");
+        assert_eq!(entry.branch, None);
+        assert!(!entry.dirty);
+        assert_eq!(entry.path, root.to_string_lossy());
+        assert_eq!(
+            entry.name,
+            root.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        );
+        // It is not one of the repositories, so it never crowds the lists that
+        // order them.
+        let names: Vec<_> = listing.all.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha"]);
+        assert!(listing.recent.is_empty());
+    }
+
+    /// A root that is itself a git repository is still offered as a root: the
+    /// spawn it feeds runs no git commands, so advertising a branch here would
+    /// be a choice nothing honours.
+    #[test]
+    fn a_git_root_is_still_reported_as_rootless() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".git")).expect("mkdir");
+        let listing = scan_roots(&[dir.path().to_path_buf()], &HashMap::new());
+        assert_eq!(listing.roots.len(), 1);
+        assert!(!listing.roots[0].is_git);
+        assert!(listing.roots[0].is_root);
+    }
+
+    #[test]
+    fn overlapping_roots_do_not_duplicate_root_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let listing = scan_roots(&[root.clone(), root], &HashMap::new());
+        assert_eq!(listing.roots.len(), 1);
+    }
+
+    /// A root configured inside another root belongs in the roots group, not in
+    /// the repository list of its parent — otherwise selecting it from `all`
+    /// would spawn with repository semantics it does not have.
+    #[test]
+    fn a_nested_root_is_listed_as_a_root_not_as_a_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = dir.path().to_path_buf();
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).expect("mkdir");
+        std::fs::create_dir_all(outer.join("plain")).expect("mkdir");
+
+        let listing = scan_roots(&[outer, inner.clone()], &HashMap::new());
+        let root_paths: Vec<_> = listing.roots.iter().map(|e| e.path.as_str()).collect();
+        assert!(root_paths.contains(&inner.to_string_lossy().as_ref()));
+        let all_names: Vec<_> = listing.all.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(all_names, vec!["plain"], "`inner` is a root, not a repo");
+    }
+
+    /// The listing still describes the roots it could not read: an unusable
+    /// root is reported as an error *and* left out of the spawnable group.
+    #[test]
+    fn a_missing_root_is_not_offered_as_a_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope");
+        let listing = scan_roots(&[dir.path().to_path_buf(), missing], &HashMap::new());
+        assert_eq!(listing.roots.len(), 1);
+        assert_eq!(listing.roots[0].path, dir.path().to_string_lossy());
+        assert_eq!(listing.errors.len(), 1);
+    }
+
+    #[test]
+    fn a_root_carries_its_own_last_used_timestamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut usage = HashMap::new();
+        usage.insert(dir.path().to_string_lossy().to_string(), 99_i64);
+        let listing = scan_roots(&[dir.path().to_path_buf()], &usage);
+        assert_eq!(listing.roots[0].last_used_at, Some(99));
+        assert!(
+            listing.recent.is_empty(),
+            "a root is always visible in its own group, so it never takes a Recent slot"
+        );
     }
 
     #[test]

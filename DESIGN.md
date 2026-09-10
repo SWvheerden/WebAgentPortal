@@ -107,13 +107,14 @@ CREATE TABLE agents (
   id                TEXT PRIMARY KEY,      -- uuid, also the claude --session-id
   name              TEXT NOT NULL,
   slug              TEXT NOT NULL UNIQUE,  -- URL identity
-  repo_path         TEXT NOT NULL,         -- repo the task belongs to
-  work_path         TEXT NOT NULL,         -- worktree, or repo_path if in-place/non-git
+  repo_path         TEXT NOT NULL,         -- repo the task belongs to, or the root itself
+  work_path         TEXT NOT NULL,         -- worktree, or repo_path if in-place/non-git/root
   is_git            INTEGER NOT NULL,
-  branch            TEXT,                  -- NULL for non-git folders
+  branch            TEXT,                  -- NULL for non-git folders and root agents
   base_ref          TEXT,                  -- NULL when an existing branch was reused
   uses_worktree     INTEGER NOT NULL,
   branch_is_new     INTEGER,               -- we created `branch`, so delete may drop it
+  is_root           INTEGER,               -- spawned on a configured root, tied to no repo
   permission_mode   TEXT NOT NULL,         -- ask | acceptEdits | bypass | dangerous
   model             TEXT,
   effort            TEXT,
@@ -157,12 +158,15 @@ CREATE TABLE notes (
 );
 ```
 
-**Implementation note — one additive migration.** The shipped schema carries one
-column beyond the table above: `agents.add_dirs` (a JSON array, added by an
-`ALTER TABLE` guarded on `PRAGMA table_info`, so an existing database opens
-unchanged). Without it the `--add-dir` values chosen at spawn are lost on
-Resume after a server restart, which silently changes what the agent can reach.
-Everything else matches this schema exactly.
+**Implementation note — additive migrations.** The shipped schema carries one
+column beyond the table above: `agents.add_dirs` (a JSON array). It, and the
+`branch_is_new` and `is_root` columns above it, are added by `ALTER TABLE`
+guarded on `PRAGMA table_info`, so an existing database opens unchanged.
+Without `add_dirs` the `--add-dir` values chosen at spawn are lost on Resume
+after a server restart, which silently changes what the agent can reach. A NULL
+`branch_is_new` reads as `true` (reuse did not exist before the column) and a
+NULL `is_root` as `false` (neither did root spawns). Everything else matches
+this schema exactly.
 
 **Not persisted:** `stream_event` partial-token deltas. `--include-partial-messages` drives
 live typing in the UI, but only completed blocks are written — otherwise the table grows by
@@ -477,8 +481,43 @@ Each entry badged `git` (with current branch and dirty marker) or `plain`. Re-sc
 every picker open.
 
 ### Ordering
-A **Recent** group (max 5) ordered by *this tool's own* `last_used_at` descending, then
-**All** alphabetically.
+The configured **roots** first, in configured order (see *The whole folder* below), then a
+**Recent** group (max 5) ordered by *this tool's own* `last_used_at` descending, then
+**All** alphabetically. A root sits in its own group rather than in Recent or All: it is
+not one of the repositories being ordered, it is the folder they are in, and it is always
+visible so it never needs a recency slot.
+
+### The whole folder, and no repository
+The picker also offers **each configured root itself**, badged `root`. An agent spawned
+there starts in e.g. `~/Code` rather than in a repository under it, so it can touch several
+repositories, or none — a sweep across every checkout, a scratch session, a question that
+spans two projects.
+
+A root spawn is **rootless**: `is_root` is recorded, `is_git`, `uses_worktree` and
+`branch_is_new` are all false, and `branch` and `base_ref` are `NULL`. No git command is
+run for it — no worktree created, no branch created or checked out, no dirty check, no
+branch list. Delete therefore takes nothing off disk and the safety check has nothing to
+report, exactly as for a non-git folder.
+
+Three rules make that predictable:
+
+- **The path decides, not the request.** The server compares the resolved spawn path
+  against the canonicalised roots (`config::is_configured_root`); a client cannot claim
+  either shape for a directory. The same comparison answers `/api/repos/branches`, so the
+  form is told what the spawn will actually do.
+- **A root that is itself a git repository is still rootless.** Reading its branch would
+  bind the agent to a repository the operator did not pick, and its worktree would land
+  *beside* the root rather than under it. A root is a container by configuration; what it
+  happens to contain does not change that.
+- **Every git option is inert**, exactly as under *Leaving git alone*: `in_place`,
+  `existing_branch`, `base_ref` and `no_branch` each ask for the work this mode declines to
+  do, so the mode wins over all of them rather than half-honouring one. The form holds
+  **Workspace** at the main checkout, disables **Branch** and greys out **Fetch**, so the
+  controls are held rather than silently contradicted.
+
+> **Warned in the UI:** the agent can reach every repository under the root, and its
+> changes land in the checkouts the operator is working in. There is no worktree and no
+> branch standing between them.
 
 ### Branching
 - Slug from the task name (lowercase, non-alphanumerics → `_`, ≤40 chars).
@@ -539,6 +578,8 @@ never deletes the branch. With no worktree to remove either, Delete takes nothin
 > main checkout are invisible to the agent.** Spawning against a dirty repo shows a warning.
 
 **Non-git folders:** spawn normally, no branch, badged "no VCS". Never `git init` implicitly.
+A root agent is badged "whole folder · no repository" instead — it is attached to no
+repository at all, which is a different thing from a folder that merely has no VCS.
 
 ### Cloning
 URL field → folder name derived (editable) → `git clone --progress` into the chosen root,
@@ -674,7 +715,8 @@ case. Clone URLs are restricted to https/ssh and absolute paths.
 ```
 GET  /                          dashboard
 GET  /agent/:slug               detail view
-GET  /api/repos                 scan + recency ordering
+GET  /api/repos                 scan + recency ordering, plus the roots themselves
+GET  /api/repos/branches?path=  branches, dirty, is_git, is_root — what the form may offer
 POST /api/repos/clone           clone into a root
 GET  /api/agents                registry
 GET  /api/agents/:id            one agent, plus its composer history
@@ -777,6 +819,8 @@ Repo picker (§6) · task name (auto-filled from folder, editable) · **Workspac
 with the repo's branches listed ｜ stay on the current one, which pins Workspace to the main
 checkout) · branch name preview · base ref · model ·
 permission mode · optional first message.
+Picking a **root** rather than a repository holds Workspace at the main checkout, disables
+Branch and Fetch, and sends no branch fields at all — the whole folder, no repository (§6).
 **Advanced:** effort, `--add-dir`, `--max-budget-usd`.
 
 ### The socket, and a token that has gone stale

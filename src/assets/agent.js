@@ -512,9 +512,13 @@ function renderHeader() {
   if (!agent) return;
   $('agent-name').textContent = agent.name;
   $('agent-status').replaceChildren(statusEl(agent.status, agent.status_detail));
-  const where = agent.is_git
-    ? `${agent.branch || 'detached'} · base ${agent.base_ref || '?'} · ${agent.uses_worktree ? 'worktree' : 'main checkout'}`
-    : 'no VCS';
+  // A rootless agent is attached to no repository at all, which is a different
+  // thing from a folder that merely has no VCS (§6).
+  const where = agent.is_root
+    ? 'whole folder · no repository'
+    : agent.is_git
+      ? `${agent.branch || 'detached'} · base ${agent.base_ref || '?'} · ${agent.uses_worktree ? 'worktree' : 'main checkout'}`
+      : 'no VCS';
   // The mode is the picker's job now; repeating it in the meta line would let
   // the two disagree.
   $('agent-meta').textContent = `${where} · ${fmtCost(agent.cost_usd)} · ${agent.work_path}`;

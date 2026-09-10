@@ -228,6 +228,28 @@ pub fn confine_to_roots(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
     )
 }
 
+/// Is `path` one of the configured roots *itself*, rather than a repository
+/// inside one?
+///
+/// A root is the container the picker scans, not a workspace with a repository
+/// identity, so an agent spawned on one is deliberately rootless: no branch, no
+/// worktree, no git assumptions (§6). That has to be decided from the resolved
+/// path rather than from a request flag, or a client could claim either shape
+/// for any directory.
+///
+/// Both sides are canonicalised, exactly as [`confine_to_roots`] does it, so a
+/// symlinked or `..`-laden spelling of a root is still recognised as one.
+///
+/// Blocking: call from `spawn_blocking`.
+pub fn is_configured_root(path: &Path, roots: &[PathBuf]) -> bool {
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    roots
+        .iter()
+        .any(|root| std::fs::canonicalize(root).is_ok_and(|root| root == resolved))
+}
+
 /// Expand a leading `~` using `$HOME`. Everything else is passed through.
 pub fn expand_tilde(raw: &str) -> PathBuf {
     expand_tilde_with(raw, home_dir())
@@ -477,6 +499,59 @@ pinned_cli_version = "2.1.241"
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "branch_prefix = \"--upload-pack=x\"\n").expect("write");
         assert!(Config::load_or_create(&path).is_err());
+    }
+
+    #[test]
+    fn a_root_is_recognised_as_a_root_and_a_repo_under_it_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("Code");
+        let repo = root.join("thing");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        let roots = vec![root.clone()];
+
+        assert!(is_configured_root(&root, &roots));
+        assert!(!is_configured_root(&repo, &roots), "a repo is not the root");
+        assert!(!is_configured_root(&root, &[]), "no roots, no root");
+
+        // Spelling does not decide it: a `..`-laden path and a symlink to the
+        // root both resolve to the same directory, so both are the root.
+        assert!(is_configured_root(&repo.join(".."), &roots));
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("code-link");
+            std::os::unix::fs::symlink(&root, &link).expect("symlink");
+            assert!(is_configured_root(&link, &roots));
+        }
+    }
+
+    /// A path that does not resolve is not a root. It is also not confinable,
+    /// so nothing downstream ever sees it — this only fixes the answer.
+    #[test]
+    fn a_path_that_does_not_exist_is_not_a_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = vec![dir.path().to_path_buf()];
+        assert!(!is_configured_root(&dir.path().join("gone"), &roots));
+        assert!(
+            !is_configured_root(dir.path(), &[dir.path().join("gone")]),
+            "an unresolvable root matches nothing rather than everything"
+        );
+    }
+
+    /// One of several roots is enough, and a root configured inside another is
+    /// still a root in its own right.
+    #[test]
+    fn any_configured_root_counts_including_a_nested_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = dir.path().join("outer");
+        let inner = outer.join("inner");
+        let other = dir.path().join("other");
+        for path in [&inner, &other] {
+            std::fs::create_dir_all(path).expect("mkdir");
+        }
+        let roots = vec![outer.clone(), other.clone()];
+        assert!(is_configured_root(&other, &roots));
+        assert!(!is_configured_root(&inner, &roots));
+        assert!(is_configured_root(&inner, &[outer, inner.clone()]));
     }
 
     #[test]
