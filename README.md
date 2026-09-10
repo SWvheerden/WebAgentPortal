@@ -60,7 +60,7 @@ the day the CLI honours it. See DESIGN §9 and F12a.
 ## Development
 
 ```sh
-cargo test
+cargo ci-test            # nextest run --all-features --release --no-fail-fast
 cargo ci-clippy          # clippy --all-targets --all-features -- -D warnings
 cargo +nightly fmt --all
 ```

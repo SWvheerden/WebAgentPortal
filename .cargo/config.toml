@@ -1,2 +1,3 @@
 [alias]
+ci-test = "nextest run --all-features --release --no-fail-fast"
 ci-clippy = "clippy --all-targets --all-features -- -D warnings"

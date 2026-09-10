@@ -643,7 +643,7 @@ function renderSpawnWarnings(info) {
   if (info.is_root) {
     host.append(el('div', {
       class: 'warnbox small',
-      text: 'The whole folder, not a repository. The agent starts in the root itself and can reach every repository under it — so no branch is created, no worktree is made, and nothing is checked out for you. Anything it changes lands in the checkouts you are working in.',
+      text: 'The whole folder, not a repository. The agent starts in the root itself and can reach every repository under it — so no branch is created, no worktree is made, and nothing is checked out for you. Anything it changes lands in the checkouts you are working in. It can also reach .worktrees under this folder, which is where every other agent\u2019s isolated checkout lives: a root agent can read and write those while their own agents are mid-edit, and nothing stops it.',
     }));
   } else if (!info.is_git) {
     host.append(el('div', {

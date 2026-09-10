@@ -96,20 +96,31 @@ pub fn scan_roots(roots: &[PathBuf], usage: &HashMap<String, i64>) -> RepoListin
 
 /// The picker entry for a configured root itself (§6).
 ///
-/// No git is run against it: a root spawn has no branch or worktree semantics
-/// whatever the directory contains, and reporting a branch here would offer the
-/// operator a choice the spawn does not honour.
+/// No git *command* is run against it: a root spawn has no branch or worktree
+/// semantics whatever the directory contains, and reporting a branch here would
+/// offer the operator a choice the spawn does not honour.
+///
+/// The config-only vet of §7 is the exception, and has to be. A root that is
+/// itself a working tree can declare a command-valued key we cannot disarm, and
+/// the agent's own CLI runs git in its cwd on startup — so "we run no git" is
+/// not the same as "no git runs". `git config --list` reads config files and no
+/// working tree, so asking costs nothing the guard exists to prevent.
 fn root_entry(root: &Path, usage: &HashMap<String, i64>) -> RepoEntry {
     let path = root.to_string_lossy().to_string();
     let name = root
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.clone());
+    // Free for a plain root: the guard short-circuits when there is no `.git`.
+    let refused = git::RepoGuard::read(root)
+        .check(root)
+        .err()
+        .map(|err| format!("{err}"));
     RepoEntry {
         name,
         branch: None,
         dirty: false,
-        refused: None,
+        refused,
         is_git: false,
         is_root: true,
         last_used_at: usage.get(&path).copied(),
@@ -346,6 +357,43 @@ mod tests {
         assert_eq!(listing.roots.len(), 1);
         assert!(!listing.roots[0].is_git);
         assert!(listing.roots[0].is_root);
+    }
+
+    /// A root that declares a command we cannot disarm is badged rather than
+    /// entered, exactly as a repository under one is. The `claude` child runs
+    /// git in its cwd, so the guard has to reach a root too (§6, §7).
+    #[test]
+    fn a_root_that_refuses_inspection_is_badged_not_inspected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        if git::git(root, &["init", "-q", "-b", "main", "."]).is_err() {
+            return;
+        }
+        let config = root.join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).expect("read config");
+        text.push_str("\n[sometool \"x\"]\n\tcommand = /tmp/payload.sh\n");
+        std::fs::write(&config, text).expect("write config");
+
+        let listing = scan_roots(&[root.to_path_buf()], &HashMap::new());
+        assert_eq!(listing.roots.len(), 1);
+        let entry = &listing.roots[0];
+        assert!(entry.is_root);
+        let refused = entry.refused.as_deref().expect("refused");
+        assert!(refused.contains("sometool"), "{refused}");
+        // And it still says nothing about branches: the vet reads config files,
+        // it does not start inspecting the working tree.
+        assert!(!entry.is_git);
+        assert_eq!(entry.branch, None);
+        assert!(!entry.dirty);
+    }
+
+    /// The common case pays nothing and is never badged.
+    #[test]
+    fn an_ordinary_root_is_not_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("alpha")).expect("mkdir");
+        let listing = scan_roots(&[dir.path().to_path_buf()], &HashMap::new());
+        assert_eq!(listing.roots[0].refused, None);
     }
 
     #[test]

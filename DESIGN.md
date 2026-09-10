@@ -499,6 +499,16 @@ run for it — no worktree created, no branch created or checked out, no dirty c
 branch list. Delete therefore takes nothing off disk and the safety check has nothing to
 report, exactly as for a non-git folder.
 
+**The one exception is the config-only vet of §7, and it has to be.** A root can itself be
+a working tree — one the operator added to `repo_roots` directly, or unpacked from
+somewhere — and declare a command-valued key we cannot disarm. The agent's own CLI runs git
+in its cwd the moment it starts, so *we* running no git is not the same as *no* git running,
+and the guard would otherwise never be built for a root at all. `RepoGuard::read` is
+therefore consulted in the picker and again at spawn: a refused root is badged
+"not inspected" and refused a spawn, exactly like a repository under one. `git config
+--list` reads config files and no working tree, and short-circuits to nothing when there is
+no `.git`, so a plain root pays one existence check and the guarantee above stands.
+
 Three rules make that predictable:
 
 - **The path decides, not the request.** The server compares the resolved spawn path
@@ -517,7 +527,40 @@ Three rules make that predictable:
 
 > **Warned in the UI:** the agent can reach every repository under the root, and its
 > changes land in the checkouts the operator is working in. There is no worktree and no
-> branch standing between them.
+> branch standing between them. It can also reach `<root>/.worktrees`, so it can read and
+> write **other agents' isolated checkouts** while those agents are mid-edit.
+
+#### What a root agent can reach, and the limitation we are accepting
+
+Worktrees live at `<root>/.worktrees/<repo>/<slug>` — *inside* a root agent's own working
+directory. So a root agent has read/write access to the in-flight checkout of every other
+agent in that root, which is the one thing the worktree model exists to prevent. `scan_root`
+skips dot-directories, which is why this is otherwise invisible.
+
+It is a real hazard, not a theoretical one. A root agent told to "fix the lint errors
+everywhere", in `acceptEdits` or `bypass`, will rewrite files inside a running agent's
+worktree: two writers on one checkout, and the damage persists past the edit. `safety_for`
+runs `git::safety_report` against that worktree, so the other agent's Delete is refused over
+uncommitted changes it never made, and a forced Delete drops work belonging to neither
+agent.
+
+**We are not moving `.worktrees` out of the roots.** It sits under a root by design — the
+worktree is outside the repository but next to it, under a dot-directory the scanner
+already skips (see *Worktrees* above) — and relocating it is an architectural change with a
+migration for every existing agent's `work_path`. That is a larger decision than this
+feature, and making it here would put a schema migration behind a picker entry.
+
+What we do instead, and what the operator therefore relies on:
+
+- The spawn form's warning names `.worktrees` and other agents' checkouts explicitly, so
+  the reach is stated before the agent starts rather than discovered afterwards.
+- The spawn itself emits a **Notice** when other agents' worktrees exist under that root,
+  naming them and how many. It fires at the moment the risk becomes real, which a static
+  warning in a form cannot do.
+- There is **no interlock**. Nothing prevents the writes; the operator is informed and
+  decides. Recorded here as an accepted limitation so it is a trade-off on the record and
+  not an oversight, and so that a future decision to relocate `.worktrees` has this to
+  argue against.
 
 ### Branching
 - Slug from the task name (lowercase, non-alphanumerics → `_`, ≤40 chars).
