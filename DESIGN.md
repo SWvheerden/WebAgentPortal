@@ -825,6 +825,47 @@ monospace transcript pane — structured events underneath (tool calls as collap
 blocks), terminal look on top. Both pages carry a turtle favicon — an inline SVG, drawn for
 16px rather than shrunk to it, so a tab is identifiable at a glance.
 
+### Fitting the screen
+The page used to be a 1200px column centred in the window, which on anything wider than a
+laptop meant two stripes of background and a transcript no wider than it had been on the
+laptop. The cap is gone. What is capped is decided per thing instead, because the content
+does not all want the same answer: the agent-card grid, the rate-limit tiles and the
+transcript get better with room, and a form or a prose textarea only gets harder to read, so
+the spawn/clone/settings panels and the note editor keep a maximum and nothing else does.
+The notes column is capped for a third reason — every row in it is one line of truncated
+heading, so a wider column shows no more of them, and the slack is worth another card per
+row instead.
+
+**The agent page is two columns from 1200px.** The transcript and the composer take the
+left; the approval queue, the spawn warning and the agent's branch, cost and working
+directory sit in a rail on the right. An approval used to be a block above the transcript
+that pushed the conversation down the page to read it. 1200px rather than the width at which
+two columns first fit: the rail's floor is 300px and it comes out of the transcript, so
+splitting a 1000px window left the conversation narrower than it had been as one column.
+
+Inside the transcript the text is *not* held to a reading measure. Most of what is in it is
+tool output — a diff, a build log, a file listing — which is written in columns and is worth
+the width; capping the text to ~110 characters left the pane visibly half empty, which is
+the original complaint one layer in. Long prose lines on a very large monitor are the price,
+and this pane has always been a terminal.
+
+**The window is the frame, not the top of a scroll** — from 1200×560, where the agent page
+fills the viewport exactly once: the header pinned above, the composer and its footnote
+below, the transcript taking whatever is left and scrolling inside itself, and the rail
+scrolling separately so a queue of approvals cannot set the height of the page. Both bounds
+matter. Stacked columns cannot share a fixed height without one of them being squeezed to
+nothing, and below the height bound the header and the composer have eaten the window before
+the transcript gets any of it. Outside either bound the page is an ordinary scrolling
+document, which is what a phone wants: the narrow layout is the base and every wide rule is
+an override of it, so nothing is waiting on a media query to become usable.
+
+The header wraps now. It carries a name, a status, a mode picker and four buttons, which on
+a phone was wider than the screen — putting Stop and Resume past the right edge.
+
+Two layout rules were also being dropped on the floor: the spawn form's columns were written
+as `style="flex: 2 1 320px"` attributes, and `style-src 'self'` carries no `'unsafe-inline'`,
+so the CSP discarded them and the two halves silently came out even. They are classes now.
+
 ### The tab as a notification surface
 An agent in `awaiting_approval` is **blocked on a human**, and that human is usually in their
 editor rather than on this page. The browser tab is the only surface that reaches them there,

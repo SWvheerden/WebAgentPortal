@@ -30,6 +30,12 @@ a:hover { text-decoration: underline; }
 header.top {
   display: flex;
   align-items: center;
+  /* The agent header carries a name, a status, a mode picker and four buttons.
+     On a phone that is wider than the screen, and a header that overflows puts
+     Stop and Resume off the right edge; let it run onto a second line instead.
+     The spacer still eats the slack on the first line, so a wide window looks
+     exactly as it did. */
+  flex-wrap: wrap;
   gap: 12px;
   padding: 10px 16px;
   border-bottom: 1px solid var(--line);
@@ -44,8 +50,18 @@ header.top .spacer { flex: 1; }
    the buttons and take only the room they need. */
 header.top select { width: auto; }
 
-main { padding: 16px; max-width: 1200px; margin: 0 auto; }
-.detail-main { max-width: 1100px; }
+/* The page is the window. What gets capped is decided per thing rather than
+   here, because the two kinds of content on this page want opposite answers: a
+   grid of agent cards and a transcript get better with room, and a form or a
+   prose textarea just gets harder to read. Capping the page punished the first
+   to protect the second and left a stripe of background down both sides of a
+   wide monitor. */
+main { padding: 16px; }
+/* Forms. A label above a 2000px input is a line of text with a hairline under
+   it a long way to the right of it, and the eye has to travel the whole width
+   to get from one field to the next. The rows inside them wrap on their own
+   below this, so nothing here affects a narrow window. */
+#spawn-panel, #clone-panel, #settings-panel { max-width: 1500px; }
 
 .panel {
   background: var(--panel);
@@ -92,8 +108,20 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 .field.shrink { flex: 0 0 auto; align-self: end; }
 .row { display: flex; gap: 10px; flex-wrap: wrap; }
 .row > .field { flex: 1 1 160px; }
+.row.spaced { margin-top: 8px; }
+/* The spawn form's two halves: the repository picker and everything you say
+   about the agent. Both are wide enough to want their own line on a phone and
+   the ratio only applies once they share one — which `flex-basis` handles, the
+   row wrapping below about 700px. Classes rather than `style` attributes: the
+   CSP carries no 'unsafe-inline', so an inline style is dropped and the two
+   columns silently come out even. */
+.row > .field.repo-col { flex: 2 1 320px; }
+.row > .field.form-col { flex: 3 1 360px; }
 .inline { display: flex; align-items: center; gap: 8px; }
 .inline input[type=checkbox] { width: auto; }
+/* The label is the checkbox's other half, on its line, not a caption above a
+   control that isn't there. */
+.inline label { margin-bottom: 0; }
 
 .muted { color: var(--dim); }
 .small { font-size: 11px; }
@@ -103,7 +131,7 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 /* agent cards */
 /* Rate-limit meters. Fixed row order, so a window appearing or resetting does
    not make the panel jump around. */
-.meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 360px)); gap: 12px; }
 .meter { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
 .meter .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 11px; }
 .meter .head .pct { font-size: 15px; }
@@ -119,10 +147,19 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 
 /* The board: the notes index down the left with the agent list beside it.
    Notes take a narrow column and wrap above the cards on a phone rather than
-   squeezing them down to one per row. */
+   squeezing them down to one per row. Every row in that column is one line of
+   truncated heading, so past `max-width` a wider column shows nothing more —
+   the slack on a wide screen belongs to the cards, where it buys another one
+   per row. */
 .board { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
 .board > .notes { flex: 1 1 240px; }
 .board > .agents { flex: 3 1 520px; }
+/* Only once the two actually fit side by side: below this the notes panel has
+   wrapped onto a row of its own, where capping it would leave a half-width
+   panel with a stripe of background next to it. */
+@media (min-width: 800px) {
+  .board > .notes { max-width: 380px; }
+}
 
 /* notes */
 .notes h2 { display: flex; align-items: center; gap: 8px; }
@@ -179,6 +216,7 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.note-editor { max-width: 1100px; }
 .note-editor textarea {
   min-height: 55vh;
   resize: vertical;
@@ -214,6 +252,25 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 .repo.selected { background: #1f6feb22; }
 .repo .name { flex: 1; }
 .group-label { padding: 4px 8px; font-size: 10px; text-transform: uppercase; color: var(--dim); background: var(--panel-2); }
+
+/* The agent page.
+   Narrow — a phone, a half-screen window — is the layout this page has always
+   had: one document column, the rail stacked above the conversation, the
+   transcript a fixed slice of the window, the whole thing scrolled as a page.
+   The wide layout below is an override of it, so nothing here depends on a
+   media query being matched. */
+.detail-main { display: grid; gap: 16px; }
+.side > .panel:last-child { margin-bottom: 0; }
+/* The agent's branch, cost and working directory. A path has no spaces to wrap
+   at and the column is narrow, so it breaks anywhere rather than pushing the
+   rail wider than its track. */
+.meta-list { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 11px; }
+.meta-list dt { color: var(--dim); }
+.meta-list dd { margin: 0; word-break: break-all; }
+/* Nothing is waiting, so the panel says so in one line and gets out of the
+   way; the heading alone would read as a list that had failed to load. */
+#approvals-panel.pending #approvals-empty { display: none; }
+#approvals-panel.pending { border-color: var(--warn); }
 
 /* transcript */
 .transcript {
@@ -290,3 +347,81 @@ details.tool pre { color: var(--dim); }
 .toast.warn { border-left-color: var(--warn); }
 .toast.error { border-left-color: var(--err); }
 .toast.info { border-left-color: var(--accent-2); }
+
+/* ---------------------------------------------------------------------------
+   Room to spare.
+
+   Everything above is the layout at any size, phone included. What follows is
+   only what a bigger window buys, so a rule that fails to match costs nothing:
+   the page is never waiting on a breakpoint to become usable.
+*/
+
+/* The repository picker fills its column instead of being a 260px box with a
+   dead zone under it. `~/Code` here has 46 directories in it, so the list is
+   always longer than the box and the space was costing a scroll to reach the
+   repository you wanted. The column has a definite height to divide up only
+   because the row stretches it to match the form beside it, which is why this
+   waits for the two to actually share a row; below that the row has wrapped
+   and the base 260px cap is what keeps the list off the whole page. */
+@media (min-width: 960px) {
+  .row > .field.repo-col { display: flex; flex-direction: column; }
+  .repo-col .repo-list { flex: 1 1 auto; max-height: none; min-height: 200px; }
+}
+
+/* Two columns: the rail beside the transcript rather than stacked on top of
+   it, so an approval no longer pushes the conversation down the page to read
+   it.
+
+   1200px, not the width at which two columns first fit: the rail has a floor
+   of 300px and takes it out of the transcript, so splitting a 1000px window
+   left the conversation narrower than it had been as one column — a worse
+   layout than the one it replaced.
+
+   The transcript gets the rest of the window rather than being held to a
+   reading measure. Most of what is in it is tool output — a diff, a build log,
+   a file listing — which is written in columns and is worth the width, and
+   capping the text left the pane half empty, which is the same complaint one
+   layer in. Long prose lines on a very large monitor are the price. */
+@media (min-width: 1200px) {
+  .detail-main {
+    grid-template-columns: minmax(0, 1fr) minmax(300px, 400px);
+    align-items: start;
+  }
+  /* The rail is written first, for the stacked order; both are placed
+     explicitly here rather than one being pushed past the other. */
+  .detail-main > .conversation { grid-column: 1; grid-row: 1; }
+  .detail-main > .side { grid-column: 2; grid-row: 1; }
+}
+
+/* The window as the frame rather than the top of a scroll. The composer stays
+   where you left it, the transcript is as tall as the screen allows, and the
+   band of background under a short conversation is gone.
+
+   Both bounds matter: stacked columns cannot share a fixed height without one
+   of them being squeezed to nothing, and under `min-height` the header and the
+   composer have eaten the window before the transcript gets any of it. Outside
+   them the page scrolls as a document, which is what a phone wants anyway. */
+@media (min-width: 1200px) and (min-height: 560px) {
+  body.app {
+    height: 100vh;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  body.app > main { flex: 1 1 auto; min-height: 0; }
+  body.app .detail-main { height: 100%; align-items: stretch; }
+  body.app .conversation { display: flex; flex-direction: column; min-height: 0; }
+  /* `min-height: 0` on both: a flex item's floor is its content, and without it
+     a long transcript pushes the composer off the bottom of the window rather
+     than scrolling inside its own box. */
+  body.app .transcript { flex: 1 1 auto; height: auto; min-height: 120px; }
+  /* Approvals can outrun the window on their own. The rail scrolls in place;
+     it is not allowed to set the height of the page. */
+  body.app .side { overflow-y: auto; min-height: 0; }
+  /* Flex items stretch across the column by default, which turned a button
+     into a full-width bar the moment this layout applied and left it looking
+     like a divider between the transcript and the composer. */
+  body.app #load-earlier { align-self: start; }
+  body.app .conversation > p:last-child { margin-bottom: 0; }
+}
