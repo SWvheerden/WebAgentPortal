@@ -410,6 +410,10 @@ function renderApprovals() {
       ]),
     ]));
   }
+  // The panel is always there, so that the place to look is the same whether
+  // or not anything is waiting; `pending` is what makes it loud.
+  $('approvals-panel').classList.toggle('pending', state.pending.size > 0);
+  $('approvals-count').textContent = state.pending.size ? String(state.pending.size) : '';
   // Called after every change to `state.pending`, so this is the one place the
   // tab needs to be told.
   setAttention(state.pending.size);
@@ -537,16 +541,25 @@ function renderHeader() {
   if (!agent) return;
   $('agent-name').textContent = agent.name;
   $('agent-status').replaceChildren(statusEl(agent.status, agent.status_detail));
+  // Rows rather than the one run-on line this used to be in the header: the
+  // rail is a narrow column, and a working path is long enough on its own that
+  // the line wrapped twice and buried the cost in the middle of it. The
+  // permission mode is the picker's job and is not repeated here, or the two
+  // could disagree.
+  //
   // A rootless agent is attached to no repository at all, which is a different
-  // thing from a folder that merely has no VCS (§6).
-  const where = agent.is_root
-    ? 'whole folder · no repository'
-    : agent.is_git
-      ? `${agent.branch || 'detached'} · base ${agent.base_ref || '?'} · ${agent.uses_worktree ? 'worktree' : 'main checkout'}`
-      : 'no VCS';
-  // The mode is the picker's job now; repeating it in the meta line would let
-  // the two disagree.
-  $('agent-meta').textContent = `${where} · ${fmtCost(agent.cost_usd)} · ${agent.work_path}`;
+  // thing from a folder that merely has no VCS (§6); neither has a branch.
+  const rows = agent.is_git
+    ? [
+      ['branch', agent.branch || 'detached'],
+      ['base', agent.base_ref || '?'],
+      ['workspace', agent.uses_worktree ? 'isolated worktree' : 'main checkout'],
+    ]
+    : [['workspace', agent.is_root ? 'whole folder · no repository' : 'no VCS']];
+  rows.push(['cost', fmtCost(agent.cost_usd)], ['path', agent.work_path]);
+  $('agent-meta').replaceChildren(
+    ...rows.flatMap(([key, value]) => [el('dt', { text: key }), el('dd', { text: value })]),
+  );
   const running = isRunning();
   $('btn-interrupt').disabled = !running;
   $('btn-stop').disabled = !running;

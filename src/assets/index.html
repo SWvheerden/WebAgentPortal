@@ -21,12 +21,12 @@
     <section class="panel hidden" id="spawn-panel">
       <h2>New agent</h2>
       <div class="row">
-        <div class="field" style="flex: 2 1 320px">
+        <div class="field repo-col">
           <label>Repository</label>
           <div class="repo-list" id="repo-list"></div>
           <div class="small muted" id="repo-errors"></div>
         </div>
-        <div class="field" style="flex: 3 1 360px">
+        <div class="field form-col">
           <div class="field">
             <label for="task-name">Task name</label>
             <input id="task-name" placeholder="Fix the parser">
@@ -88,7 +88,7 @@
           </div>
           <details>
             <summary class="muted small">Advanced</summary>
-            <div class="row" style="margin-top: 8px">
+            <div class="row spaced">
               <div class="field">
                 <label for="effort">Effort</label>
                 <input id="effort" placeholder="(default)">
@@ -149,8 +149,8 @@
         <div class="field"><label for="cfg-bind">Listening on (read-only)</label><input id="cfg-bind" readonly disabled></div>
         <div class="field"><label for="cfg-hostnames">Extra hostnames (read-only)</label><input id="cfg-hostnames" readonly disabled></div>
       </div>
-      <div class="field inline"><input type="checkbox" id="cfg-open"><label for="cfg-open" style="margin:0">Open a browser on startup</label></div>
-      <div class="field inline"><input type="checkbox" id="cfg-remote-control"><label for="cfg-remote-control" style="margin:0">Remote Control: launch every agent with <code>--remote-control &lt;name&gt;</code></label></div>
+      <div class="field inline"><input type="checkbox" id="cfg-open"><label for="cfg-open">Open a browser on startup</label></div>
+      <div class="field inline"><input type="checkbox" id="cfg-remote-control"><label for="cfg-remote-control">Remote Control: launch every agent with <code>--remote-control &lt;name&gt;</code></label></div>
       <p class="small muted">Offers each agent to claude.ai and the Claude mobile app under its own slug, from the next launch onwards. <strong>Verified inert on the pinned CLI</strong>: the flag is accepted alongside <code>-p</code> but only ever reaches the interactive REPL's bridge, which a headless agent never builds — nothing connects and nothing is said about it. Left here so it works the day the CLI honours it; see DESIGN §9. The portal itself already does messages, streaming, approvals and interrupt over §12.</p>
       <button id="cfg-save" class="primary">Save</button>
       <span class="small muted">Port changes take effect on restart. Where the server listens is

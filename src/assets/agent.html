@@ -7,13 +7,15 @@
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/assets/app.css">
 </head>
-<body>
+<!-- `app`: this page fills the window and scrolls inside its panes rather than
+     as a document, once the window is big enough for that to be an improvement
+     (see app.css). The dashboard is a document and does not carry it. -->
+<body class="app">
   <header class="top">
     <a href="/">← agents</a>
     <h1 id="agent-name">…</h1>
     <span id="agent-status"></span>
     <span class="spacer"></span>
-    <span class="muted small" id="agent-meta"></span>
     <select id="agent-mode" title="Permission mode. A running agent switches at once; a stopped one picks it up on resume.">
       <option value="ask">Ask me</option>
       <option value="acceptEdits">Accept edits</option>
@@ -27,21 +29,39 @@
   </header>
 
   <main class="detail-main">
-    <div id="spawn-warning"></div>
-    <div id="approvals"></div>
-    <div class="transcript" id="transcript"></div>
-    <button id="load-earlier" class="small">Load earlier</button>
+    <!-- Everything about the agent that is not the conversation. Beside it on a
+         wide screen; above it, in this order, on a narrow one — which is why
+         the thing that blocks the agent comes first. -->
+    <aside class="side">
+      <div id="spawn-warning"></div>
+      <section class="panel" id="approvals-panel">
+        <h2>Waiting on you <span class="muted" id="approvals-count"></span></h2>
+        <div id="approvals"></div>
+        <p class="muted small" id="approvals-empty">Nothing waiting.</p>
+      </section>
+      <section class="panel">
+        <h2>Agent</h2>
+        <dl class="meta-list" id="agent-meta"></dl>
+      </section>
+    </aside>
 
-    <div class="composer">
-      <div class="autocomplete hidden" id="autocomplete"></div>
-      <textarea id="input" placeholder="Message the agent — Enter to send, Shift+Enter for a newline, ↑ for an earlier message. Type / for commands."></textarea>
-      <button id="send" class="primary" disabled>Send</button>
-    </div>
-    <div class="queued" id="queued"></div>
-    <p class="small muted">
-      Trivially safe tool calls are auto-approved by the CLI and never appear as approvals —
-      the transcript is the audit trail, the approval queue is not.
-    </p>
+    <!-- The conversation: the transcript and the box you answer it in, one
+         column, kept to a readable width however wide the window is. -->
+    <section class="conversation">
+      <div class="transcript" id="transcript"></div>
+      <button id="load-earlier" class="small">Load earlier</button>
+
+      <div class="composer">
+        <div class="autocomplete hidden" id="autocomplete"></div>
+        <textarea id="input" placeholder="Message the agent — Enter to send, Shift+Enter for a newline, ↑ for an earlier message. Type / for commands."></textarea>
+        <button id="send" class="primary" disabled>Send</button>
+      </div>
+      <div class="queued" id="queued"></div>
+      <p class="small muted">
+        Trivially safe tool calls are auto-approved by the CLI and never appear as approvals —
+        the transcript is the audit trail, the approval queue is not.
+      </p>
+    </section>
   </main>
 
   <script type="module" src="/assets/agent.js"></script>
