@@ -63,13 +63,19 @@ pub const FIRST_BACKOFF_MS: i64 = 60_000;
 /// The longest the backoff grows to.
 pub const MAX_BACKOFF_MS: i64 = 30 * 60_000;
 
-/// How many times one agent may be nudged before the watcher stops guessing.
+/// How many times one agent may be nudged **on the same evidence** before the
+/// watcher stops trying.
 ///
-/// Six, spread by the backoff over roughly half an hour, and then silence until
-/// the agent is seen working again. The failure this bounds is the one that has
-/// no natural end: a snapshot nothing refreshes reads the same way forever, and
-/// a flat retry interval turns that into hundreds of messages and hundreds of
-/// transcript rows over a five-hour window.
+/// Six, spread by the backoff over roughly half an hour. The failure this bounds
+/// is the one that has no natural end: a snapshot nothing refreshes reads the
+/// same way forever, and a flat retry interval turns that into hundreds of
+/// messages and hundreds of transcript rows over a five-hour window.
+///
+/// It bounds *guessing*, not resuming — [`Stall::saw`] hands the count back the
+/// moment the account is newly shown to have tokens, because that is the
+/// refresh whose absence the budget was standing in for. A budget that outlived
+/// its evidence would strand the agent it exists to rescue: the window really
+/// resets four hours later, the verdict really says so, and nothing is sent.
 pub const MAX_TRIES: u32 = 6;
 
 /// How long an agent has to be doing something other than sitting out of tokens
@@ -173,6 +179,11 @@ pub struct Stall {
     /// When it was last seen alive but *not* out of tokens, if it currently is.
     /// The episode ends once that has held for [`PROGRESS_MS`].
     pub working_since_ms: Option<i64>,
+    /// Whether the previous pass's verdict was [`Verdict::Tokens`], so that
+    /// *becoming* so can be told from having been so for hours. Only the
+    /// transition is news; a verdict that has read the same all along is the
+    /// very thing the budget is counting.
+    pub saw_tokens: bool,
 }
 
 impl Stall {
@@ -183,7 +194,36 @@ impl Stall {
             tries: 0,
             last_ms: 0,
             working_since_ms: None,
+            saw_tokens: false,
         }
+    }
+
+    /// Take this pass's verdict, re-arming the budget when the account has
+    /// newly been shown to have tokens.
+    ///
+    /// The budget bounds guessing, and what it stands in for is a reading that
+    /// nothing refreshes. A verdict that has just turned to [`Verdict::Tokens`]
+    /// *is* that refresh — a snapshot newer than the stall, or the reset time of
+    /// the refusal that caused it finally passing — so the count it was keeping
+    /// is spent, and starts again.
+    ///
+    /// This cannot spin. Tokens that turn out not to be there produce a 429,
+    /// whose event carries a fresh reset time; the verdict goes
+    /// [`Verdict::Held`] and nothing more is sent until the API's own clock
+    /// says otherwise. And a verdict that stays `Tokens` does not re-arm
+    /// anything: only the transition does, so each re-arming needs a real call
+    /// that really was served.
+    ///
+    /// `Held → Tokens` re-arms for the same reason `NoEvidence → Tokens` does,
+    /// and must: a stall that spent its guesses before the CLI ever reported a
+    /// reset time would otherwise be stranded by the very reading that settles
+    /// the question.
+    pub fn saw(&mut self, verdict: Verdict) {
+        let tokens = verdict == Verdict::Tokens;
+        if tokens && !self.saw_tokens {
+            self.tries = 0;
+        }
+        self.saw_tokens = tokens;
     }
 
     /// Is a nudge due?
@@ -191,8 +231,9 @@ impl Stall {
     /// `evidence` is whether the account is known to have tokens rather than
     /// merely not known to lack them. With it, the first nudge is immediate and
     /// the rest are spaced; without it the agent is left alone for
-    /// [`PATIENCE_MS`] first, and either way the budget runs out at
-    /// [`MAX_TRIES`].
+    /// [`PATIENCE_MS`] first. Either way the budget runs out at [`MAX_TRIES`] —
+    /// and is handed back by [`Stall::saw`] when fresh evidence arrives, which
+    /// is the only thing that ends an exhausted stall short of the operator.
     pub fn due(&self, now_ms: i64, evidence: bool) -> bool {
         if self.tries >= MAX_TRIES {
             return false;
@@ -423,7 +464,47 @@ mod tests {
         for pair in sent.windows(2) {
             assert!(pair[1] - pair[0] >= FIRST_BACKOFF_MS, "{sent:?}");
         }
-        assert!(!stall.due(now + 86_400_000, true), "even with evidence");
+        assert!(
+            !stall.due(now + 86_400_000, true),
+            "spent, while the verdict has not changed"
+        );
+    }
+
+    /// The budget bounds guessing, so evidence has to hand it back. Without
+    /// this the single-agent case fails exactly where it must not: nothing else
+    /// is running to refresh the account-wide snapshot, the six guesses go in
+    /// the first half hour, and when the window really does reset four hours
+    /// later the verdict says `Tokens`, `evidence` is true — and the agent is
+    /// never spoken to again.
+    #[test]
+    fn evidence_hands_the_budget_back() {
+        let mut stall = Stall::new(STALL);
+        for _ in 0..MAX_TRIES {
+            stall.nudged(STALL);
+        }
+        assert!(!stall.due(STALL + 86_400_000, true), "spent");
+
+        // Four hours later a snapshot newer than the stall arrives.
+        stall.saw(Verdict::Tokens);
+        assert!(stall.due(STALL + 86_400_000, true), "and it is rescued");
+
+        // Staying `Tokens` is not news, so the backoff still applies to the
+        // nudges that follow: only the transition re-arms.
+        stall.nudged(STALL + 86_400_000);
+        stall.saw(Verdict::Tokens);
+        assert!(!stall.due(STALL + 86_400_000, true));
+        assert!(stall.due(STALL + 86_400_000 + FIRST_BACKOFF_MS, true));
+
+        // A stall that spent its guesses before the CLI ever named a reset time
+        // is rescued by the same rule the moment that window passes.
+        let mut stall = Stall::new(STALL);
+        for _ in 0..MAX_TRIES {
+            stall.nudged(STALL);
+        }
+        stall.saw(Verdict::Held);
+        assert!(!stall.due(STALL + 86_400_000, false), "still waiting");
+        stall.saw(Verdict::Tokens);
+        assert!(stall.due(STALL + 86_400_000, true));
     }
 
     #[test]

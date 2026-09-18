@@ -381,7 +381,12 @@ impl Supervisor {
                 .entry(id.clone())
                 .or_insert_with(|| resume::Stall::new(now));
             stall.stalled();
-            let evidence = match resume::verdict(snapshot, stall.since_ms, now) {
+            let verdict = resume::verdict(snapshot, stall.since_ms, now);
+            // Evidence that has just arrived hands the budget back: what the
+            // budget bounds is guessing, and this is the refresh it was
+            // standing in for.
+            stall.saw(verdict);
+            let evidence = match verdict {
                 // The window has not reset. The common answer, and the one the
                 // whole feature is waiting for.
                 resume::Verdict::Held => continue,
@@ -394,9 +399,13 @@ impl Supervisor {
             // Counted before it is sent: a nudge that failed halfway still
             // spent its turn, and must not be free to repeat next tick.
             stall.nudged(now);
+            let spent = stall.tries >= resume::MAX_TRIES;
             let resets_at = snapshot.and_then(|(_, info)| resume::resets_at_ms(info));
             if self.nudge(&id, resets_at, evidence).await {
-                resumed.push(id);
+                resumed.push(id.clone());
+            }
+            if spent {
+                self.announce_exhausted(&id, evidence).await;
             }
         }
         resumed
@@ -488,6 +497,42 @@ impl Supervisor {
             ),
         });
         true
+    }
+
+    /// Say that the budget is spent, once, as it is spent.
+    ///
+    /// Silence here is indistinguishable from patience: the dashboard says
+    /// *Out of tokens* either way, and the transcript shows the same handful of
+    /// markers whether the watcher is still waiting on the window or has given
+    /// up on it. That is the difference between going to bed and not, so it is
+    /// said rather than left to be inferred.
+    ///
+    /// Sent as the last nudge goes out rather than on the ticks that follow, so
+    /// it lands once per budget. Fresh evidence hands the budget back
+    /// ([`resume::Stall::saw`]), and a budget spent a second time says so a
+    /// second time — by then it is news again.
+    async fn announce_exhausted(&self, id: &str, evidence: bool) {
+        tracing::warn!(agent = %id, evidence, "auto-resume has given up on this agent");
+        self.log_system(
+            id,
+            json!({
+                "type": "system",
+                "subtype": "auto_resume_exhausted",
+                "tries": resume::MAX_TRIES,
+                "evidence": evidence,
+            }),
+        )
+        .await;
+        self.broadcast(ServerMsg::Notice {
+            agent_id: Some(id.to_string()),
+            level: "warn".to_string(),
+            text: format!(
+                "Auto-resume has stopped after {} attempts and the agent is still out of \
+                 tokens. It will try again if the account is reported to have tokens; \
+                 otherwise send it a message yourself.",
+                resume::MAX_TRIES
+            ),
+        });
     }
 
     /// Append a `system` event to an agent's log and put it on the bus.
@@ -2895,6 +2940,26 @@ mod tests {
             marker.payload.get("evidence").and_then(Value::as_bool),
             Some(false)
         );
+
+        // Giving up is said out loud, once. Silence here is indistinguishable
+        // from patience, and the dashboard says "Out of tokens" either way —
+        // the operator cannot otherwise tell an agent that is still being
+        // watched from one that has been abandoned.
+        assert_eq!(logged(&sup, "auto_resume_exhausted").await, 1);
+
+        // And a spent budget is not a life sentence: hours later the window
+        // really does reset, some agent's CLI reports it, and the verdict says
+        // so. Refusing to act on that is the 4am state this feature exists to
+        // remove.
+        let allowed: RateLimitInfo =
+            serde_json::from_value(json!({"status": "allowed"})).expect("info");
+        *sup.rate_limit.write().await = Some((now, allowed));
+        assert_eq!(
+            sup.auto_resume_pass(&mut stalls, now).await,
+            vec!["agent-limited"],
+            "evidence has to hand the budget back"
+        );
+        assert_eq!(typed(&mut rx).as_deref(), Some(resume::RESUME_PROMPT));
     }
 
     /// The case the spacing is load-bearing for, and the one a

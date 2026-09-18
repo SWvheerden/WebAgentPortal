@@ -188,6 +188,14 @@ function renderEvent(event) {
           el('div', { class: 'body', text: `↻ ${why} — auto-resumed: "${p.prompt || 'resume where you left off'}"` }),
         ]);
       }
+      // Auto-resume has given up on this agent. Without this the transcript
+      // looks the same whether it is still waiting on the window or has
+      // stopped trying, which is the difference between going to bed and not.
+      if (p.subtype === 'auto_resume_exhausted') {
+        return el('div', { class: 'ev system' }, [
+          el('div', { class: 'body', text: `↻ auto-resume gave up after ${p.tries ?? 'several'} attempts — it will try again if the account is reported to have tokens` }),
+        ]);
+      }
       // The child went away between the decision and the send. Said out loud,
       // or the line above is left claiming a resume that never happened.
       if (p.subtype === 'auto_resume_failed') {
