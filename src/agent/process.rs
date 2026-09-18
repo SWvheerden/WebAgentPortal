@@ -404,10 +404,9 @@ impl Dispatcher {
                 if let Some(cost) = res.total_cost_usd {
                     out.push(Action::Cost(cost));
                 }
-                // A turn killed by a rate limit ends exactly like one that
-                // finished the job: `TurnEnded`, then `Idle`. Say so, or the
-                // operator is left looking at an idle agent that quietly
-                // stopped halfway and no sign of why.
+                // A turn that died on the API still reports `subtype: success`
+                // (F15), so a failure is only visible if it is said out loud.
+                // One notice per turn, carrying the CLI's own wording.
                 if let Some(text) = res.failure() {
                     out.push(Action::Notice {
                         level: "error".to_string(),
@@ -416,15 +415,30 @@ impl Dispatcher {
                 }
                 self.tool_labels.clear();
                 self.turn_open = false;
-                // The turn is over, but a backgrounded subagent outlives it:
-                // the CLI returns the `Task` tool result as soon as the
-                // subagent *starts*, and wakes the agent again when it
-                // finishes. Reporting `idle` here tells the operator the agent
-                // is waiting on them, when it is waiting on its own subagent.
-                if self.background_tasks.is_empty() {
+                // Out of tokens is not a finished turn, and `idle` — which
+                // claims the agent is waiting on the operator — is the one
+                // thing it is not: there is nothing they can type that will
+                // move it until the window resets. The notice above is a toast
+                // and is gone by the time they look; the status is what the
+                // dashboard still shows an hour later, so it carries the CLI's
+                // own wording, reset time and all. The agent stays live
+                // throughout: the child is alive and can be spoken to (F15).
+                if res.out_of_tokens() {
+                    // A subagent left running has nothing to run on either, so
+                    // there is no turn end left to hold back for it.
+                    self.deferred_turn_end = false;
+                    out.push(Action::StatusDetail(res.limit_wording()));
+                    out.push(Action::Transition(Transition::LimitReached));
+                } else if self.background_tasks.is_empty() {
                     out.push(Action::StatusDetail(None));
                     out.push(Action::Transition(Transition::TurnEnded));
                 } else {
+                    // The turn is over, but a backgrounded subagent outlives
+                    // it: the CLI returns the `Task` tool result as soon as the
+                    // subagent *starts*, and wakes the agent again when it
+                    // finishes. Reporting `idle` here tells the operator the
+                    // agent is waiting on them, when it is waiting on its own
+                    // subagent.
                     self.deferred_turn_end = true;
                     out.push(Action::StatusDetail(Some(self.waiting_label())));
                 }
@@ -1545,10 +1559,36 @@ mod tests {
             "the reason has to survive: {text}"
         );
 
-        // The turn is still over, and the agent still goes idle: the process is
-        // alive and can be spoken to. Only the silence was the bug.
-        assert!(actions.contains(&Action::Transition(Transition::TurnEnded)));
+        // The turn is over, but not finished, and `idle` would claim the agent
+        // is waiting on the operator when nothing they type can move it.
+        assert!(actions.contains(&Action::Transition(Transition::LimitReached)));
+        assert!(
+            !actions.contains(&Action::Transition(Transition::TurnEnded)),
+            "out of tokens replaces the ordinary turn end, it does not follow it"
+        );
+        // The toast is gone by the time anyone looks; the status is not, so it
+        // carries the reset time.
+        let Some(Action::StatusDetail(Some(detail))) = actions
+            .iter()
+            .find(|a| matches!(a, Action::StatusDetail(_)))
+        else {
+            panic!("no status detail in {actions:?}");
+        };
+        assert!(detail.contains("resets 7pm"), "{detail}");
         assert!(actions.contains(&Action::Cost(89.7)));
+    }
+
+    /// Only the rate limit means the *next* turn cannot run either. Any other
+    /// failed turn is over in the ordinary way, and the agent really is waiting
+    /// on the operator.
+    #[test]
+    fn a_turn_that_failed_for_another_reason_still_comes_to_rest() {
+        let actions = dispatch(&[
+            r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":500,"result":"Internal server error"}"#,
+        ]);
+        assert!(actions.contains(&Action::Transition(Transition::TurnEnded)));
+        assert!(!actions.contains(&Action::Transition(Transition::LimitReached)));
+        assert!(actions.contains(&Action::StatusDetail(None)));
     }
 
     /// `subtype` says `success` even on the 429, so nothing may key off it —

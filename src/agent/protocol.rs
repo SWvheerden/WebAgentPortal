@@ -228,6 +228,35 @@ impl ResultLine {
             .unwrap_or_default();
         Some(format!("The turn ended in an error{status}{detail}"))
     }
+
+    /// Did the account run out of tokens on this turn?
+    ///
+    /// By F15 `subtype` still reads `success`, so the pair that means it is
+    /// `is_error` with `api_error_status: 429` — the rate limit. Any other
+    /// failure ends the turn the ordinary way: it says nothing about whether
+    /// the next one can run.
+    pub fn out_of_tokens(&self) -> bool {
+        self.is_error && self.api_error_status == Some(429)
+    }
+
+    /// The CLI's own wording for the limit — "You've hit your session limit ·
+    /// resets 7pm (Africa/Johannesburg)" — for the status sub-label.
+    ///
+    /// Longer than a tool label is allowed to be, because the reset time is
+    /// the whole point of showing it and it sits at the end.
+    pub fn limit_wording(&self) -> Option<String> {
+        let text = self
+            .result
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())?;
+        let short: String = text.chars().take(100).collect();
+        Some(if short.len() < text.len() {
+            format!("{short}…")
+        } else {
+            short
+        })
+    }
 }
 
 /// A `control_request` from the CLI to us. The only subtype we act on is

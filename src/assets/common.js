@@ -149,6 +149,9 @@ export function statusLabel(status, detail) {
     idle: 'Idle',
     working: 'Working',
     awaiting_approval: 'Awaiting approval',
+    // Named `rate_limited` on the wire, after the 429 that causes it; the
+    // operator is told the thing they can act on, which is that it stopped.
+    rate_limited: 'Out of tokens',
     stopped: 'Stopped',
     failed: 'Failed',
   }[status] || status;

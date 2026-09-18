@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 
 /// Where an agent is in its lifecycle.
 ///
-/// `Starting → Idle → Working → Idle …` with [`Status::AwaitingApproval`]
-/// branching off `Working`, and `Stopped` / `Failed` as terminal states. The
-/// exit code, error text and the live tool sub-label live alongside the status
-/// on the agent record rather than inside the enum, because that is how they
-/// are stored.
+/// `Starting → Idle → Working → Idle …` with [`Status::AwaitingApproval`] and
+/// [`Status::RateLimited`] branching off `Working`, and `Stopped` / `Failed` as
+/// terminal states. The exit code, error text and the live tool sub-label live
+/// alongside the status on the agent record rather than inside the enum,
+/// because that is how they are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -19,6 +19,12 @@ pub enum Status {
     Idle,
     Working,
     AwaitingApproval,
+    /// The account ran out of tokens mid-turn (F15). Live, not terminal: the
+    /// child is alive and can be spoken to, but the work stopped short and
+    /// nothing the operator types moves it until the window resets. Named for
+    /// the rate limit that causes it, to match `rate_limit_event` and the
+    /// `rate_limit` table; the operator reads it as "out of tokens".
+    RateLimited,
     Stopped,
     Failed,
 }
@@ -30,6 +36,7 @@ impl Status {
             Status::Idle => "idle",
             Status::Working => "working",
             Status::AwaitingApproval => "awaiting_approval",
+            Status::RateLimited => "rate_limited",
             Status::Stopped => "stopped",
             Status::Failed => "failed",
         }
@@ -68,6 +75,12 @@ impl Status {
             (AwaitingApproval, PermissionResolved) => Some(Working),
             (s, PermissionResolved) => Some(s),
 
+            // Ends the turn as surely as `TurnEnded` does, and replaces it: the
+            // agent is not resting, it is out of tokens. `TurnStarted` is what
+            // leaves this state, so the next turn — typed by the operator once
+            // the window resets, or begun by the CLI itself — clears it.
+            (_, LimitReached) => Some(RateLimited),
+
             (_, TurnEnded) => Some(Idle),
             (_, Exited) => Some(Stopped),
             (_, Errored) => Some(Failed),
@@ -90,6 +103,7 @@ impl FromStr for Status {
             "idle" => Ok(Status::Idle),
             "working" => Ok(Status::Working),
             "awaiting_approval" => Ok(Status::AwaitingApproval),
+            "rate_limited" => Ok(Status::RateLimited),
             "stopped" => Ok(Status::Stopped),
             "failed" => Ok(Status::Failed),
             other => Err(UnknownStatus(other.to_string())),
@@ -116,6 +130,10 @@ pub enum Transition {
     PermissionResolved,
     /// A `result` line closed the turn.
     TurnEnded,
+    /// A `result` line closed the turn because the account is out of tokens —
+    /// an HTTP 429 (F15). Raised instead of [`Transition::TurnEnded`], never
+    /// alongside it.
+    LimitReached,
     /// The process exited on request.
     Exited,
     /// The process died unexpectedly, or could not be started.
@@ -267,6 +285,33 @@ mod tests {
         );
     }
 
+    /// Running out of tokens is a live state, not a death: the child is still
+    /// there, and the next turn — whoever begins it — clears the state.
+    #[test]
+    fn out_of_tokens_holds_until_a_turn_starts() {
+        let s = Status::Working
+            .apply(Transition::LimitReached)
+            .expect("429");
+        assert_eq!(s, Status::RateLimited);
+        assert!(s.is_live() && !s.is_terminal());
+        // Nothing but a turn moves it. `Initialized` opens every turn (F1a) and
+        // must not quietly report the agent as rested.
+        assert_eq!(s.apply(Transition::Initialized), Some(Status::RateLimited));
+        assert_eq!(s.apply(Transition::TurnStarted), Some(Status::Working));
+        // A second limited turn is not news, so it does not republish.
+        assert_eq!(s.apply(Transition::LimitReached), Some(Status::RateLimited));
+    }
+
+    /// A limit that lands while a tool call is out for approval leaves the
+    /// approval standing: it is still the operator's to answer.
+    #[test]
+    fn an_approval_outlives_the_limit_that_interrupted_it() {
+        assert_eq!(
+            Status::RateLimited.apply(Transition::PermissionRequested),
+            Some(Status::AwaitingApproval)
+        );
+    }
+
     #[test]
     fn init_before_every_turn_does_not_reset_working() {
         assert_eq!(
@@ -289,6 +334,7 @@ mod tests {
                 Transition::TurnEnded,
                 Transition::PermissionRequested,
                 Transition::PermissionResolved,
+                Transition::LimitReached,
                 Transition::Exited,
                 Transition::Errored,
             ] {
@@ -305,6 +351,7 @@ mod tests {
             Status::Idle,
             Status::Working,
             Status::AwaitingApproval,
+            Status::RateLimited,
         ] {
             assert!(s.is_live());
             assert_eq!(s.apply(Transition::Exited), Some(Status::Stopped));
@@ -319,6 +366,7 @@ mod tests {
             Status::Idle,
             Status::Working,
             Status::AwaitingApproval,
+            Status::RateLimited,
             Status::Stopped,
             Status::Failed,
         ] {

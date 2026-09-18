@@ -48,12 +48,14 @@ These are load-bearing — several contradict what the published docs imply.
   transcript entries, so both are handled without a row in `events` and without a toast —
   persisting a 30s heartbeat buries the transcript it is meant to annotate.
 - **A failed turn is indistinguishable from a finished one unless it is made so.** F15 means a
-  rate limit ends the turn through the ordinary `TurnEnded` path and leaves the agent `Idle`,
-  which is exactly what success looks like. The `result`'s `is_error` therefore raises an
-  error notice naming the status and the CLI's own wording, once per turn; the synthetic
-  `assistant` lines are filed under `error` rather than `assistant`, so the transcript never
-  puts "You've hit your session limit" in Claude's mouth. Neither changes the state machine:
-  the process really is idle and really can be spoken to.
+  rate limit would otherwise end the turn through the ordinary `TurnEnded` path and leave the
+  agent `Idle`, which is exactly what success looks like. Three things separate them. The
+  `result`'s `is_error` raises an error notice naming the status and the CLI's own wording,
+  once per turn; the synthetic `assistant` lines are filed under `error` rather than
+  `assistant`, so the transcript never puts "You've hit your session limit" in Claude's mouth;
+  and a 429 specifically raises `LimitReached` in place of `TurnEnded`, resting the agent at
+  `RateLimited` rather than `Idle`. Only the 429 gets that last one — any other failed turn
+  really is over and really is waiting on the operator.
 - **F4 means the approval UI is not a complete audit trail.** Some tool calls execute without
   ever asking. The transcript shows them; the approval queue does not.
 
@@ -177,9 +179,9 @@ thousands of rows per turn and replay re-animates every keystroke.
 ## 4. Agent lifecycle
 
 ### Status state machine
-`Starting → Idle → Working → Idle …`, with `AwaitingApproval` branching off `Working`,
-and `Stopped(code)` / `Failed(error)` as terminal states. `Working` carries a live
-sub-label naming the current tool.
+`Starting → Idle → Working → Idle …`, with `AwaitingApproval` and `RateLimited`
+branching off `Working`, and `Stopped(code)` / `Failed(error)` as terminal states.
+`Working` carries a live sub-label naming the current tool.
 
 **`Idle` claims the agent is waiting on the operator**, which is the only reason the
 status exists — it is what tells them to type. By F17 the closing `result` no longer
@@ -196,6 +198,29 @@ And because that woken turn carries no message from us, **the first line of CLI 
 raises `TurnStarted`**, whoever began the turn. Sending a message still raises it too,
 so the transition arrives at most once per turn either way; a transition that lands
 where it already was is not published.
+
+### Out of tokens
+**`RateLimited` is what `Idle` would have lied about.** By F15 a turn killed by the
+account's rate limit closes with an ordinary `result` — the work stopped halfway, and the
+status said the agent was resting and waiting to be typed at. Nothing the operator can type
+helps until the window resets, so a `result` carrying `is_error` with `api_error_status: 429`
+raises **`LimitReached` instead of `TurnEnded`**, and the agent comes to rest at
+`RateLimited`. The status is displayed as *"Out of tokens — You've hit your session limit ·
+resets 7pm"*: the `result`'s own wording becomes the sub-label, because the error notice is a
+toast that is long gone by the time anyone looks at the dashboard, and the reset time is the
+one fact worth keeping.
+
+It is a **live** state, not a terminal one. The child is alive and can be spoken to, Stop and
+Interrupt still apply, and nothing about `Resume` changes. `TurnStarted` is what leaves it —
+whether the operator types once the window has reset, or the CLI wakes the agent itself — so
+the state clears the moment work actually resumes rather than on a timer we would have to
+trust. `Initialized` does not clear it: by F1a that opens every turn, and it would report the
+agent as rested before a single token had been spent. A limit that lands while a subagent is
+still running drops the held-back turn end (§4): the subagent has nothing to run on either.
+
+Only the 429 does this. Any other failed turn ends through `TurnEnded` as before — a 500 says
+nothing about whether the next turn can run. The wire name is `rate_limited`, matching
+`rate_limit_event` and the `rate_limit` table; only the operator-facing label says tokens.
 
 ### Launch
 ```

@@ -236,6 +236,9 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 .s-idle .dot { background: var(--dim); }
 .s-working .dot { background: var(--accent); animation: pulse 1.2s infinite; }
 .s-awaiting_approval .dot { background: var(--warn); animation: pulse 1.2s infinite; }
+/* Amber like an approval, but still: nothing is happening, and unlike an
+   approval there is nothing to answer — only a window to wait out. */
+.s-rate_limited .dot { background: var(--warn); }
 .s-stopped .dot { background: #6e7681; }
 .s-failed .dot { background: var(--err); }
 @keyframes pulse { 50% { opacity: .3; } }
