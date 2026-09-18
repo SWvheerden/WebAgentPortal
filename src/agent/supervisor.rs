@@ -396,16 +396,23 @@ impl Supervisor {
             if !stall.due(now, evidence) {
                 continue;
             }
+            // Which phase this nudge belongs to has to be read before it is
+            // counted, since counting it is what ends the phase.
+            let probe = stall.probing();
             // Counted before it is sent: a nudge that failed halfway still
             // spent its turn, and must not be free to repeat next tick.
             stall.nudged(now);
-            let spent = stall.tries >= resume::MAX_TRIES;
             let resets_at = snapshot.and_then(|(_, info)| resume::resets_at_ms(info));
-            if self.nudge(&id, resets_at, evidence).await {
+            if self.nudge(&id, resets_at, evidence, probe).await {
                 resumed.push(id.clone());
             }
-            if spent {
-                self.announce_exhausted(&id, evidence).await;
+            // Two different pieces of news, and the operator needs to be able
+            // to tell them apart: the watcher has slowed to an hourly probe, or
+            // it has stopped for good.
+            if stall.stopped() {
+                self.announce_stopped(&id).await;
+            } else if !probe && stall.probing() {
+                self.announce_slowed(&id).await;
             }
         }
         resumed
@@ -452,7 +459,13 @@ impl Supervisor {
     /// leaves one gap — a child that goes away in between — and a second line
     /// closes it rather than leaving the log claiming a resume that never
     /// happened.
-    async fn nudge(&self, id: &str, resets_at_ms: Option<i64>, evidence: bool) -> bool {
+    async fn nudge(
+        &self,
+        id: &str,
+        resets_at_ms: Option<i64>,
+        evidence: bool,
+        probe: bool,
+    ) -> bool {
         self.log_system(
             id,
             json!({
@@ -464,6 +477,8 @@ impl Supervisor {
                 // was guessing. The difference is worth having in the log when
                 // the resume turns out to have been premature.
                 "evidence": evidence,
+                // A dense nudge, or one of the hourly probes that follow them.
+                "phase": if probe { "probe" } else { "dense" },
             }),
         )
         .await;
@@ -499,6 +514,34 @@ impl Supervisor {
         true
     }
 
+    /// Say that the watcher has dropped to an hourly probe.
+    ///
+    /// Half an hour of nudges have gone unanswered, which is worth saying —
+    /// but it is emphatically not giving up, and the line says so, because the
+    /// operator reading it at midnight is deciding whether to stay up.
+    async fn announce_slowed(&self, id: &str) {
+        tracing::info!(agent = %id, "auto-resume has slowed to an hourly probe");
+        self.log_system(
+            id,
+            json!({
+                "type": "system",
+                "subtype": "auto_resume_slowed",
+                "tries": resume::DENSE_TRIES,
+                "probe_ms": resume::PROBE_MS,
+            }),
+        )
+        .await;
+        self.broadcast(ServerMsg::Notice {
+            agent_id: Some(id.to_string()),
+            level: "info".to_string(),
+            text: format!(
+                "Still out of tokens after {} automatic attempts. Auto-resume is still \
+                 watching, and will try again about once an hour.",
+                resume::DENSE_TRIES
+            ),
+        });
+    }
+
     /// Say that the budget is spent, once, as it is spent.
     ///
     /// Silence here is indistinguishable from patience: the dashboard says
@@ -508,18 +551,16 @@ impl Supervisor {
     /// said rather than left to be inferred.
     ///
     /// Sent as the last nudge goes out rather than on the ticks that follow, so
-    /// it lands once per budget. Fresh evidence hands the budget back
-    /// ([`resume::Stall::saw`]), and a budget spent a second time says so a
-    /// second time — by then it is news again.
-    async fn announce_exhausted(&self, id: &str, evidence: bool) {
-        tracing::warn!(agent = %id, evidence, "auto-resume has given up on this agent");
+    /// it lands once per stall — nothing hands [`resume::MAX_NUDGES`] back, so
+    /// unlike the dense budget this really is the end of it.
+    async fn announce_stopped(&self, id: &str) {
+        tracing::warn!(agent = %id, "auto-resume has given up on this agent");
         self.log_system(
             id,
             json!({
                 "type": "system",
                 "subtype": "auto_resume_exhausted",
-                "tries": resume::MAX_TRIES,
-                "evidence": evidence,
+                "nudges": resume::MAX_NUDGES,
             }),
         )
         .await;
@@ -528,9 +569,9 @@ impl Supervisor {
             level: "warn".to_string(),
             text: format!(
                 "Auto-resume has stopped after {} attempts and the agent is still out of \
-                 tokens. It will try again if the account is reported to have tokens; \
-                 otherwise send it a message yourself.",
-                resume::MAX_TRIES
+                 tokens. Nothing further will be tried automatically — send it a message \
+                 yourself once the account has tokens again.",
+                resume::MAX_NUDGES
             ),
         });
     }
@@ -2890,8 +2931,13 @@ mod tests {
     /// never refreshes reads the same way forever. Five hours of ticks must
     /// cost a handful of messages, not one a minute — each is an API call, a
     /// transcript row and context in the child.
+    ///
+    /// But it must not stop watching either. When every agent on the account is
+    /// out of tokens — the case the feature was built for — the nudges are the
+    /// only thing that can refresh the snapshot, so the dense phase gives way
+    /// to an hourly probe rather than to silence.
     #[tokio::test]
-    async fn an_unknown_account_is_guessed_at_a_few_times_and_then_left_alone() {
+    async fn an_unknown_account_is_guessed_at_and_then_probed_hourly() {
         let (sup, mut rx) = one_agent(Status::RateLimited).await;
         // Nothing has ever been reported: no snapshot at all.
         let start = now_ms();
@@ -2910,21 +2956,22 @@ mod tests {
         // The first guess waited: one made a tick after the limit landed is the
         // behaviour the feature exists to avoid.
         assert_eq!(first, Some(resume::PATIENCE_MS));
+        // Six dense nudges inside the first hour, then one an hour.
+        let expected = resume::DENSE_TRIES as usize + 4;
         assert_eq!(
-            sent,
-            resume::MAX_TRIES as usize,
-            "five hours of guessing must cost {} messages",
-            resume::MAX_TRIES
+            sent, expected,
+            "five hours of guessing must cost {expected} messages"
+        );
+        assert!(
+            sent < resume::MAX_NUDGES as usize,
+            "and stay under the ceiling"
         );
         let mut delivered = 0;
         while typed(&mut rx).is_some() {
             delivered += 1;
         }
-        assert_eq!(delivered, resume::MAX_TRIES as usize);
-        assert_eq!(
-            logged(&sup, "auto_resume").await,
-            resume::MAX_TRIES as usize
-        );
+        assert_eq!(delivered, expected);
+        assert_eq!(logged(&sup, "auto_resume").await, expected);
 
         // And the log says it was a guess, which is the thing worth knowing
         // when a resume turns out to have been premature.
@@ -2941,11 +2988,16 @@ mod tests {
             Some(false)
         );
 
-        // Giving up is said out loud, once. Silence here is indistinguishable
-        // from patience, and the dashboard says "Out of tokens" either way —
-        // the operator cannot otherwise tell an agent that is still being
-        // watched from one that has been abandoned.
-        assert_eq!(logged(&sup, "auto_resume_exhausted").await, 1);
+        // Slowing down is said out loud, once, and is not the same news as
+        // giving up: the dashboard says "Out of tokens" throughout, and the
+        // operator deciding whether to stay up needs to tell "still watching,
+        // slowly" from "abandoned".
+        assert_eq!(logged(&sup, "auto_resume_slowed").await, 1);
+        assert_eq!(
+            logged(&sup, "auto_resume_exhausted").await,
+            0,
+            "the ceiling is not reached by an ordinary stall"
+        );
 
         // And a spent budget is not a life sentence: hours later the window
         // really does reset, some agent's CLI reports it, and the verdict says
@@ -2954,12 +3006,67 @@ mod tests {
         let allowed: RateLimitInfo =
             serde_json::from_value(json!({"status": "allowed"})).expect("info");
         *sup.rate_limit.write().await = Some((now, allowed));
+        assert!(
+            sup.auto_resume_pass(&mut stalls, now).await.is_empty(),
+            "a re-arm does not let a nudge jump the queue: the last probe was \
+             minutes ago, and a flapping snapshot would nudge on every tick"
+        );
+        let rescued = now + resume::REARM_FLOOR_MS;
         assert_eq!(
-            sup.auto_resume_pass(&mut stalls, now).await,
+            sup.auto_resume_pass(&mut stalls, rescued).await,
             vec!["agent-limited"],
             "evidence has to hand the budget back"
         );
         assert_eq!(typed(&mut rx).as_deref(), Some(resume::RESUME_PROMPT));
+    }
+
+    /// The ceiling, end to end. A sibling served on a window this agent is not
+    /// on flips the account-wide snapshot back and forth, and every flip hands
+    /// the dense budget back — so without a total cap the re-arm is the flat
+    /// retry again, by a third route. At the cap the watcher says so and stops
+    /// for good, which unlike slowing down nothing undoes.
+    #[tokio::test]
+    async fn a_flapping_account_cannot_nudge_forever_and_says_when_it_stops() {
+        let (sup, mut rx) = one_agent(Status::RateLimited).await;
+        let allowed: RateLimitInfo =
+            serde_json::from_value(json!({"status": "allowed"})).expect("info");
+        let refused: RateLimitInfo =
+            serde_json::from_value(json!({"status": "rejected"})).expect("info");
+        let start = now_ms();
+        let mut stalls = HashMap::new();
+        let mut sent = 0;
+        let mut now = start;
+        let mut tokens = false;
+        // Seven hours, because the floor holds the flapping to one nudge per
+        // half hour and the point is to reach the ceiling, not approach it.
+        while now < start + 7 * 3_600_000 {
+            tokens = !tokens;
+            // Alternating: a sibling served a moment ago, which is newer than
+            // the stall and reads `Tokens`; then this agent's own refusal,
+            // carrying no reset time (F13 makes it optional), which reads
+            // `NoEvidence`.
+            let info = if tokens {
+                allowed.clone()
+            } else {
+                refused.clone()
+            };
+            *sup.rate_limit.write().await = Some((now, info));
+            sent += sup.auto_resume_pass(&mut stalls, now).await.len();
+            now += resume::TICK.as_millis() as i64;
+        }
+        assert_eq!(sent, resume::MAX_NUDGES as usize);
+        let mut delivered = 0;
+        while typed(&mut rx).is_some() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, resume::MAX_NUDGES as usize);
+        assert_eq!(logged(&sup, "auto_resume_exhausted").await, 1);
+
+        // And it stays stopped: the ceiling is the one thing evidence does not
+        // hand back.
+        *sup.rate_limit.write().await = Some((now, allowed));
+        assert!(sup.auto_resume_pass(&mut stalls, now).await.is_empty());
+        assert_eq!(typed(&mut rx), None);
     }
 
     /// The case the spacing is load-bearing for, and the one a

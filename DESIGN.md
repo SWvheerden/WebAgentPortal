@@ -254,28 +254,49 @@ first tick after the limit landed would resume the agent it was meant to protect
 
 **A guess is bounded in number, not merely in rate.** `NoEvidence` still resumes eventually —
 waiting on an event that cannot arrive is the worse error, and a wasted turn fails fast — but
-it waits 5 minutes first, then retries at 1, 2, 4, 8, 16 minutes, and stops after **6 nudges**.
-At one a minute a snapshot nothing refreshes would cost ~300 messages, transcript rows and API
-calls per agent across a five-hour window; the claim that a fresh 429 would end that is not one
-the code can make, since a 429 whose event carries no reset time lands straight back in the
-same branch.
+it waits 5 minutes first, then retries at 1, 2, 4, 8, 16 minutes. At one a minute a snapshot
+nothing refreshes would cost ~300 messages, transcript rows and API calls per agent across a
+five-hour window; the claim that a fresh 429 would end that is not one the code can make, since
+a 429 whose event carries no reset time lands straight back in the same branch.
 
-**The budget bounds guessing, so evidence hands it back.** A verdict that has just *become*
-`Tokens` — a snapshot newer than the stall, or the reset time of the refusal that caused it
+**But it must never stop watching, because the nudges are the only probe there is.** A nudge
+either gets through, and the CLI reports a snapshot that says so, or it is refused, and the CLI
+reports that instead. When every agent on the account is out of tokens — which is not an edge
+case, it is the case this was built for — nothing else is making the call that would refresh
+the account-wide snapshot, so a watcher that stopped at 36 minutes would sleep through the
+reset it is waiting for. After the dense phase it therefore drops to **one probe an hour**, at
+a cost of about four extra nudges across a five-hour window.
+
+So three phases and a ceiling: **dense** (6 nudges, widening), **probe** (hourly), and
+**stopped** at **12 nudges per stall** — a ceiling no verdict can undo.
+
+**The dense budget bounds guessing, so evidence hands it back.** A verdict that has just
+*become* `Tokens` — a snapshot newer than the stall, or the reset time of the refusal that caused it
 finally passing — is precisely the refresh the budget was standing in for, so the count starts
 again. Without that the feature fails in the case it was built for: one agent, nothing else
 running to refresh the account-wide snapshot, a refusal carrying no `resetsAt`, six guesses
 spent in the first half hour — and when the window really resets four hours later and the
 verdict says so, nothing is sent. Only the *transition* re-arms, so a verdict that has read
-`Tokens` all along is still counted, and the path cannot spin: tokens that turn out not to be
-there produce a 429 whose event carries a fresh reset time, the verdict goes `Held`, and the
-API's own clock decides when anything is sent next.
+`Tokens` all along is still counted.
 
-**Giving up is said out loud**, once, as the last nudge goes out: an `auto_resume_exhausted`
-line and a warning. Silence is indistinguishable from patience — the dashboard says *Out of
-tokens* either way, and the transcript shows the same handful of markers — so without it the
-operator cannot tell an agent that is still being watched from one that has been abandoned,
-which is the difference between going to bed and not.
+**A re-arm is not proof, which is what the ceiling and the floor are for.** "Every re-arm
+needs a real window to pass" holds for `Held → Tokens`, whose intermediate state carries a real
+future `resetsAt` — and fails flat for `NoEvidence → Tokens`, where no clock is involved at
+all: a sibling served on a window *this* agent is not on (a different model, `seven_day` against
+`five_hour`) writes `allowed` into the shared snapshot, this agent's own reset-time-less 429
+writes `rejected` back, and the verdict flaps with whichever landed last. Every flap would hand
+the budget back. So a re-armed budget may not nudge within **30 minutes** of the previous nudge
+— which never delays the case that matters, where a window resets hours after the last attempt
+— and `MAX_NUDGES` caps the stall outright whatever the verdict does.
+
+**Slowing down and giving up are said out loud**, and are different news: an
+`auto_resume_slowed` line when the dense phase ends (*still watching, about once an hour*) and
+an `auto_resume_exhausted` warning at the ceiling (*nothing further will be tried*). Each goes
+out once, as the nudge that causes it does. Silence is indistinguishable from patience — the
+dashboard says *Out of tokens* throughout, and the transcript shows the same handful of markers
+— so without them the operator cannot tell an agent still being watched from one that has been
+abandoned, which is the difference between going to bed and not. Each `auto_resume` marker
+carries its own phase for the same reason.
 
 **Leaving `RateLimited` does not hand the budget back** — only evidence does. A nudge starts a
 turn, so the agent goes `Working` and can be refused again seconds later — if that reset the count, the backoff

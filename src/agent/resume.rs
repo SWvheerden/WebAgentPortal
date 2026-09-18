@@ -20,7 +20,7 @@
 //!   watcher waits first, then retries on a widening interval, then gives up
 //!   until the agent is doing something again. Every nudge is an API call, a
 //!   transcript row and context in the child, so the budget for guessing is
-//!   [`MAX_TRIES`] of them per stall, not one a minute for five hours.
+//!   [`DENSE_TRIES`] of them per stall, not one a minute for five hours.
 //!
 //! The supervisor does the typing; [`Stall`] is the per-agent bookkeeping it
 //! carries between passes.
@@ -63,20 +63,49 @@ pub const FIRST_BACKOFF_MS: i64 = 60_000;
 /// The longest the backoff grows to.
 pub const MAX_BACKOFF_MS: i64 = 30 * 60_000;
 
-/// How many times one agent may be nudged **on the same evidence** before the
-/// watcher stops trying.
+/// How many nudges the dense phase is worth.
 ///
-/// Six, spread by the backoff over roughly half an hour. The failure this bounds
-/// is the one that has no natural end: a snapshot nothing refreshes reads the
-/// same way forever, and a flat retry interval turns that into hundreds of
-/// messages and hundreds of transcript rows over a five-hour window.
+/// Six, spread by the backoff over roughly half an hour, after which the
+/// watcher drops to [`PROBE_MS`]. The failure this bounds is the one with no
+/// natural end: a snapshot nothing refreshes reads the same way forever, and a
+/// flat retry interval turns that into hundreds of messages and hundreds of
+/// transcript rows over a five-hour window.
 ///
 /// It bounds *guessing*, not resuming — [`Stall::saw`] hands the count back the
 /// moment the account is newly shown to have tokens, because that is the
 /// refresh whose absence the budget was standing in for. A budget that outlived
 /// its evidence would strand the agent it exists to rescue: the window really
 /// resets four hours later, the verdict really says so, and nothing is sent.
-pub const MAX_TRIES: u32 = 6;
+pub const DENSE_TRIES: u32 = 6;
+
+/// How often the watcher probes once the dense phase is spent.
+///
+/// It must not stop. **The nudges are the only probe there is**: one either
+/// gets through, and the CLI reports a snapshot that says so, or it is refused,
+/// and the CLI reports that instead. When every agent on the account is out of
+/// tokens — the case this whole feature was built for — nothing else is making
+/// the call that would refresh the snapshot, so a watcher that gave up at
+/// thirty-six minutes would sleep through the reset it is waiting for. Hourly
+/// costs about four extra nudges across a five-hour window and buys the
+/// recovery outright.
+pub const PROBE_MS: i64 = 60 * 60_000;
+
+/// The soonest a *re-armed* budget may nudge after the previous nudge.
+///
+/// A re-arm is not always the good news it looks like. The snapshot is
+/// account-wide and last-writer-wins, so a sibling being served on a window
+/// this agent is not on — a different model, `seven_day` against `five_hour` —
+/// can flip the verdict back and forth between ticks, and without this each
+/// flip would fire a nudge on the spot. It does not slow the case that matters:
+/// when a window really resets hours later, the previous nudge is hours old.
+pub const REARM_FLOOR_MS: i64 = 30 * 60_000;
+
+/// The most nudges one stall may ever cost, whatever the verdict does.
+///
+/// The ceiling no transition can reset, and what makes the re-arm safe to have.
+/// Twelve leaves the ordinary five-hour stall — six dense, four probes — well
+/// clear of it, so it only bites the pathological case it is there for.
+pub const MAX_NUDGES: u32 = 12;
 
 /// How long an agent has to be doing something other than sitting out of tokens
 /// before its next stall counts as a new one, with a fresh budget.
@@ -172,8 +201,12 @@ pub struct Stall {
     /// When it was first seen out of tokens in this episode. What a snapshot's
     /// `captured_at` is measured against.
     pub since_ms: i64,
-    /// Nudges sent in this episode.
+    /// Nudges sent since the budget was last handed back. What decides the
+    /// dense phase's backoff, and what [`Stall::saw`] resets.
     pub tries: u32,
+    /// Nudges sent in this episode, full stop. Nothing resets this but the end
+    /// of the stall, which is what makes it a ceiling.
+    pub nudges: u32,
     /// When the last one was sent. Meaningless while `tries == 0`.
     pub last_ms: i64,
     /// When it was last seen alive but *not* out of tokens, if it currently is.
@@ -192,6 +225,7 @@ impl Stall {
         Self {
             since_ms: now_ms,
             tries: 0,
+            nudges: 0,
             last_ms: 0,
             working_since_ms: None,
             saw_tokens: false,
@@ -218,6 +252,12 @@ impl Stall {
     /// and must: a stall that spent its guesses before the CLI ever reported a
     /// reset time would otherwise be stranded by the very reading that settles
     /// the question.
+    ///
+    /// What a re-arm cannot do is make a stall cost more than [`MAX_NUDGES`].
+    /// `NoEvidence → Tokens` involves no clock at all — a sibling served on a
+    /// window this agent is not on flips it, and can flip it back next tick —
+    /// so "every re-arm needs a real window to pass" holds for `Held → Tokens`
+    /// and fails here. The ceiling and [`REARM_FLOOR_MS`] stand in for it.
     pub fn saw(&mut self, verdict: Verdict) {
         let tokens = verdict == Verdict::Tokens;
         if tokens && !self.saw_tokens {
@@ -228,27 +268,54 @@ impl Stall {
 
     /// Is a nudge due?
     ///
-    /// `evidence` is whether the account is known to have tokens rather than
-    /// merely not known to lack them. With it, the first nudge is immediate and
-    /// the rest are spaced; without it the agent is left alone for
-    /// [`PATIENCE_MS`] first. Either way the budget runs out at [`MAX_TRIES`] —
-    /// and is handed back by [`Stall::saw`] when fresh evidence arrives, which
-    /// is the only thing that ends an exhausted stall short of the operator.
+    /// Three phases, and one ceiling over all of them:
+    ///
+    /// - **dense**, [`DENSE_TRIES`] nudges on the widening backoff. `evidence`
+    ///   — the account is known to have tokens, rather than merely not known to
+    ///   lack them — makes the first immediate; without it the agent is left
+    ///   alone for [`PATIENCE_MS`] first.
+    /// - **probe**, once that is spent: one an hour, because the nudges are the
+    ///   only thing that can refresh a snapshot nobody else is refreshing.
+    /// - **stopped**, at [`MAX_NUDGES`], which no verdict can undo.
+    ///
+    /// A budget handed back by [`Stall::saw`] returns to the dense phase but
+    /// may not jump the queue: [`REARM_FLOOR_MS`] still has to have passed
+    /// since the last nudge, or a flapping snapshot would nudge every tick.
     pub fn due(&self, now_ms: i64, evidence: bool) -> bool {
-        if self.tries >= MAX_TRIES {
+        if self.stopped() {
             return false;
         }
-        let earliest = if self.tries == 0 {
-            self.since_ms + if evidence { 0 } else { PATIENCE_MS }
+        let earliest = if self.probing() {
+            self.last_ms + PROBE_MS
+        } else if self.tries == 0 {
+            let first = self.since_ms + if evidence { 0 } else { PATIENCE_MS };
+            if self.nudges == 0 {
+                first
+            } else {
+                first.max(self.last_ms + REARM_FLOOR_MS)
+            }
         } else {
             self.last_ms + backoff_ms(self.tries)
         };
         now_ms >= earliest
     }
 
+    /// Is the dense phase spent, so that the next nudge is an hourly probe?
+    /// The operator has to be able to tell "still watching, slowly" from
+    /// "given up".
+    pub fn probing(&self) -> bool {
+        self.tries >= DENSE_TRIES
+    }
+
+    /// Has this stall spent every nudge it will ever get?
+    pub fn stopped(&self) -> bool {
+        self.nudges >= MAX_NUDGES
+    }
+
     /// Note that a nudge was sent.
     pub fn nudged(&mut self, now_ms: i64) {
         self.tries += 1;
+        self.nudges += 1;
         self.last_ms = now_ms;
         self.working_since_ms = None;
     }
@@ -436,12 +503,16 @@ mod tests {
         assert!(stall.due(STALL + PATIENCE_MS, false));
     }
 
-    /// The nudges are bounded in *number*, not merely in rate. A snapshot that
-    /// nothing refreshes reads the same way forever, and at one a minute that
-    /// is ~300 messages, transcript rows and API calls per agent across a
-    /// five-hour window.
+    /// Five hours of ticks against a verdict that never changes: the dense
+    /// phase, then hourly probes, and never the ~300 messages, transcript rows
+    /// and API calls a flat one-a-minute retry would have cost.
+    ///
+    /// It must not stop altogether. The nudges are the only probe there is —
+    /// when every agent on the account is out of tokens, nothing else is making
+    /// the call that would refresh the snapshot — so a watcher that gave up at
+    /// thirty-six minutes would sleep through the reset it is waiting for.
     #[test]
-    fn guessing_widens_and_then_stops() {
+    fn guessing_widens_into_an_hourly_probe() {
         let mut stall = Stall::new(STALL);
         let mut now = STALL;
         let mut sent = Vec::new();
@@ -453,21 +524,87 @@ mod tests {
             }
             now += TICK.as_millis() as i64;
         }
-        assert_eq!(sent.len(), MAX_TRIES as usize, "sent at {sent:?}");
-        // Patience, then 1m, 2m, 4m, 8m, 16m — the last inside the first hour,
-        // and then nothing at all.
-        assert_eq!(sent[0], PATIENCE_MS);
+        // Patience, then 1m, 2m, 4m, 8m, 16m — the dense phase, all of it
+        // inside the first hour.
+        let dense = &sent[..DENSE_TRIES as usize];
+        assert_eq!(dense[0], PATIENCE_MS);
         assert!(
-            sent.last().copied().expect("sent") < 3_600_000,
-            "and then silence: {sent:?}"
+            dense.last().copied().expect("dense") < 3_600_000,
+            "{sent:?}"
         );
-        for pair in sent.windows(2) {
+        for pair in dense.windows(2) {
             assert!(pair[1] - pair[0] >= FIRST_BACKOFF_MS, "{sent:?}");
         }
+        // Then one an hour for the rest of the window — four of them, not
+        // silence, and nowhere near the ceiling.
+        let probes = &sent[DENSE_TRIES as usize..];
+        assert_eq!(probes.len(), 4, "sent at {sent:?}");
+        for pair in sent[DENSE_TRIES as usize - 1..].windows(2) {
+            assert!(pair[1] - pair[0] >= PROBE_MS, "{sent:?}");
+        }
+        assert!(sent.len() < MAX_NUDGES as usize, "{sent:?}");
+        assert!(stall.probing() && !stall.stopped());
+    }
+
+    /// The ceiling exists because the re-arm has no clock behind it. A sibling
+    /// being served on a window this agent is not on flips the account-wide
+    /// snapshot between `allowed` and this agent's own refusal, and every flip
+    /// hands the budget back — which without a ceiling is the flat one-a-minute
+    /// retry again, by a third route.
+    #[test]
+    fn a_flapping_verdict_cannot_nudge_forever() {
+        let mut stall = Stall::new(STALL);
+        let mut now = STALL;
+        let mut sent = Vec::new();
+        let mut tokens = true;
+        // A day of it, so the ceiling is reached rather than merely approached.
+        while now < STALL + 24 * 3_600_000 {
+            // The worst case: it alternates on every single tick.
+            tokens = !tokens;
+            let verdict = if tokens {
+                Verdict::Tokens
+            } else {
+                Verdict::NoEvidence
+            };
+            stall.saw(verdict);
+            if stall.due(now, tokens) {
+                stall.nudged(now);
+                sent.push(now - STALL);
+            }
+            now += TICK.as_millis() as i64;
+        }
+        // The floor holds the flapping to one nudge per half hour, and the
+        // ceiling ends it: twelve, and no more, however long this goes on.
+        assert_eq!(sent.len(), MAX_NUDGES as usize, "sent at {sent:?}");
+        for pair in sent.windows(2) {
+            assert!(pair[1] - pair[0] >= REARM_FLOOR_MS, "{sent:?}");
+        }
+        assert!(stall.stopped());
+        stall.saw(Verdict::NoEvidence);
+        stall.saw(Verdict::Tokens);
         assert!(
-            !stall.due(now + 86_400_000, true),
-            "spent, while the verdict has not changed"
+            !stall.due(now, true),
+            "the ceiling is the one thing no verdict undoes"
         );
+    }
+
+    /// And the floor keeps a single flip from firing on the spot, so the
+    /// ceiling is not burned through in one burst — without slowing the case
+    /// that matters, where the previous nudge is hours old by the time a window
+    /// really resets.
+    #[test]
+    fn a_re_arm_does_not_jump_the_queue() {
+        let mut stall = Stall::new(STALL);
+        stall.nudged(STALL);
+        stall.saw(Verdict::Tokens);
+        assert!(!stall.due(STALL + 1_000, true));
+        assert!(!stall.due(STALL + REARM_FLOOR_MS - 1, true));
+        assert!(stall.due(STALL + REARM_FLOOR_MS, true));
+
+        // The first nudge of a stall is not held back by a floor there is
+        // nothing to measure from.
+        let fresh = Stall::new(STALL);
+        assert!(fresh.due(STALL, true));
     }
 
     /// The budget bounds guessing, so evidence has to hand it back. Without
@@ -479,14 +616,19 @@ mod tests {
     #[test]
     fn evidence_hands_the_budget_back() {
         let mut stall = Stall::new(STALL);
-        for _ in 0..MAX_TRIES {
+        for _ in 0..DENSE_TRIES {
             stall.nudged(STALL);
         }
-        assert!(!stall.due(STALL + 86_400_000, true), "spent");
+        assert!(stall.probing(), "the dense phase is spent");
+        assert!(
+            !stall.due(STALL + PROBE_MS - 1, true),
+            "and the probe is not due"
+        );
 
         // Four hours later a snapshot newer than the stall arrives.
         stall.saw(Verdict::Tokens);
         assert!(stall.due(STALL + 86_400_000, true), "and it is rescued");
+        assert!(!stall.probing(), "back to the dense phase");
 
         // Staying `Tokens` is not news, so the backoff still applies to the
         // nudges that follow: only the transition re-arms.
@@ -498,13 +640,16 @@ mod tests {
         // A stall that spent its guesses before the CLI ever named a reset time
         // is rescued by the same rule the moment that window passes.
         let mut stall = Stall::new(STALL);
-        for _ in 0..MAX_TRIES {
-            stall.nudged(STALL);
+        for _ in 0..DENSE_TRIES {
+            stall.nudged(STALL + 1);
         }
         stall.saw(Verdict::Held);
-        assert!(!stall.due(STALL + 86_400_000, false), "still waiting");
+        assert!(
+            !stall.due(STALL + PROBE_MS - 1, false),
+            "held, and not yet due to probe"
+        );
         stall.saw(Verdict::Tokens);
-        assert!(stall.due(STALL + 86_400_000, true));
+        assert!(stall.due(STALL + REARM_FLOOR_MS + 1, true));
     }
 
     #[test]

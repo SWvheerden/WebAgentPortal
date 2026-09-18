@@ -188,12 +188,19 @@ function renderEvent(event) {
           el('div', { class: 'body', text: `↻ ${why} — auto-resumed: "${p.prompt || 'resume where you left off'}"` }),
         ]);
       }
-      // Auto-resume has given up on this agent. Without this the transcript
-      // looks the same whether it is still waiting on the window or has
-      // stopped trying, which is the difference between going to bed and not.
+      // Slowed down, and given up, are different news: the dashboard says "Out
+      // of tokens" throughout, so without these the transcript looks the same
+      // whether the watcher is still waiting on the window or has stopped
+      // trying — the difference between going to bed and not.
+      if (p.subtype === 'auto_resume_slowed') {
+        const hours = Math.round((p.probe_ms ?? 3600000) / 3600000);
+        return el('div', { class: 'ev system' }, [
+          el('div', { class: 'body', text: `↻ still out of tokens after ${p.tries ?? 'several'} attempts — auto-resume is still watching, trying about every ${hours}h` }),
+        ]);
+      }
       if (p.subtype === 'auto_resume_exhausted') {
         return el('div', { class: 'ev system' }, [
-          el('div', { class: 'body', text: `↻ auto-resume gave up after ${p.tries ?? 'several'} attempts — it will try again if the account is reported to have tokens` }),
+          el('div', { class: 'body', text: `↻ auto-resume gave up after ${p.nudges ?? 'several'} attempts — nothing further will be tried automatically` }),
         ]);
       }
       // The child went away between the decision and the send. Said out loud,
