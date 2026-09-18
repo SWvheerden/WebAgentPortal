@@ -179,6 +179,14 @@ function renderEvent(event) {
           }),
         ]);
       }
+      // Ours, not the operator's: the prompt itself is persisted as an
+      // ordinary user message, so without this the transcript shows somebody
+      // typing at 4am.
+      if (p.subtype === 'auto_resume') {
+        return el('div', { class: 'ev system' }, [
+          el('div', { class: 'body', text: `↻ tokens are back — auto-resumed: "${p.prompt || 'resume where you left off'}"` }),
+        ]);
+      }
       if (p.type === 'control_response') return null;
       // A backgrounded subagent. The parent's `Agent` tool result only says one
       // was launched, so without these the transcript goes quiet for as long as

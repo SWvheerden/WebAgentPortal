@@ -780,6 +780,7 @@ function fillSettings() {
   $('cfg-mode').value = cfg.default_permission_mode;
   $('cfg-pin').value = cfg.pinned_cli_version;
   $('cfg-open').checked = cfg.open_browser;
+  $('cfg-auto-resume').checked = cfg.auto_resume;
   $('cfg-remote-control').checked = cfg.remote_control;
   // Shown, never edited: the server keeps its own values whatever this panel
   // sends back (§12).
@@ -798,6 +799,7 @@ async function saveSettings() {
     default_permission_mode: $('cfg-mode').value,
     pinned_cli_version: $('cfg-pin').value,
     open_browser: $('cfg-open').checked,
+    auto_resume: $('cfg-auto-resume').checked,
     remote_control: $('cfg-remote-control').checked,
   };
   try {

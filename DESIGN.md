@@ -89,6 +89,7 @@ src/
     supervisor.rs   registry, spawn/stop/resume, concurrency cap
     process.rs      child lifecycle, stdin writer, stdout reader, SIGTERM
     protocol.rs     stream-json event + control_request/response types
+    resume.rs       when the account has tokens again, for auto-resume
     state.rs        status state machine
   repo/
     scan.rs         repo-root scanning, git metadata, recency ordering
@@ -221,6 +222,40 @@ still running drops the held-back turn end (§4): the subagent has nothing to ru
 Only the 429 does this. Any other failed turn ends through `TurnEnded` as before — a 500 says
 nothing about whether the next turn can run. The wire name is `rate_limited`, matching
 `rate_limit_event` and the `rate_limit` table; only the operator-facing label says tokens.
+
+### Auto-resume
+**`auto_resume = true` (§10) finishes the job `RateLimited` started.** Knowing an agent stopped
+is worth little at 2am; what the operator actually wants is not to spend the next morning
+opening eight agents and typing the same sentence into each. So when the account has tokens
+again, every agent the limit stopped is sent **`resume where you left off`** — the words an
+operator would use, and not a slash command, because only the transcript the agent already
+holds knows what the task was.
+
+**It is a clock, not an event.** No `rate_limit_event` announces a window reset: the CLI
+reports usage when it makes an API call, and an account whose agents are all out of tokens
+makes none. A watcher started at boot therefore looks every 30 seconds and asks one pure
+question (`agent/resume.rs`): *given the last usage snapshot, are there tokens?*
+
+- not a rejection → yes. Somebody was served, which is also how an account that came back
+  early is noticed, since any agent's turn refreshes the snapshot for all of them;
+- a rejection whose `resetsAt` has passed (plus 15s, because the window rolls over on the
+  API's clock and not ours) → yes;
+- a rejection still inside its window → no, which is the common answer;
+- no snapshot at all → yes, and retry. Waiting on an event that cannot arrive is the worse
+  error: being wrong here costs one API call that fails fast.
+
+Two of those answers are guesses, so **one agent is resumed at most once a minute**. That
+spacing is what stops a snapshot nothing refreshes — it reads as "there are tokens" forever —
+from typing at the agent every tick. A genuine 429 replaces the snapshot with a fresh reset
+time, which ends the retrying by itself.
+
+Only *running* agents whose status is `rate_limited` are spoken to: a record left at
+`rate_limited` by a server that died is the memory of an agent, and Resume is what brings
+those back (§10). The prompt is written to the child as an ordinary user message and
+persisted as one, so a `system` / `auto_resume` line is logged beside it — otherwise the
+transcript shows the operator typing at 4am. The watcher's own resume leaves `RateLimited`
+the same way any other turn does, by `TurnStarted`; if there were no tokens after all, the
+429 puts it straight back and the reset time it carries is the next thing waited on.
 
 ### Launch
 ```
@@ -1194,6 +1229,7 @@ default_model   = "opus"
 default_permission_mode = "ask"
 claude_bin      = "claude"
 pinned_cli_version = "2.1.241"   # warn on mismatch
+auto_resume     = true           # resume agents the token limit stopped (§4)
 remote_control  = false          # launch every agent with --remote-control (§9)
 ```
 

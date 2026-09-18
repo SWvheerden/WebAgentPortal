@@ -102,6 +102,11 @@ async fn main() -> Result<()> {
     // The account's usage outlives the process; the panel should not have to
     // wait for an agent to run before it can say anything.
     sup.restore_rate_limit().await;
+    // Nothing else notices a window resetting: the CLI reports usage when it
+    // makes an API call, and an account with every agent out of tokens makes
+    // none. Without this the operator comes back hours later to a row of agents
+    // stopped mid-task, and types the same sentence at each of them (§4).
+    sup.start_auto_resume();
 
     // The stream-json protocol carries no stability guarantee, so check the CLI
     // version against the pinned one and say so loudly on a mismatch.

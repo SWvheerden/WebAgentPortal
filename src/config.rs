@@ -35,6 +35,15 @@ pub struct Config {
     pub default_permission_mode: PermissionMode,
     pub claude_bin: String,
     pub pinned_cli_version: String,
+    /// Type `resume where you left off` at every agent the account's token
+    /// limit stopped, once the window has reset (§4).
+    ///
+    /// On by default: a turn cut short by a 429 is halfway through work the
+    /// operator already asked for, and the alternative is visiting each stalled
+    /// agent by hand hours later — which is the whole cost of the limit, paid
+    /// twice. Off leaves the agent sitting at `Out of tokens` until somebody
+    /// types at it.
+    pub auto_resume: bool,
     /// Launch every agent with `--remote-control <slug>`, offering it to
     /// claude.ai and the Claude mobile app (§9).
     ///
@@ -58,6 +67,7 @@ impl Default for Config {
             default_permission_mode: PermissionMode::Ask,
             claude_bin: "claude".to_string(),
             pinned_cli_version: "2.1.241".to_string(),
+            auto_resume: true,
             remote_control: false,
         }
     }
@@ -327,6 +337,24 @@ pinned_cli_version = "2.1.241"
         let on = Config::from_toml_str("remote_control = true\n").expect("parse");
         assert!(on.remote_control);
         assert!(on.validate().is_ok(), "it is a launch flag, not a bind");
+    }
+
+    /// On unless it is turned off, and — the part that matters — on for a
+    /// config file written before the option existed. An agent stopped by the
+    /// token limit is mid-task, and leaving it stopped is the failure mode this
+    /// defaults against.
+    #[test]
+    fn auto_resume_is_on_unless_it_is_turned_off() {
+        assert!(Config::default().auto_resume);
+        assert!(
+            Config::from_toml_str("port = 9000\n")
+                .expect("parse")
+                .auto_resume,
+            "an older config.toml must not lose the behaviour by being old"
+        );
+        let off = Config::from_toml_str("auto_resume = false\n").expect("parse");
+        assert!(!off.auto_resume);
+        assert!(off.validate().is_ok(), "either way is a valid config");
     }
 
     #[test]

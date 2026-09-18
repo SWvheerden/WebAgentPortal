@@ -1159,6 +1159,28 @@ mod tests {
         );
     }
 
+    /// Same two halves for the auto-resume toggle, and one more: a checkbox
+    /// that starts unticked because the panel forgot to fill it turns the
+    /// setting *off* on the next save, which is the failure that matters here.
+    #[test]
+    fn the_settings_panel_reads_and_writes_the_auto_resume_toggle() {
+        let html = std::str::from_utf8(&Assets::get("index.html").expect("index.html").data)
+            .expect("utf-8")
+            .to_string();
+        let js = std::str::from_utf8(&Assets::get("dashboard.js").expect("dashboard.js").data)
+            .expect("utf-8")
+            .to_string();
+        assert!(html.contains("id=\"cfg-auto-resume\""), "no checkbox");
+        assert!(
+            js.contains("$('cfg-auto-resume').checked = cfg.auto_resume"),
+            "the panel never shows the saved value"
+        );
+        assert!(
+            js.contains("auto_resume: $('cfg-auto-resume').checked"),
+            "the panel never sends the value back"
+        );
+    }
+
     #[test]
     fn every_permission_picker_offers_every_mode() {
         let html = std::str::from_utf8(&Assets::get("index.html").expect("index.html").data)
@@ -1624,6 +1646,7 @@ mod tests {
         body["hostnames"] = json!(["evil.example"]);
         body["max_agents"] = json!(3);
         body["remote_control"] = json!(true);
+        body["auto_resume"] = json!(false);
         let mut request = axum::http::Request::builder()
             .method("PUT")
             .uri("/api/config")
@@ -1647,6 +1670,7 @@ mod tests {
         // the bind, it is an ordinary setting the panel owns (§9).
         assert_eq!(saved.max_agents, 3);
         assert!(saved.remote_control);
+        assert!(!saved.auto_resume, "and auto-resume can be turned off");
         let on_disk = Config::from_toml_str(
             &std::fs::read_to_string(dir.path().join("config.toml")).expect("read"),
         )
