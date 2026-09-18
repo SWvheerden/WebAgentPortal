@@ -233,29 +233,54 @@ holds knows what the task was.
 
 **It is a clock, not an event.** No `rate_limit_event` announces a window reset: the CLI
 reports usage when it makes an API call, and an account whose agents are all out of tokens
-makes none. A watcher started at boot therefore looks every 30 seconds and asks one pure
-question (`agent/resume.rs`): *given the last usage snapshot, are there tokens?*
+makes none. A watcher started at boot therefore looks every 30 seconds, and `agent/resume.rs`
+answers, per agent, what the last usage snapshot says about *this* stall:
 
-- not a rejection → yes. Somebody was served, which is also how an account that came back
-  early is noticed, since any agent's turn refreshes the snapshot for all of them;
-- a rejection whose `resetsAt` has passed (plus 15s, because the window rolls over on the
-  API's clock and not ours) → yes;
-- a rejection still inside its window → no, which is the common answer;
-- no snapshot at all → yes, and retry. Waiting on an event that cannot arrive is the worse
-  error: being wrong here costs one API call that fails fast.
+| snapshot | verdict |
+| --- | --- |
+| a rejection whose `resetsAt` fell after this stall began and has now passed (+15s, because the window rolls over on the API's clock) | **Tokens** |
+| a rejection still inside its window | **Held** — the common answer, and the one worth waiting for |
+| anything else (`allowed`, `allowed_warning`) **taken since this agent stopped** | **Tokens**: somebody was served |
+| the same, taken *before* it stopped | **NoEvidence** |
+| a rejection whose window had already rolled over *before* this stall began | **NoEvidence** — it is from an older episode and cannot explain this one |
+| a rejection with no reset time, or no snapshot at all | **NoEvidence** |
 
-Two of those answers are guesses, so **one agent is resumed at most once a minute**. That
-spacing is what stops a snapshot nothing refreshes — it reads as "there are tokens" forever —
-from typing at the agent every tick. A genuine 429 replaces the snapshot with a fresh reset
-time, which ends the retrying by itself.
+A refusal's age does not matter, because `resetsAt` is absolute — an old one whose window has
+since rolled over is still telling the truth. An `allowed` reading is the opposite: it says
+only that somebody was served *at the moment it was taken*. The snapshot is account-wide and
+last-writer-wins, it is restored from disk at startup, and the last reading before a limit is
+routinely `allowed_warning` — so **evidence that predates the stall is not evidence**, or the
+first tick after the limit landed would resume the agent it was meant to protect.
+
+**A guess is bounded in number, not merely in rate.** `NoEvidence` still resumes eventually —
+waiting on an event that cannot arrive is the worse error, and a wasted turn fails fast — but
+it waits 5 minutes first, then retries at 1, 2, 4, 8, 16 minutes, and stops after **6 nudges**
+until the agent is seen working again. At one a minute a snapshot nothing refreshes would cost
+~300 messages, transcript rows and API calls per agent across a five-hour window; the claim
+that a fresh 429 would end that is not one the code can make, since a 429 whose event carries
+no reset time lands straight back in the same branch.
+
+**Leaving `RateLimited` does not hand the budget back.** A nudge starts a turn, so the agent
+goes `Working` and can be refused again seconds later — if that reset the count, the backoff
+would never apply to the loop it exists for. The stall ends only when the agent has been seen
+alive and not out of tokens across passes spanning 5 minutes, which is what having got
+somewhere looks like; then the record is dropped and the next limit starts from nothing. It is
+also dropped the moment the agent stops running, so the watcher's map cannot grow.
 
 Only *running* agents whose status is `rate_limited` are spoken to: a record left at
 `rate_limited` by a server that died is the memory of an agent, and Resume is what brings
-those back (§10). The prompt is written to the child as an ordinary user message and
-persisted as one, so a `system` / `auto_resume` line is logged beside it — otherwise the
-transcript shows the operator typing at 4am. The watcher's own resume leaves `RateLimited`
-the same way any other turn does, by `TurnStarted`; if there were no tokens after all, the
-429 puts it straight back and the reset time it carries is the next thing waited on.
+those back (§10). The prompt is written to the child as an ordinary user message and persisted
+as one, so a `system` / `auto_resume` line is written **first, and awaited**, before the
+prompt is handed to the runner — otherwise the marker and the message it annotates race and
+the transcript can show them in either order. It records whether the watcher had evidence or
+was guessing. If the child goes away in between, an `auto_resume_failed` line says so rather
+than leaving the log claiming a resume that never happened.
+
+The watcher's handle is **kept and aborted by `shutdown`**, before any child is asked to stop:
+a tick landing mid-teardown would resume an agent already on its way out, persisting a message
+nothing will answer and flipping the status to `working` moments before every agent is marked
+stopped. A pass that panics is caught and logged rather than taking the watcher with it, since
+a dead watcher fails silently and forever.
 
 ### Launch
 ```

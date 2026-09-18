@@ -5,12 +5,14 @@
 //! the status state machine has exactly one owner.
 
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -211,6 +213,11 @@ pub struct Supervisor {
     /// that connects between two events still sees the numbers, rather than a
     /// blank panel until the next API call.
     rate_limit: Arc<RwLock<Option<(i64, RateLimitInfo)>>>,
+    /// The auto-resume watcher, while one is running (§4). Held so shutdown can
+    /// stop it: a tick during the teardown would type at a child that is on its
+    /// way out. A plain mutex because it is taken for a handle and released,
+    /// never across an await, and because starting the watcher is not async.
+    auto_resume: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     bus: broadcast::Sender<ServerMsg>,
 }
 
@@ -224,6 +231,7 @@ impl Supervisor {
             agent_pids: Arc::new(RwLock::new(HashSet::new())),
             next_generation: AtomicU64::new(1),
             rate_limit: Arc::new(RwLock::new(None)),
+            auto_resume: std::sync::Mutex::new(None),
             bus,
         })
     }
@@ -275,118 +283,202 @@ impl Supervisor {
     /// A clock rather than a reaction to an event, because the event that would
     /// announce the reset does not exist: the CLI reports usage when it makes
     /// an API call, and an account with every agent out of tokens makes none.
-    /// The watcher outlives every agent, so it is started once at boot and is
-    /// harmless while nothing is stalled — it reads the agent table and finds
-    /// nothing to do.
-    pub fn start_auto_resume(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let sup = self.clone();
-        tokio::spawn(async move {
-            // Per-agent, and only for as long as the agent is stalled: this is
-            // what stops a snapshot nothing refreshes from licensing a resume
-            // every tick.
-            let mut last: HashMap<String, i64> = HashMap::new();
-            loop {
-                tokio::time::sleep(resume::TICK).await;
-                sup.auto_resume_pass(&mut last).await;
-            }
-        })
+    /// The watcher outlives every agent, so it is started once at boot; its
+    /// handle is kept so [`Supervisor::shutdown`] can stop it rather than leave
+    /// it typing at children that are being torn down.
+    pub fn start_auto_resume(self: &Arc<Self>) {
+        self.watch_every(resume::TICK);
     }
 
-    /// One look: if the account has tokens, tell every agent the limit stopped
-    /// to carry on. Answers with the ids it spoke to.
+    /// [`Supervisor::start_auto_resume`] with the period exposed, so a test can
+    /// watch the loop actually tick without waiting out half a minute.
+    fn watch_every(self: &Arc<Self>, tick: Duration) {
+        let sup = self.clone();
+        let handle = tokio::spawn(async move {
+            let mut stalls: HashMap<String, resume::Stall> = HashMap::new();
+            loop {
+                tokio::time::sleep(tick).await;
+                // A pass that panics must not take the watcher down with it:
+                // every later window reset would then go unnoticed, for the
+                // life of the process, without a word.
+                let pass = AssertUnwindSafe(sup.auto_resume_pass(&mut stalls, now_ms()))
+                    .catch_unwind()
+                    .await;
+                if pass.is_err() {
+                    tracing::error!("an auto-resume pass panicked; the watcher is carrying on");
+                }
+            }
+        });
+        if let Some(previous) = self
+            .auto_resume
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(handle)
+        {
+            // Only a second call could produce one, which no caller makes; two
+            // watchers would nudge each agent twice.
+            previous.abort();
+        }
+    }
+
+    /// Stop the watcher. Called at shutdown, before the children are asked to
+    /// stop: a tick landing during the teardown would resume an agent whose
+    /// child is already on its way out, persisting a message nothing will ever
+    /// answer and flipping the status to `working` moments before every agent
+    /// is marked stopped.
+    pub fn stop_auto_resume(&self) {
+        if let Some(handle) = self
+            .auto_resume
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
+            tracing::debug!("the auto-resume watcher has been stopped");
+        }
+    }
+
+    /// One look: tell every agent the limit stopped to carry on, where the
+    /// account is known to have tokens and the agent's own budget allows it.
+    /// Answers with the ids it spoke to.
     ///
-    /// `last` carries the spacing of [`resume::may_resume`] across passes; the
-    /// watcher owns it, and a test can drive this directly without waiting out
-    /// a tick.
-    pub async fn auto_resume_pass(&self, last: &mut HashMap<String, i64>) -> Vec<String> {
+    /// `stalls` is the watcher's memory between passes — when each agent
+    /// stopped, how often it has been nudged, and whether it has since got
+    /// anywhere ([`resume::Stall`]). `now` is passed in rather than read so the
+    /// backoff can be tested across hours without waiting any.
+    pub async fn auto_resume_pass(
+        &self,
+        stalls: &mut HashMap<String, resume::Stall>,
+        now: i64,
+    ) -> Vec<String> {
         if !self.config().await.auto_resume {
+            stalls.clear();
             return Vec::new();
         }
-        let stalled = self.rate_limited().await;
-        // An agent that got going again — by the resume, by the operator, or by
-        // being stopped — starts from a clean slate if it stalls later.
-        last.retain(|id, _| stalled.contains(id));
+        let (stalled, working) = self.stall_census().await;
+        // An agent that is no longer running cannot be resumed and is not
+        // remembered; one that has been working long enough to have got
+        // somewhere has ended its stall, and its next one starts with a fresh
+        // budget.
+        stalls.retain(|id, _| stalled.contains(id) || working.contains(id));
+        let recovered: Vec<String> = working
+            .iter()
+            .filter(|id| stalls.get_mut(*id).is_some_and(|s| s.working(now)))
+            .cloned()
+            .collect();
+        for id in recovered {
+            stalls.remove(&id);
+        }
         if stalled.is_empty() {
             return Vec::new();
         }
-        let now = now_ms();
-        let snapshot = self.rate_limit().await;
-        let info = snapshot.as_ref().map(|(_, info)| info);
-        if !resume::tokens_available(info, now) {
-            return Vec::new();
-        }
-        let resets_at = info.and_then(resume::resets_at_ms);
 
+        let snapshot = self.rate_limit().await;
+        let snapshot = snapshot.as_ref().map(|(at, info)| (*at, info));
         let mut resumed = Vec::new();
         for id in stalled {
-            if !resume::may_resume(last.get(&id).copied(), now) {
+            let stall = stalls
+                .entry(id.clone())
+                .or_insert_with(|| resume::Stall::new(now));
+            stall.stalled();
+            let evidence = match resume::verdict(snapshot, stall.since_ms, now) {
+                // The window has not reset. The common answer, and the one the
+                // whole feature is waiting for.
+                resume::Verdict::Held => continue,
+                resume::Verdict::Tokens => true,
+                resume::Verdict::NoEvidence => false,
+            };
+            if !stall.due(now, evidence) {
                 continue;
             }
-            if let Err(err) = self.send_message(&id, resume::RESUME_PROMPT).await {
-                // The agent went away between the listing and the send. It is
-                // no longer stalled either, so there is nothing to retry.
-                tracing::warn!(agent = %id, ?err, "could not auto-resume");
-                continue;
+            // Counted before it is sent: a nudge that failed halfway still
+            // spent its turn, and must not be free to repeat next tick.
+            stall.nudged(now);
+            let resets_at = snapshot.and_then(|(_, info)| resume::resets_at_ms(info));
+            if self.nudge(&id, resets_at, evidence).await {
+                resumed.push(id);
             }
-            last.insert(id.clone(), now);
-            tracing::info!(agent = %id, "tokens are back; resumed the agent");
-            self.note_auto_resume(&id, resets_at).await;
-            resumed.push(id);
         }
         resumed
     }
 
-    /// The live agents the token limit stopped.
+    /// The live agents, split into the ones the token limit stopped and the
+    /// ones doing anything else.
     ///
-    /// `rate_limited` in the database *and* still running: a message can only
-    /// be delivered to a child that is there, and a record left at
-    /// `rate_limited` by a server that died is not an agent, it is a memory of
-    /// one — Resume is what brings those back (§10).
-    async fn rate_limited(&self) -> Vec<String> {
+    /// Running in both cases: a record left at `rate_limited` by a server that
+    /// died is the memory of an agent, and Resume is what brings those back
+    /// (§10).
+    async fn stall_census(&self) -> (Vec<String>, Vec<String>) {
         let records = match self.db.run(|db| db.list_agents()).await {
             Ok(records) => records,
             Err(err) => {
                 tracing::warn!(?err, "could not read the agent list to auto-resume");
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
         };
         let runners = self.runners.read().await;
-        records
-            .into_iter()
-            .filter(|r| r.status == Status::RateLimited && runners.contains_key(&r.id))
-            .map(|r| r.id)
-            .collect()
+        let mut stalled = Vec::new();
+        let mut working = Vec::new();
+        for record in records {
+            if !runners.contains_key(&record.id) {
+                continue;
+            }
+            if record.status == Status::RateLimited {
+                stalled.push(record.id);
+            } else {
+                working.push(record.id);
+            }
+        }
+        (stalled, working)
     }
 
-    /// Say — in the agent's own log, not only in a toast — that the resume was
-    /// ours.
+    /// Type the prompt at one agent, and say — in the agent's own log, not only
+    /// in a toast — that it was ours. Answers whether it was delivered.
     ///
     /// The prompt is written to the child as an ordinary user message and is
     /// persisted as one, which is honest about what the agent was told but not
-    /// about who told it. Without this line the transcript shows the operator
-    /// typing at 4am.
-    async fn note_auto_resume(&self, id: &str, resets_at_ms: Option<i64>) {
-        let payload = json!({
-            "type": "system",
-            "subtype": "auto_resume",
-            "prompt": resume::RESUME_PROMPT,
-            "resets_at_ms": resets_at_ms,
-        });
-        let agent_id = id.to_string();
-        let payload_for_db = payload.clone();
-        if let Ok(seq) = self
-            .db
-            .run(move |db| db.append_event(&agent_id, EventKind::System, &payload_for_db))
-            .await
-        {
-            self.broadcast(ServerMsg::Event {
-                agent_id: id.to_string(),
-                seq,
-                ts: now_ms(),
-                kind: EventKind::System.as_str().to_string(),
-                payload,
+    /// about who told it; without the marker the transcript shows the operator
+    /// typing at 4am. The marker is written *first* and awaited, so it cannot
+    /// race the runner's own row and land after the message it annotates. That
+    /// leaves one gap — a child that goes away in between — and a second line
+    /// closes it rather than leaving the log claiming a resume that never
+    /// happened.
+    async fn nudge(&self, id: &str, resets_at_ms: Option<i64>, evidence: bool) -> bool {
+        self.log_system(
+            id,
+            json!({
+                "type": "system",
+                "subtype": "auto_resume",
+                "prompt": resume::RESUME_PROMPT,
+                "resets_at_ms": resets_at_ms,
+                // Whether the account was known to have tokens or the watcher
+                // was guessing. The difference is worth having in the log when
+                // the resume turns out to have been premature.
+                "evidence": evidence,
+            }),
+        )
+        .await;
+
+        if let Err(err) = self.send_message(id, resume::RESUME_PROMPT).await {
+            tracing::error!(agent = %id, ?err, "the auto-resume prompt was not delivered");
+            self.log_system(
+                id,
+                json!({
+                    "type": "system",
+                    "subtype": "auto_resume_failed",
+                    "error": format!("{err:#}"),
+                }),
+            )
+            .await;
+            self.broadcast(ServerMsg::Notice {
+                agent_id: Some(id.to_string()),
+                level: "warn".to_string(),
+                text: format!("Could not auto-resume this agent: {err:#}"),
             });
+            return false;
         }
+
+        tracing::info!(agent = %id, evidence, "tokens are back; resumed the agent");
         self.broadcast(ServerMsg::Notice {
             agent_id: Some(id.to_string()),
             level: "info".to_string(),
@@ -395,6 +487,33 @@ impl Supervisor {
                 resume::RESUME_PROMPT
             ),
         });
+        true
+    }
+
+    /// Append a `system` event to an agent's log and put it on the bus.
+    ///
+    /// A failure is said out loud: this is the transcript's only record that
+    /// the server, rather than the operator, typed something, and losing it
+    /// silently recreates the confusion it exists to prevent.
+    async fn log_system(&self, id: &str, payload: Value) {
+        let agent_id = id.to_string();
+        let payload_for_db = payload.clone();
+        match self
+            .db
+            .run(move |db| db.append_event(&agent_id, EventKind::System, &payload_for_db))
+            .await
+        {
+            Ok(seq) => self.broadcast(ServerMsg::Event {
+                agent_id: id.to_string(),
+                seq,
+                ts: now_ms(),
+                kind: EventKind::System.as_str().to_string(),
+                payload,
+            }),
+            Err(err) => {
+                tracing::error!(agent = %id, ?err, ?payload, "could not log a system event")
+            }
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ServerMsg> {
@@ -1085,6 +1204,9 @@ impl Supervisor {
 
     /// SIGTERM every child, then wait out the grace period (§4).
     pub async fn shutdown(&self) {
+        // Before anything is asked to stop: a tick that lands mid-teardown
+        // resumes an agent whose child is already dying (§4).
+        self.stop_auto_resume();
         let ids: Vec<String> = self.runners.read().await.keys().cloned().collect();
         for id in &ids {
             self.stop(id).await.ok();
@@ -2583,8 +2705,8 @@ mod tests {
         (sup, rx)
     }
 
-    fn rejection(resets_at: i64) -> RateLimitInfo {
-        serde_json::from_value(json!({"status": "rejected", "resetsAt": resets_at}))
+    fn rejection(resets_at_secs: i64) -> RateLimitInfo {
+        serde_json::from_value(json!({"status": "rejected", "resetsAt": resets_at_secs}))
             .expect("rate limit info")
     }
 
@@ -2597,6 +2719,16 @@ mod tests {
         }
     }
 
+    async fn logged(sup: &Supervisor, subtype: &str) -> usize {
+        sup.db
+            .run(|db| db.events_after("agent-limited", 0, 500))
+            .await
+            .expect("events")
+            .iter()
+            .filter(|e| e.payload.get("subtype").and_then(Value::as_str) == Some(subtype))
+            .count()
+    }
+
     /// The whole point: an agent stopped mid-task by the token limit is waiting
     /// on the clock, not on the operator, so when the window resets it is told
     /// to carry on rather than left for someone to find hours later.
@@ -2604,38 +2736,35 @@ mod tests {
     async fn an_agent_the_limit_stopped_is_told_to_carry_on_once_the_window_resets() {
         let (sup, mut rx) = one_agent(Status::RateLimited).await;
         let now = now_ms();
-        let mut last = HashMap::new();
+        let mut stalls = HashMap::new();
 
         // Still inside the window: nothing to say, and saying it would spend a
         // turn to be refused again.
         *sup.rate_limit.write().await = Some((now, rejection(now / 1_000 + 3_600)));
-        assert!(sup.auto_resume_pass(&mut last).await.is_empty());
+        assert!(sup.auto_resume_pass(&mut stalls, now).await.is_empty());
         assert_eq!(typed(&mut rx), None);
 
         // The window has since reset.
-        *sup.rate_limit.write().await = Some((now, rejection(now / 1_000 - 60)));
-        assert_eq!(sup.auto_resume_pass(&mut last).await, vec!["agent-limited"]);
+        let later = now + 3_700_000;
+        assert_eq!(
+            sup.auto_resume_pass(&mut stalls, later).await,
+            vec!["agent-limited"]
+        );
         assert_eq!(typed(&mut rx).as_deref(), Some(resume::RESUME_PROMPT));
 
         // And not again a moment later: a snapshot nothing refreshes keeps
-        // reading as "there are tokens", so the spacing is what stops it.
-        assert!(sup.auto_resume_pass(&mut last).await.is_empty());
+        // reading as "there are tokens", so the backoff is what stops it.
+        assert!(
+            sup.auto_resume_pass(&mut stalls, later + 1_000)
+                .await
+                .is_empty()
+        );
         assert_eq!(typed(&mut rx), None);
 
         // The resume is in the agent's own log, not only in a toast that is
         // gone by morning: the prompt is persisted as an ordinary user message,
         // which would otherwise read as the operator typing at 4am.
-        let events = sup
-            .db
-            .run(|db| db.events_after("agent-limited", 0, 50))
-            .await
-            .expect("events");
-        assert!(
-            events
-                .iter()
-                .any(|e| e.payload.get("subtype").and_then(Value::as_str) == Some("auto_resume")),
-            "no auto_resume in the log: {events:?}"
-        );
+        assert_eq!(logged(&sup, "auto_resume").await, 1);
     }
 
     /// Only the agents the limit stopped, and only the ones still there. An
@@ -2644,14 +2773,23 @@ mod tests {
     /// brings those back (§10).
     #[tokio::test]
     async fn nothing_else_is_typed_at() {
+        let now = now_ms();
         let (sup, mut rx) = one_agent(Status::Idle).await;
-        *sup.rate_limit.write().await = Some((now_ms(), rejection(now_ms() / 1_000 - 60)));
-        assert!(sup.auto_resume_pass(&mut HashMap::new()).await.is_empty());
+        *sup.rate_limit.write().await = Some((now, rejection(now / 1_000 - 3_600)));
+        assert!(
+            sup.auto_resume_pass(&mut HashMap::new(), now)
+                .await
+                .is_empty()
+        );
         assert_eq!(typed(&mut rx), None);
 
         let (sup, mut rx) = one_agent(Status::RateLimited).await;
         sup.runners.write().await.clear();
-        assert!(sup.auto_resume_pass(&mut HashMap::new()).await.is_empty());
+        assert!(
+            sup.auto_resume_pass(&mut HashMap::new(), now)
+                .await
+                .is_empty()
+        );
         assert_eq!(typed(&mut rx), None);
     }
 
@@ -2665,27 +2803,252 @@ mod tests {
             ..Config::default()
         })
         .await;
-        *sup.rate_limit.write().await = Some((now_ms(), rejection(now_ms() / 1_000 - 60)));
-        assert!(sup.auto_resume_pass(&mut HashMap::new()).await.is_empty());
+        let now = now_ms();
+        *sup.rate_limit.write().await = Some((now, rejection(now / 1_000 - 3_600)));
+        assert!(
+            sup.auto_resume_pass(&mut HashMap::new(), now)
+                .await
+                .is_empty()
+        );
         assert_eq!(typed(&mut rx), None);
     }
 
-    /// An account that was never refused — or came back early, which is the
-    /// same thing on the wire — is not made to wait out a reset time nobody
-    /// has refreshed.
+    /// A reading taken *since* the agent stopped means somebody was served, so
+    /// the account has tokens whatever a stale reset time says. One taken
+    /// before it means nothing: the snapshot is account-wide, last-writer-wins
+    /// and restored from disk at startup, so the reading in hand when a limit
+    /// lands is routinely an `allowed` one from just before it.
     #[tokio::test]
-    async fn a_snapshot_that_is_not_a_refusal_releases_the_agent_immediately() {
+    async fn only_a_reading_taken_since_the_stall_releases_the_agent() {
+        let now = now_ms();
+        let allowed: RateLimitInfo =
+            serde_json::from_value(json!({"status": "allowed"})).expect("info");
+
         let (sup, mut rx) = one_agent(Status::RateLimited).await;
-        let allowed = RateLimitInfo {
-            status: "allowed".to_string(),
-            ..rejection(now_ms() / 1_000 + 3_600)
-        };
-        *sup.rate_limit.write().await = Some((now_ms(), allowed));
+        *sup.rate_limit.write().await = Some((now - 60_000, allowed.clone()));
+        let mut stalls = HashMap::new();
+        assert!(
+            sup.auto_resume_pass(&mut stalls, now).await.is_empty(),
+            "an allowed reading from before the stall is not evidence it is over"
+        );
+        assert_eq!(typed(&mut rx), None);
+
+        *sup.rate_limit.write().await = Some((now + 1_000, allowed));
         assert_eq!(
-            sup.auto_resume_pass(&mut HashMap::new()).await,
+            sup.auto_resume_pass(&mut stalls, now + 2_000).await,
             vec!["agent-limited"]
         );
         assert_eq!(typed(&mut rx).as_deref(), Some(resume::RESUME_PROMPT));
+    }
+
+    /// What the flat one-a-minute spacing could not bound: a snapshot that
+    /// never refreshes reads the same way forever. Five hours of ticks must
+    /// cost a handful of messages, not one a minute — each is an API call, a
+    /// transcript row and context in the child.
+    #[tokio::test]
+    async fn an_unknown_account_is_guessed_at_a_few_times_and_then_left_alone() {
+        let (sup, mut rx) = one_agent(Status::RateLimited).await;
+        // Nothing has ever been reported: no snapshot at all.
+        let start = now_ms();
+        let mut stalls = HashMap::new();
+        let mut sent = 0;
+        let mut first = None;
+        let mut now = start;
+        while now < start + 5 * 3_600_000 {
+            let nudged = sup.auto_resume_pass(&mut stalls, now).await.len();
+            if nudged > 0 && first.is_none() {
+                first = Some(now - start);
+            }
+            sent += nudged;
+            now += resume::TICK.as_millis() as i64;
+        }
+        // The first guess waited: one made a tick after the limit landed is the
+        // behaviour the feature exists to avoid.
+        assert_eq!(first, Some(resume::PATIENCE_MS));
+        assert_eq!(
+            sent,
+            resume::MAX_TRIES as usize,
+            "five hours of guessing must cost {} messages",
+            resume::MAX_TRIES
+        );
+        let mut delivered = 0;
+        while typed(&mut rx).is_some() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, resume::MAX_TRIES as usize);
+        assert_eq!(
+            logged(&sup, "auto_resume").await,
+            resume::MAX_TRIES as usize
+        );
+
+        // And the log says it was a guess, which is the thing worth knowing
+        // when a resume turns out to have been premature.
+        let marker = sup
+            .db
+            .run(|db| db.events_after("agent-limited", 0, 500))
+            .await
+            .expect("events")
+            .into_iter()
+            .find(|e| e.payload.get("subtype").and_then(Value::as_str) == Some("auto_resume"))
+            .expect("a first nudge");
+        assert_eq!(
+            marker.payload.get("evidence").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    /// The case the spacing is load-bearing for, and the one a
+    /// `retain`-on-every-pass forgot: a nudge moves the agent to `Working`, and
+    /// the resumed turn can be refused again seconds later. If leaving
+    /// `RateLimited` handed back the budget, the backoff would never apply to
+    /// the loop it exists to stop.
+    #[tokio::test]
+    async fn a_turn_that_starts_and_dies_again_does_not_earn_a_fresh_budget() {
+        let (sup, mut rx) = one_agent(Status::RateLimited).await;
+        let stalled_at = now_ms();
+        // Refused, with the window reopening a minute later.
+        *sup.rate_limit.write().await = Some((stalled_at, rejection(stalled_at / 1_000 + 60)));
+        let mut stalls = HashMap::new();
+        assert!(
+            sup.auto_resume_pass(&mut stalls, stalled_at)
+                .await
+                .is_empty(),
+            "the window is still shut"
+        );
+        let now = stalled_at + 120_000;
+        assert_eq!(sup.auto_resume_pass(&mut stalls, now).await.len(), 1);
+        assert!(typed(&mut rx).is_some());
+
+        // The resumed turn started, ran for a tick, and hit the same limit.
+        let id = "agent-limited".to_string();
+        let working = id.clone();
+        sup.db
+            .run(move |db| db.set_status(&working, Status::Working, None, None, None))
+            .await
+            .expect("working");
+        assert!(
+            sup.auto_resume_pass(&mut stalls, now + 30_000)
+                .await
+                .is_empty()
+        );
+        let limited = id.clone();
+        sup.db
+            .run(move |db| db.set_status(&limited, Status::RateLimited, None, None, None))
+            .await
+            .expect("rate limited");
+
+        assert!(
+            sup.auto_resume_pass(&mut stalls, now + 60_000 - 1)
+                .await
+                .is_empty(),
+            "the nudge that caused this still counts against the next one"
+        );
+        assert_eq!(typed(&mut rx), None);
+        assert_eq!(
+            sup.auto_resume_pass(&mut stalls, now + 60_000).await.len(),
+            1
+        );
+
+        // Real work, on the other hand, ends the stall: the record is dropped
+        // and the next limit starts from nothing. It has to be seen working
+        // across the passes in between — a single late look cannot tell an
+        // agent that worked all morning from one that started a second ago.
+        let working = id.clone();
+        sup.db
+            .run(move |db| db.set_status(&working, Status::Working, None, None, None))
+            .await
+            .expect("working");
+        let got_going = now + 61_000;
+        sup.auto_resume_pass(&mut stalls, got_going).await;
+        assert_eq!(stalls.len(), 1, "one look is not yet progress");
+        assert!(
+            sup.auto_resume_pass(&mut stalls, got_going + resume::PROGRESS_MS)
+                .await
+                .is_empty()
+        );
+        assert!(stalls.is_empty(), "the stall is over: {stalls:?}");
+    }
+
+    /// A gone agent is not remembered either — the map is the watcher's only
+    /// state, and it must not grow for the life of the process.
+    #[tokio::test]
+    async fn the_watcher_forgets_an_agent_that_is_no_longer_running() {
+        let (sup, _rx) = one_agent(Status::RateLimited).await;
+        let now = now_ms();
+        let mut stalls = HashMap::new();
+        sup.auto_resume_pass(&mut stalls, now).await;
+        assert_eq!(stalls.len(), 1);
+        sup.runners.write().await.clear();
+        sup.auto_resume_pass(&mut stalls, now + 1_000).await;
+        assert!(stalls.is_empty());
+    }
+
+    /// The loop itself: it has to tick without being asked, and it has to stop
+    /// when it is told to — a tick landing during shutdown resumes an agent
+    /// whose child is already being torn down.
+    #[tokio::test]
+    async fn the_watcher_ticks_on_its_own_and_stops_when_it_is_told_to() {
+        let (sup, mut rx) = one_agent(Status::RateLimited).await;
+        // A reading taken since the stall — a sibling agent was served — so the
+        // verdict does not turn on a reset time the test would have to wait out
+        // in real seconds.
+        let allowed: RateLimitInfo =
+            serde_json::from_value(json!({"status": "allowed"})).expect("info");
+        *sup.rate_limit.write().await = Some((now_ms() + 60_000, allowed));
+        sup.watch_every(Duration::from_millis(5));
+
+        let mut text = None;
+        for _ in 0..200 {
+            text = typed(&mut rx);
+            if text.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            text.as_deref(),
+            Some(resume::RESUME_PROMPT),
+            "the watcher never ticked"
+        );
+
+        sup.stop_auto_resume();
+        assert!(
+            sup.auto_resume
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        );
+        // Whatever the backoff would have allowed, nothing more arrives.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while typed(&mut rx).is_some() {}
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(typed(&mut rx), None, "the watcher is still running");
+    }
+
+    /// A child that went away between the listing and the send leaves the log
+    /// claiming a resume that did not happen, unless the failure is written
+    /// down too.
+    #[tokio::test]
+    async fn a_prompt_that_cannot_be_delivered_is_admitted_in_the_log() {
+        let (sup, rx) = one_agent(Status::RateLimited).await;
+        drop(rx);
+        let stalled_at = now_ms();
+        *sup.rate_limit.write().await = Some((stalled_at, rejection(stalled_at / 1_000 + 60)));
+        let mut stalls = HashMap::new();
+        assert!(
+            sup.auto_resume_pass(&mut stalls, stalled_at)
+                .await
+                .is_empty(),
+            "the window is still shut"
+        );
+        assert!(
+            sup.auto_resume_pass(&mut stalls, stalled_at + 120_000)
+                .await
+                .is_empty(),
+            "an undelivered prompt is not a resume"
+        );
+        assert_eq!(logged(&sup, "auto_resume").await, 1);
+        assert_eq!(logged(&sup, "auto_resume_failed").await, 1);
     }
 
     #[tokio::test]

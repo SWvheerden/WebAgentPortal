@@ -183,8 +183,16 @@ function renderEvent(event) {
       // ordinary user message, so without this the transcript shows somebody
       // typing at 4am.
       if (p.subtype === 'auto_resume') {
+        const why = p.evidence === false ? 'no word on the account yet' : 'tokens are back';
         return el('div', { class: 'ev system' }, [
-          el('div', { class: 'body', text: `↻ tokens are back — auto-resumed: "${p.prompt || 'resume where you left off'}"` }),
+          el('div', { class: 'body', text: `↻ ${why} — auto-resumed: "${p.prompt || 'resume where you left off'}"` }),
+        ]);
+      }
+      // The child went away between the decision and the send. Said out loud,
+      // or the line above is left claiming a resume that never happened.
+      if (p.subtype === 'auto_resume_failed') {
+        return el('div', { class: 'ev system' }, [
+          el('div', { class: 'body', text: `↻ the auto-resume was not delivered: ${p.error || 'the agent was gone'}` }),
         ]);
       }
       if (p.type === 'control_response') return null;
