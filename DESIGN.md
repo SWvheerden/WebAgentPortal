@@ -270,24 +270,34 @@ a cost of about four extra nudges across a five-hour window.
 So three phases and a ceiling: **dense** (6 nudges, widening), **probe** (hourly), and
 **stopped** at **12 nudges per stall** — a ceiling no verdict can undo.
 
-**The dense budget bounds guessing, so evidence hands it back.** A verdict that has just
-*become* `Tokens` — a snapshot newer than the stall, or the reset time of the refusal that caused it
-finally passing — is precisely the refresh the budget was standing in for, so the count starts
-again. Without that the feature fails in the case it was built for: one agent, nothing else
-running to refresh the account-wide snapshot, a refusal carrying no `resetsAt`, six guesses
-spent in the first half hour — and when the window really resets four hours later and the
-verdict says so, nothing is sent. Only the *transition* re-arms, so a verdict that has read
-`Tokens` all along is still counted.
+**Evidence moves the schedule, never the count.** A verdict that has just *become* `Tokens` —
+a snapshot newer than the stall, or the reset time of the refusal that caused it finally
+passing — brings the next nudge forward to 30 minutes after the last one, which turns an hourly
+probe into a prompt rescue. Without something of the sort the feature fails in the case it was
+built for: nothing else running to refresh the account-wide snapshot, a refusal carrying no
+`resetsAt`, the dense phase spent in the first half hour — and when the window really resets
+four hours later and the verdict says so, the agent waits out the rest of the hour. Only the
+*transition* counts as news, and the nudge it buys spends it: a verdict that has read `Tokens`
+all along changes nothing, or one served sibling call would buy every later nudge its spacing.
 
-**A re-arm is not proof, which is what the ceiling and the floor are for.** "Every re-arm
+Note what it does **not** do: it does not wind the nudge count back. `nudges` only ever goes up
+— it decides the phase, the backoff and the ceiling alike — so no sequence of verdicts can buy
+a stall more than twelve nudges.
+
+**Evidence is not proof, which is what the floor and the ceiling are for.** "Every re-arm
 needs a real window to pass" holds for `Held → Tokens`, whose intermediate state carries a real
 future `resetsAt` — and fails flat for `NoEvidence → Tokens`, where no clock is involved at
 all: a sibling served on a window *this* agent is not on (a different model, `seven_day` against
 `five_hour`) writes `allowed` into the shared snapshot, this agent's own reset-time-less 429
-writes `rejected` back, and the verdict flaps with whichever landed last. Every flap would hand
-the budget back. So a re-armed budget may not nudge within **30 minutes** of the previous nudge
-— which never delays the case that matters, where a window resets hours after the last attempt
-— and `MAX_NUDGES` caps the stall outright whatever the verdict does.
+writes `rejected` back, and the verdict flaps with whichever landed last. So evidence may pull a
+nudge no closer than **30 minutes** to the last one, and `MAX_NUDGES` caps the stall outright
+whatever the verdict does.
+
+The floor is a bound on *acceleration*, and the schedule it arrives into still stands: the next
+nudge is the **sooner** of the two. Applied the other way it inverts the whole thing — in the
+dense phase the backoff is one to sixteen minutes against a thirty-minute floor, so news that
+the account has tokens would cost the agent up to 29 minutes it would not have lost by being
+told nothing at all. *A stall never resumes later for having been told something.*
 
 **Slowing down and giving up are said out loud**, and are different news: an
 `auto_resume_slowed` line when the dense phase ends (*still watching, about once an hour*) and
