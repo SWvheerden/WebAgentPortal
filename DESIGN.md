@@ -1014,6 +1014,18 @@ someone's nose is just noise. It clears the moment the last request is answered.
 `document.title` is owned by the flasher and pages set their base title through `setTitle`,
 or the two would overwrite each other on every tick.
 
+Away, the icon alternates between the badged turtle and `favicon-flash.svg` — the whole tile
+orange — because a four-pixel badge does not read from across a tab strip; a blinking orange
+tab does. The flash starts on its orange half, so the tab changes the moment it is needed.
+
+Each new request also **chimes**: two short notes synthesised with Web Audio, so there is no
+binary asset to embed. It is driven by the `permission_request` message (`announceAttention`),
+not by the count, so every request chimes — including a second one while another is already
+waiting. Browsers refuse audio before a user gesture, so the context is created or resumed on
+the first click or key press; until then a chime is skipped silently, never thrown. Two open
+tabs would chime twice for the same request, so the first claims its id in `localStorage` and
+the other stays quiet.
+
 Only `awaiting_approval` qualifies. `failed` looks like it belongs and does not: it is
 terminal, nothing is waiting on the human, and a flash with no answering action would simply
 never stop.

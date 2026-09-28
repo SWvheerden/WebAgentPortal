@@ -1,5 +1,5 @@
 // Agent detail: transcript, approvals, composer, slash commands.
-import { api, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast } from '/assets/common.js';
+import { announceAttention, api, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
@@ -921,8 +921,10 @@ async function main() {
     })
     .on('permission_request', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
+      const fresh = !state.pending.has(msg.request.request_id);
       state.pending.set(msg.request.request_id, msg.request);
       renderApprovals();
+      if (fresh) announceAttention(msg.request.request_id);
     })
     .on('permission_resolved', (msg) => {
       if (msg.agent_id !== state.agent.id) return;

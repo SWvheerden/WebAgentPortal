@@ -1,6 +1,6 @@
 // Dashboard: the agent registry, account usage, notes, the spawn form, cloning
 // and settings.
-import { api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast } from '/assets/common.js';
+import { announceAttention, api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast } from '/assets/common.js';
 
 const state = {
   agents: new Map(),
@@ -913,6 +913,9 @@ async function main() {
     .on('permission_request', (msg) => {
       const agent = state.agents.get(msg.agent_id);
       toast(`${agent ? agent.name : msg.agent_id} needs approval for ${msg.request.tool_name}`, 'warn');
+      // Per request, not per render: every new one chimes, even when another
+      // agent is already waiting.
+      announceAttention(msg.request.request_id);
     })
     .on('permission_mode_changed', (msg) => {
       const agent = state.agents.get(msg.agent_id);

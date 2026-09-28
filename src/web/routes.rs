@@ -1130,10 +1130,60 @@ mod tests {
             "agent.js",
             "favicon.svg",
             "favicon-alert.svg",
+            "favicon-flash.svg",
         ] {
             assert!(
                 Assets::get(name).is_some(),
                 "missing embedded asset: {name}"
+            );
+        }
+    }
+
+    fn asset_text(name: &str) -> String {
+        std::str::from_utf8(&Assets::get(name).expect(name).data)
+            .expect("utf-8")
+            .to_string()
+    }
+
+    /// The flash is only orange if the flasher actually swaps to the orange
+    /// icon, and that icon is only reachable if it is embedded under the name
+    /// the flasher asks for.
+    #[test]
+    fn the_tab_flashes_the_orange_icon() {
+        let js = asset_text("common.js");
+        assert!(
+            js.contains("'/assets/favicon-flash.svg'"),
+            "the flasher never names the orange icon"
+        );
+        assert!(
+            js.contains("ICON_FLASH : ICON_ALERT"),
+            "the flash never alternates to orange"
+        );
+        let svg = asset_text("favicon-flash.svg");
+        assert!(svg.contains("#ff8c1a"), "the flash icon is not orange");
+    }
+
+    /// Every page that shows approvals must chime on each new request, not
+    /// only when the count first rises from zero — so the call belongs in the
+    /// `permission_request` handler, which fires once per request.
+    #[test]
+    fn every_new_permission_request_announces_itself() {
+        let common = asset_text("common.js");
+        assert!(common.contains("export function announceAttention("));
+        assert!(
+            common.contains("new Ctor()"),
+            "no Web Audio context for the chime"
+        );
+        for page in ["dashboard.js", "agent.js"] {
+            let js = asset_text(page);
+            let handler = js
+                .split(".on('permission_request'")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{page} has no permission_request handler"));
+            let body = handler.split(".on(").next().unwrap_or_default();
+            assert!(
+                body.contains("announceAttention(msg.request.request_id)"),
+                "{page} does not announce new permission requests"
             );
         }
     }

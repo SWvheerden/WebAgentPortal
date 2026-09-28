@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="turtle, attention needed">
+  <!-- The loud half of the flash. The badge on favicon-alert.svg is four
+       pixels across at 16px; this one is the whole tile, so alternating the two
+       reads as the tab itself blinking orange from across the tab strip. The
+       turtle stays, drawn dark on the orange, so it is still this app's tab. -->
+  <rect width="64" height="64" rx="12" fill="#ff8c1a"/>
+  <g fill="#5a2a00">
+    <ellipse cx="32" cy="10" rx="10" ry="9.5"/>
+    <ellipse cx="12" cy="20" rx="8.5" ry="5" transform="rotate(-42 12 20)"/>
+    <ellipse cx="52" cy="20" rx="8.5" ry="5" transform="rotate(42 52 20)"/>
+    <ellipse cx="12" cy="48" rx="8.5" ry="5" transform="rotate(42 12 48)"/>
+    <ellipse cx="52" cy="48" rx="8.5" ry="5" transform="rotate(-42 52 48)"/>
+    <path d="M32 61 L28 47 L36 47 Z"/>
+  </g>
+  <ellipse cx="32" cy="35" rx="19" ry="16" fill="#2a1200" stroke="#5a2a00" stroke-width="3"/>
+  <path d="M32 24 L41 30.5 L37.5 41.5 L26.5 41.5 L23 30.5 Z" fill="#ffb366"/>
+</svg>
