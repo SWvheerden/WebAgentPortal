@@ -1,7 +1,7 @@
 // Dashboard: the agent registry, account usage, notes, the spawn form, cloning
 // and settings.
 import { announceAttention, releaseAttention, api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast } from '/assets/common.js';
-import { PendingRequests, Resync } from '/assets/attention.js';
+import { PendingRequests, Resync, withDeadline } from '/assets/attention.js';
 
 const state = {
   agents: new Map(),
@@ -227,6 +227,8 @@ function renderAgents() {
   setAttention(list.filter((a) => a.status === 'awaiting_approval').length);
 }
 
+const RELOAD_DEADLINE_MS = 10000;
+
 /// `announce` on every socket open: a request that landed before the socket
 /// was up, or while it was down, came in no `permission_request`, so the
 /// snapshot is the only place it shows. The load at startup stays quiet —
@@ -236,7 +238,10 @@ async function loadAgents({ announce = false } = {}) {
   const generation = state.resync.begin();
   let data;
   try {
-    data = await api('/api/agents');
+    // Bounded: a reload stalled on a half-open connection would otherwise hold
+    // every live message — cards frozen, chimes silent — for as long as it hung.
+    // On the deadline the fetch is aborted and the held messages flush below.
+    data = await withDeadline((signal) => api('/api/agents', { signal }), RELOAD_DEADLINE_MS);
   } catch (err) {
     state.resync.finish(generation, null);
     throw err;

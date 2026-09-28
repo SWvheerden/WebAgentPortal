@@ -251,3 +251,26 @@ export class Resync {
     return true;
   }
 }
+
+/// Run `run(signal)`, giving up after `ms`: the signal aborts, and the returned
+/// promise rejects even if `run` ignores the signal. The timer is cleared
+/// however it settles. For fetches whose stall would hold something else up —
+/// a `Resync` holding every live message until the snapshot lands.
+export function withDeadline(run, ms, timers = { set: setTimeout, clear: clearTimeout }) {
+  const controller = new AbortController();
+  let timer = null;
+  const expired = new Promise((_, reject) => {
+    timer = timers.set(() => {
+      const err = new Error(`gave up after ${ms / 1000}s`);
+      controller.abort(err);
+      reject(err);
+    }, ms);
+  });
+  let work;
+  try {
+    work = Promise.resolve(run(controller.signal));
+  } catch (err) {
+    work = Promise.reject(err);
+  }
+  return Promise.race([work, expired]).finally(() => timers.clear(timer));
+}

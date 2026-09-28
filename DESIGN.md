@@ -1037,7 +1037,9 @@ diffs every agent's `pending_permissions`; what is new chimes, and the load at s
 quiet. The socket keeps delivering while that reload is in flight, and the snapshot — taken
 at some unknown point in the window — must not overwrite newer news, so agent messages are
 held (`Resync`) and replayed on top of the snapshot in order; an overlapping older reload's
-result is discarded. The decisions (tab look, flash phase, which tab chimes, the resync)
+result is discarded. The reload has a ten-second deadline — the fetch is aborted and the held
+messages flush onto what the page had — so a fetch stalled on a half-open connection cannot
+freeze the board. The decisions (tab look, flash phase, which tab chimes, the resync)
 live in the DOM-free `attention.js`, driven under node by a test.
 
 Only `awaiting_approval` qualifies. `failed` looks like it belongs and does not: it is

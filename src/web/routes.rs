@@ -1151,7 +1151,7 @@ mod tests {
         let driver = dir.path().join("attention.mjs");
         let source = format!(
             r#"
-import {{ Chimer, ChimeClaims, Flasher, PendingRequests, Resync, attentionKey, newKeys, tabLook, ICON, ICON_ALERT, ICON_FLASH, CHIME_CLAIM_MS, CHIME_STORAGE_KEY }} from "{module}";
+import {{ Chimer, ChimeClaims, Flasher, PendingRequests, Resync, withDeadline, attentionKey, newKeys, tabLook, ICON, ICON_ALERT, ICON_FLASH, CHIME_CLAIM_MS, CHIME_STORAGE_KEY }} from "{module}";
 
 const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
 
@@ -1369,6 +1369,42 @@ const agentA = (status, ids) => ({{ id: "a", status, pending_permissions: ids.ma
   b.live(() => b.status.set("a", "idle"));
   b.resync.finish(gen, null);
   assert(b.status.get("a") === "idle", "held news must not be lost when the fetch fails");
+}}
+
+// A reload that stalls hits its deadline: the fetch is aborted, and the held
+// news flushes instead of waiting forever.
+{{
+  const b = board();
+  b.load([agentA("working", [])], false);
+  let fire = null;
+  let cleared = 0;
+  const timers = {{ set: (fn) => {{ fire = fn; return 1; }}, clear: () => {{ cleared += 1; }} }};
+  let seen = null;
+  const gen = b.resync.begin();
+  // A fetch on a half-open connection: never settles, whatever the signal says.
+  const reload = withDeadline((signal) => {{ seen = signal; return new Promise(() => {{}}); }}, 10000, timers)
+    .then((data) => b.resync.finish(gen, () => b.load(data)), () => b.resync.finish(gen, null));
+  b.live(() => b.status.set("a", "awaiting_approval"));
+  b.live(() => b.pending.request("a", "r"));
+  assert(b.resync.holding && b.status.get("a") === "working", "held while the reload hangs");
+  fire();
+  await reload;
+  assert(seen.aborted, "the stalled fetch must be aborted");
+  assert(cleared === 1, "the timer is cleared on settle");
+  assert(!b.resync.holding, "the deadline must end the hold");
+  assert(b.status.get("a") === "awaiting_approval" && b.chimes.length === 1, "and the held news applies and chimes");
+}}
+
+// A reload that answers in time clears its timer and never aborts.
+{{
+  let fire = null;
+  let cleared = 0;
+  const timers = {{ set: (fn) => {{ fire = fn; return 1; }}, clear: () => {{ cleared += 1; }} }};
+  let seen = null;
+  const value = await withDeadline(async (signal) => {{ seen = signal; return 42; }}, 10000, timers);
+  assert(value === 42 && cleared === 1 && !seen.aborted, "a prompt reload is untouched");
+  const threw = await withDeadline(() => {{ throw new Error("boom"); }}, 10000, timers).then(() => null, (e) => e.message);
+  assert(threw === "boom" && cleared === 2, "a synchronous throw still rejects and clears");
 }}
 
 // What a resync finds that the socket never announced.
