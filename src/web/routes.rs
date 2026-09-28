@@ -1131,6 +1131,7 @@ mod tests {
             "favicon.svg",
             "favicon-alert.svg",
             "favicon-flash.svg",
+            "attention.js",
         ] {
             assert!(
                 Assets::get(name).is_some(),
@@ -1139,53 +1140,143 @@ mod tests {
         }
     }
 
-    fn asset_text(name: &str) -> String {
-        std::str::from_utf8(&Assets::get(name).expect(name).data)
-            .expect("utf-8")
-            .to_string()
-    }
-
-    /// The flash is only orange if the flasher actually swaps to the orange
-    /// icon, and that icon is only reachable if it is embedded under the name
-    /// the flasher asks for.
+    /// Drive the real `attention.js` — the tab alert's decisions, kept free of
+    /// the DOM and Web Audio for exactly this — through the cases that matter:
+    /// which of several tabs chimes, and which half the flash starts on.
     #[test]
-    fn the_tab_flashes_the_orange_icon() {
-        let js = asset_text("common.js");
-        assert!(
-            js.contains("'/assets/favicon-flash.svg'"),
-            "the flasher never names the orange icon"
-        );
-        assert!(
-            js.contains("ICON_FLASH : ICON_ALERT"),
-            "the flash never alternates to orange"
-        );
-        let svg = asset_text("favicon-flash.svg");
-        assert!(svg.contains("#ff8c1a"), "the flash icon is not orange");
-    }
+    fn the_tab_alert_chimes_once_per_request_and_flashes_orange_first() {
+        let module =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/assets/attention.js");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = dir.path().join("attention.mjs");
+        let source = format!(
+            r#"
+import {{ Chimer, ChimeClaims, Flasher, attentionKey, newKeys, tabLook, ICON, ICON_ALERT, ICON_FLASH, CHIME_STORAGE_KEY }} from "{module}";
 
-    /// Every page that shows approvals must chime on each new request, not
-    /// only when the count first rises from zero — so the call belongs in the
-    /// `permission_request` handler, which fires once per request.
-    #[test]
-    fn every_new_permission_request_announces_itself() {
-        let common = asset_text("common.js");
-        assert!(common.contains("export function announceAttention("));
-        assert!(
-            common.contains("new Ctor()"),
-            "no Web Audio context for the chime"
+const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
+
+// One localStorage, shared by every tab of the origin.
+const storage = () => {{
+  const map = new Map();
+  return {{ getItem: (k) => (map.has(k) ? map.get(k) : null), setItem: (k, v) => map.set(k, String(v)), map }};
+}};
+let clock = 1_000_000;
+const now = () => clock;
+
+// A tab: its own audio context, the shared storage, a count of what it played.
+const tab = (shared, state) => {{
+  const ctx = {{ state, resumed: 0, resume() {{ this.resumed += 1; return Promise.resolve(); }} }};
+  const t = {{ ctx, played: 0 }};
+  t.chimer = new Chimer({{ context: () => ctx, claims: new ChimeClaims(shared, now), play: () => {{ t.played += 1; }} }});
+  return t;
+}};
+
+// A locked tab seeing the request first must not claim it away from an
+// unlocked one: exactly one chime, from the tab that can play.
+{{
+  const shared = storage();
+  const locked = tab(shared, "suspended");
+  const open = tab(shared, "running");
+  const key = attentionKey("a", "r1");
+  locked.chimer.announce(key);
+  open.chimer.announce(key);
+  assert(locked.played === 0, "a locked tab must stay silent");
+  assert(open.played === 1, "the unlocked tab must chime: " + open.played);
+  await Promise.resolve();
+  assert(locked.ctx.resumed === 1, "the locked tab should ask to resume");
+}}
+
+// Interleaved requests across two tabs: r2 must not overwrite r1's claim.
+{{
+  const shared = storage();
+  const one = tab(shared, "running");
+  const two = tab(shared, "running");
+  const r1 = attentionKey("a", "r1");
+  const r2 = attentionKey("a", "r2");
+  one.chimer.announce(r1);
+  one.chimer.announce(r2);
+  two.chimer.announce(r1);
+  two.chimer.announce(r2);
+  assert(one.played === 2, "the first tab chimes for each request: " + one.played);
+  assert(two.played === 0, "the second tab must not chime again: " + two.played);
+}}
+
+// Request ids are only unique per agent: the same id from two agents is two
+// requests, and both chime.
+{{
+  const shared = storage();
+  const only = tab(shared, "running");
+  only.chimer.announce(attentionKey("a", "1"));
+  only.chimer.announce(attentionKey("b", "1"));
+  assert(only.played === 2, "two agents, one id: both must chime: " + only.played);
+}}
+
+// Claims expire, and the map is pruned on write so it stays bounded.
+{{
+  const shared = storage();
+  const only = tab(shared, "running");
+  for (let i = 0; i < 50; i += 1) {{
+    only.chimer.announce(attentionKey("a", String(i)));
+    clock += 1000;
+  }}
+  const held = Object.keys(JSON.parse(shared.map.get(CHIME_STORAGE_KEY)));
+  assert(held.length <= 6, "stale claims must be pruned: " + held.length);
+}}
+
+// Broken storage never costs the chime.
+{{
+  const broken = {{ getItem() {{ throw new Error("denied"); }}, setItem() {{ throw new Error("denied"); }} }};
+  const t = tab(broken, "running");
+  assert(t.chimer.announce("x") === true, "a storage failure must still chime");
+  const bad = storage();
+  bad.setItem(CHIME_STORAGE_KEY, "not json");
+  assert(tab(bad, "running").chimer.announce("y") === true, "junk in storage must still chime");
+}}
+
+// The flash starts orange, alternates, and stops cleanly.
+{{
+  let tick = null;
+  let stopped = 0;
+  const flasher = new Flasher({{ every: 1000, start: (fn) => {{ tick = fn; return 7; }}, stop: () => {{ stopped += 1; }} }});
+  assert(!flasher.loud, "idle is quiet");
+  flasher.want(true);
+  assert(flasher.loud, "the flash must start on the loud half");
+  const look = (loud, watching = false) => tabLook({{ attention: 2, watching, loud, baseTitle: "claude-web" }});
+  assert(look(flasher.loud).icon === ICON_FLASH, "the loud half is the orange icon");
+  tick();
+  assert(!flasher.loud && look(flasher.loud).icon === ICON_ALERT, "the quiet half is the badge");
+  flasher.jolt();
+  assert(flasher.loud, "a new request jumps back to orange");
+  flasher.want(true);
+  assert(stopped === 0, "wanting it twice starts one timer");
+  flasher.want(false);
+  assert(stopped === 1 && !flasher.loud && !flasher.running, "stopping clears the phase");
+  flasher.jolt();
+  assert(!flasher.loud, "a jolt does not restart a stopped flash");
+  assert(look(true, true).icon === ICON_ALERT, "watching, the badge sits still");
+  assert(tabLook({{ attention: 0, watching: false, loud: true, baseTitle: "t" }}).icon === ICON, "nothing waiting, no alert");
+  assert(tabLook({{ attention: 0, watching: false, loud: true, baseTitle: "t" }}).title === "t", "and the title is restored");
+}}
+
+// What a resync finds that the socket never announced.
+assert(JSON.stringify(newKeys(new Set(["a:1"]), ["a:1", "a:2", "b:1"])) === '["a:2","b:1"]', "newKeys");
+console.log("ok");
+"#,
+            module = module.display()
         );
-        for page in ["dashboard.js", "agent.js"] {
-            let js = asset_text(page);
-            let handler = js
-                .split(".on('permission_request'")
-                .nth(1)
-                .unwrap_or_else(|| panic!("{page} has no permission_request handler"));
-            let body = handler.split(".on(").next().unwrap_or_default();
-            assert!(
-                body.contains("announceAttention(msg.request.request_id)"),
-                "{page} does not announce new permission requests"
-            );
-        }
+        std::fs::write(&driver, source).expect("write driver");
+
+        let output = match std::process::Command::new("node").arg(&driver).output() {
+            Ok(output) => output,
+            // No node installed: nothing in the build depends on it.
+            Err(_) => return,
+        };
+        assert!(
+            output.status.success(),
+            "attention driver failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// A checkbox the panel fills but never sends back is a setting that

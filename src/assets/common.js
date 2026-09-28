@@ -1,5 +1,6 @@
 // Shared helpers: API calls, the multiplexed socket, small DOM utilities.
 // No build step, no dependencies — plain ES modules (§7).
+import { Chimer, ChimeClaims, Flasher, attentionKey, tabLook } from '/assets/attention.js';
 
 // The credential this page presents. There are two of them, and which one a
 // page holds depends on how it was opened (§7, §12).
@@ -197,15 +198,10 @@ export function fmtAgo(ms) {
 // it is terminal, nothing is waiting on the human, and a flash that cannot be
 // resolved by answering it would simply never stop.
 
-const ICON = '/assets/favicon.svg';
-const ICON_ALERT = '/assets/favicon-alert.svg';
-const ICON_FLASH = '/assets/favicon-flash.svg';
 const FLASH_MS = 1200;
 
 let baseTitle = document.title;
 let attention = 0;
-let loudPhase = false;
-let flashTimer = null;
 
 /// Is the operator actually looking at this tab? A visible tab in an unfocused
 /// window does not count — that is the case this whole feature exists for.
@@ -219,36 +215,15 @@ function setIcon(href) {
 }
 
 function paintTab() {
-  if (!attention) {
-    document.title = baseTitle;
-    setIcon(ICON);
-    return;
-  }
-  const noun = attention === 1 ? 'approval' : 'approvals';
-  const loud = !watching() && loudPhase;
-  document.title = loud ? `🔔 ${attention} ${noun} needed` : `(${attention}) ${baseTitle}`;
-  // Looking at it, the badge sits still: the page already shows the amber card,
-  // and something blinking under their nose is just noise. Away, the icon
-  // alternates between the badge and a solid orange tile.
-  if (watching()) setIcon(ICON_ALERT);
-  else setIcon(loud ? ICON_FLASH : ICON_ALERT);
+  const look = tabLook({ attention, watching: watching(), loud: flasher.loud, baseTitle });
+  document.title = look.title;
+  setIcon(look.icon);
 }
 
+const flasher = new Flasher({ every: FLASH_MS, onTick: paintTab });
+
 function scheduleFlash() {
-  const wanted = attention > 0 && !watching();
-  if (wanted && !flashTimer) {
-    // Start on the loud half, so the tab goes orange the moment it is needed
-    // rather than one tick later.
-    loudPhase = true;
-    flashTimer = setInterval(() => {
-      loudPhase = !loudPhase;
-      paintTab();
-    }, FLASH_MS);
-  } else if (!wanted && flashTimer) {
-    clearInterval(flashTimer);
-    flashTimer = null;
-    loudPhase = false;
-  }
+  flasher.want(attention > 0 && !watching());
   paintTab();
 }
 
@@ -279,11 +254,7 @@ window.addEventListener('blur', scheduleFlash);
 // has seen a gesture; the context is created (or resumed) on the first click or
 // key press, and until then a chime is skipped silently rather than throwing.
 // A tab opened and never touched therefore stays quiet — the flash still runs.
-
-/// Two tabs of this app on the same request would otherwise chime twice. The
-/// first to claim a key in localStorage plays; the rest see it and stay quiet.
-const CHIME_KEY = 'claude-web-chimed';
-const CHIME_CLAIM_MS = 5000;
+// Which tab plays, when several are open, is `Chimer`'s call (attention.js).
 
 let audio = null;
 
@@ -308,59 +279,46 @@ for (const kind of ['pointerdown', 'keydown', 'touchstart']) {
   window.addEventListener(kind, unlockAudio, { capture: true, passive: true });
 }
 
-function claimChime(key) {
-  if (key === undefined || key === null) return true;
-  try {
-    const prior = JSON.parse(localStorage.getItem(CHIME_KEY) || 'null');
-    if (prior && prior.key === String(key) && Date.now() - prior.at < CHIME_CLAIM_MS) return false;
-    localStorage.setItem(CHIME_KEY, JSON.stringify({ key: String(key), at: Date.now() }));
-  } catch {
-    // Storage unavailable (private mode, quota): a double chime beats none.
-  }
-  return true;
-}
-
-function chime() {
-  const ctx = audioContext();
-  // Not yet unlocked by a gesture. Asking to resume is harmless; playing into
-  // a suspended context would only queue the notes for a surprise later.
-  if (!ctx) return;
-  if (ctx.state !== 'running') {
-    ctx.resume().catch(() => {});
-    return;
-  }
-  try {
-    const start = ctx.currentTime;
-    // Two rising notes: short enough not to grate on the tenth request, and
-    // distinct from the single tones most other apps use.
-    for (const [freq, offset] of [[880, 0], [1320, 0.14]]) {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = freq;
-      const t = start + offset;
-      gain.gain.setValueAtTime(0.0001, t);
-      gain.gain.exponentialRampToValueAtTime(0.2, t + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(t);
-      osc.stop(t + 0.3);
-    }
-  } catch {
-    // Audio is a courtesy; never let it take the page's socket handler down.
+/// Two rising notes: short enough not to grate on the tenth request, and
+/// distinct from the single tones most other apps use.
+function playChime(ctx) {
+  const start = ctx.currentTime;
+  for (const [freq, offset] of [[880, 0], [1320, 0.14]]) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    const t = start + offset;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.2, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t);
+    osc.stop(t + 0.3);
   }
 }
 
-/// Something new needs a human: chime, and start the tab flashing on its loud
-/// half. Call it once per new request — not per render — so that each request
-/// chimes exactly once, however many there already are. `key` identifies the
-/// request (its id), so a second open tab does not chime for it again.
-export function announceAttention(key) {
-  if (claimChime(key)) chime();
-  if (flashTimer) {
-    loudPhase = true;
-    paintTab();
+function sharedStorage() {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
   }
+}
+
+const chimer = new Chimer({
+  context: audioContext,
+  claims: new ChimeClaims(sharedStorage()),
+  play: playChime,
+});
+
+/// Something new needs a human: chime, and jolt the tab back to the loud half
+/// of its flash. Call it once per new request — not per render — so that each
+/// request chimes exactly once, however many there already are.
+export function announceAttention(agentId, requestId) {
+  chimer.announce(attentionKey(agentId, requestId));
+  flasher.jolt();
+  paintTab();
 }
 
 // One socket, one reconnect path, one schema. Handlers are keyed by the

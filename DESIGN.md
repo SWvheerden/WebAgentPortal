@@ -1023,8 +1023,17 @@ binary asset to embed. It is driven by the `permission_request` message (`announ
 not by the count, so every request chimes — including a second one while another is already
 waiting. Browsers refuse audio before a user gesture, so the context is created or resumed on
 the first click or key press; until then a chime is skipped silently, never thrown. Two open
-tabs would chime twice for the same request, so the first claims its id in `localStorage` and
-the other stays quiet.
+tabs would chime twice for the same request, so the first tab *able to play* claims it in
+`localStorage` and the others stay quiet — a locked tab never claims, or it would silence one
+that could have played. Claims are keyed `agent_id:request_id` (request ids are the child's
+to choose, unique only per agent), held as a small map pruned of anything older than five
+seconds on every write.
+
+A request that lands while the socket is down arrives in no `permission_request`. After a
+reconnect the agent page diffs the replay's pending set against what it held, and the
+dashboard reloads `/api/agents` and diffs every agent's `pending_permissions`; what is new
+chimes. The first load stays quiet — nothing in it is news. The decisions (tab look, flash
+phase, which tab chimes) live in the DOM-free `attention.js`, driven under node by a test.
 
 Only `awaiting_approval` qualifies. `failed` looks like it belongs and does not: it is
 terminal, nothing is waiting on the human, and a flash with no answering action would simply

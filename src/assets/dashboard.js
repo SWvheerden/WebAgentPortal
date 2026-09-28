@@ -1,6 +1,7 @@
 // Dashboard: the agent registry, account usage, notes, the spawn form, cloning
 // and settings.
 import { announceAttention, api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast } from '/assets/common.js';
+import { attentionKey, newKeys } from '/assets/attention.js';
 
 const state = {
   agents: new Map(),
@@ -18,6 +19,9 @@ const state = {
   /// that has never been saved, or null when the editor is shut. One at a time:
   /// the editor is a place to work, not a stack of them.
   editing: null,
+  /// Every request waiting on a human, as `attentionKey`s. A request chimes
+  /// when it first lands here, whichever way it arrived.
+  pendingKeys: new Set(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -221,9 +225,22 @@ function renderAgents() {
   setAttention(list.filter((a) => a.status === 'awaiting_approval').length);
 }
 
-async function loadAgents() {
+/// `announce` on a resync after a reconnect: a request that arrived while the
+/// socket was down came in no `permission_request`, so the snapshot is the only
+/// place it shows. The load at startup stays quiet — nothing in it is news.
+async function loadAgents({ announce = false } = {}) {
   const data = await api('/api/agents');
   state.agents = new Map(data.agents.map((a) => [a.id, a]));
+  const pending = new Map();
+  for (const agent of data.agents) {
+    for (const request of agent.pending_permissions || []) {
+      pending.set(attentionKey(agent.id, request.request_id), [agent.id, request.request_id]);
+    }
+  }
+  if (announce) {
+    for (const key of newKeys(state.pendingKeys, pending.keys())) announceAttention(...pending.get(key));
+  }
+  state.pendingKeys = new Set(pending.keys());
   renderAgents();
 }
 
@@ -881,7 +898,15 @@ async function main() {
   $('clone-folder').oninput = () => { $('clone-folder').dataset.touched = '1'; };
 
   const socket = new Socket();
-  socket.onopen = () => { $('conn').textContent = 'live'; };
+  let opened = false;
+  socket.onopen = () => {
+    $('conn').textContent = 'live';
+    // The socket only carries changes. After a drop, everything that changed
+    // while it was down — statuses, and requests nobody announced — is only in
+    // a fresh snapshot.
+    if (opened) loadAgents({ announce: true }).catch((err) => toast(err.message, 'error'));
+    opened = true;
+  };
   socket
     .on('status', (msg) => {
       const agent = state.agents.get(msg.agent_id);
@@ -915,7 +940,16 @@ async function main() {
       toast(`${agent ? agent.name : msg.agent_id} needs approval for ${msg.request.tool_name}`, 'warn');
       // Per request, not per render: every new one chimes, even when another
       // agent is already waiting.
-      announceAttention(msg.request.request_id);
+      const key = attentionKey(msg.agent_id, msg.request.request_id);
+      if (!state.pendingKeys.has(key)) {
+        state.pendingKeys.add(key);
+        announceAttention(msg.agent_id, msg.request.request_id);
+      }
+    })
+    .on('permission_resolved', (msg) => {
+      // Ids are the child's to choose and may come round again once this one
+      // is answered, so a resolved one must not mute its successor.
+      state.pendingKeys.delete(attentionKey(msg.agent_id, msg.request_id));
     })
     .on('permission_mode_changed', (msg) => {
       const agent = state.agents.get(msg.agent_id);

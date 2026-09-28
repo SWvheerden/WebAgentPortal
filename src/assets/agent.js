@@ -1,6 +1,7 @@
 // Agent detail: transcript, approvals, composer, slash commands.
 import { announceAttention, api, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
+import { newKeys } from '/assets/attention.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
 const $ = (id) => document.getElementById(id);
@@ -10,6 +11,10 @@ const state = {
   transcript: new Transcript(),
   commands: [],
   pending: new Map(),
+  /// Set by the first replay. That one only confirms what the page loaded
+  /// with, so it stays quiet; later ones follow a reconnect, and a request that
+  /// arrived while the socket was down came in no `permission_request`.
+  pendingSeeded: false,
   partial: null,
   queued: [],
   acIndex: 0,
@@ -888,8 +893,13 @@ async function main() {
       if (msg.agent_id !== state.agent.id) return;
       state.transcript.seed(msg.after);
       appendEvents(msg.events);
+      const previous = state.pending;
       state.pending = new Map((msg.pending_permissions || []).map((r) => [r.request_id, r]));
       renderApprovals();
+      if (state.pendingSeeded) {
+        for (const id of newKeys(previous, state.pending.keys())) announceAttention(state.agent.id, id);
+      }
+      state.pendingSeeded = true;
       // A replay page is capped. Walk forward from the page's own cursor until
       // the server stops saying there is more. The walk deliberately ignores
       // the render state: a live event arriving mid-walk must not end it, or
@@ -924,7 +934,7 @@ async function main() {
       const fresh = !state.pending.has(msg.request.request_id);
       state.pending.set(msg.request.request_id, msg.request);
       renderApprovals();
-      if (fresh) announceAttention(msg.request.request_id);
+      if (fresh) announceAttention(msg.agent_id, msg.request.request_id);
     })
     .on('permission_resolved', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
