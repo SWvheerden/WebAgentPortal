@@ -1151,7 +1151,7 @@ mod tests {
         let driver = dir.path().join("attention.mjs");
         let source = format!(
             r#"
-import {{ Chimer, ChimeClaims, Flasher, attentionKey, newKeys, tabLook, ICON, ICON_ALERT, ICON_FLASH, CHIME_STORAGE_KEY }} from "{module}";
+import {{ Chimer, ChimeClaims, Flasher, PendingRequests, Resync, attentionKey, newKeys, tabLook, ICON, ICON_ALERT, ICON_FLASH, CHIME_CLAIM_MS, CHIME_STORAGE_KEY }} from "{module}";
 
 const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
 
@@ -1211,16 +1211,40 @@ const tab = (shared, state) => {{
   assert(only.played === 2, "two agents, one id: both must chime: " + only.played);
 }}
 
+// A throttled background tab reaches the same request a minute or more
+// later, after a reconnect: still one chime.
+{{
+  const shared = storage();
+  const one = tab(shared, "running");
+  const late = tab(shared, "running");
+  one.chimer.announce(attentionKey("a", "r1"));
+  clock += 90_000;
+  late.chimer.announce(attentionKey("a", "r1"));
+  assert(late.played === 0, "a late tab must not chime again");
+  assert(CHIME_CLAIM_MS >= 5 * 60_000, "the claim must outlast a throttled reconnect");
+}}
+
 // Claims expire, and the map is pruned on write so it stays bounded.
 {{
   const shared = storage();
   const only = tab(shared, "running");
   for (let i = 0; i < 50; i += 1) {{
     only.chimer.announce(attentionKey("a", String(i)));
-    clock += 1000;
+    clock += 60_000;
   }}
   const held = Object.keys(JSON.parse(shared.map.get(CHIME_STORAGE_KEY)));
-  assert(held.length <= 6, "stale claims must be pruned: " + held.length);
+  assert(held.length <= 11, "stale claims must be pruned: " + held.length);
+}}
+
+// An answered request frees its id: a later request reusing it chimes.
+{{
+  const shared = storage();
+  const only = tab(shared, "running");
+  const claims = new ChimeClaims(shared, now);
+  only.chimer.announce(attentionKey("a", "1"));
+  claims.release(attentionKey("a", "1"));
+  only.chimer.announce(attentionKey("a", "1"));
+  assert(only.played === 2, "a reused id must chime after release: " + only.played);
 }}
 
 // Broken storage never costs the chime.
@@ -1256,6 +1280,95 @@ const tab = (shared, state) => {{
   assert(look(true, true).icon === ICON_ALERT, "watching, the badge sits still");
   assert(tabLook({{ attention: 0, watching: false, loud: true, baseTitle: "t" }}).icon === ICON, "nothing waiting, no alert");
   assert(tabLook({{ attention: 0, watching: false, loud: true, baseTitle: "t" }}).title === "t", "and the title is restored");
+}}
+
+// The dashboard's reconnect reload, modelled with the real Resync and
+// PendingRequests: statuses in a Map, chimes counted.
+const board = () => {{
+  const b = {{ status: new Map(), chimes: [] }};
+  b.pending = new PendingRequests((agent, id) => b.chimes.push(agent + ":" + id));
+  b.resync = new Resync();
+  b.live = (apply) => b.resync.route(apply);
+  b.load = (agents, announce = true) => {{
+    b.status = new Map(agents.map((a) => [a.id, a.status]));
+    b.pending.snapshot(agents, {{ announce }});
+  }};
+  b.waiting = () => [...b.status.values()].filter((s) => s === "awaiting_approval").length;
+  return b;
+}};
+const agentA = (status, ids) => ({{ id: "a", status, pending_permissions: ids.map((request_id) => ({{ request_id }})) }});
+
+// Stale snapshot: the snapshot still shows r1 waiting, but the socket already
+// said it was answered and the agent moved on. The live news must win.
+{{
+  const b = board();
+  b.load([agentA("awaiting_approval", ["r1"])], false);
+  const gen = b.resync.begin();
+  const snapshot = [agentA("awaiting_approval", ["r1"])];
+  b.live(() => b.pending.resolved("a", "r1"));
+  b.live(() => b.status.set("a", "working"));
+  assert(b.status.get("a") === "awaiting_approval", "live news is held while the reload is in flight");
+  assert(b.resync.finish(gen, () => b.load(snapshot)), "the current reload applies");
+  assert(b.status.get("a") === "working", "a stale snapshot must not put the agent back");
+  assert(b.waiting() === 0 && b.pending.keys.size === 0, "nothing is waiting, so nothing flashes");
+  assert(b.chimes.length === 0, "and nothing chimed");
+}}
+
+// A request that lands after the snapshot was taken: the snapshot lacks it,
+// the held live message restores it, and it chimes exactly once — then not
+// again on the next reconnect, whose snapshot holds it.
+{{
+  const b = board();
+  b.load([agentA("working", [])], false);
+  const gen = b.resync.begin();
+  const snapshot = [agentA("working", [])];
+  b.live(() => {{ b.status.set("a", "awaiting_approval"); b.pending.request("a", "r"); }});
+  b.resync.finish(gen, () => b.load(snapshot));
+  assert(b.pending.keys.has("a:r") && b.waiting() === 1, "the late request must survive the snapshot");
+  assert(b.chimes.length === 1, "and chime once: " + b.chimes);
+  const again = b.resync.begin();
+  b.live(() => b.pending.request("a", "r"));
+  b.resync.finish(again, () => b.load([agentA("awaiting_approval", ["r"])]));
+  assert(b.chimes.length === 1, "a reconnect must not chime it again: " + b.chimes);
+}}
+
+// A request only the snapshot knows about — it landed while the socket was
+// down, or before it was first up — chimes; one already known does not.
+{{
+  const b = board();
+  b.load([agentA("awaiting_approval", ["r1"])], false);
+  assert(b.chimes.length === 0, "the load at startup stays quiet");
+  const gen = b.resync.begin();
+  b.resync.finish(gen, () => b.load([agentA("awaiting_approval", ["r1", "r2"])]));
+  assert(JSON.stringify(b.chimes) === '["a:r2"]', "only the unseen request chimes: " + b.chimes);
+}}
+
+// Overlapping reloads: the older result is discarded, and what was held before
+// the newer fetch began is covered by its snapshot.
+{{
+  const b = board();
+  b.load([agentA("working", [])], false);
+  const first = b.resync.begin();
+  b.live(() => b.status.set("a", "stale-live"));
+  const second = b.resync.begin();
+  b.live(() => b.status.set("a", "newest"));
+  assert(b.resync.finish(second, () => b.load([agentA("after-first", [])])), "the newer reload applies");
+  assert(b.status.get("a") === "newest", "held news replays on top: " + b.status.get("a"));
+  assert(!b.resync.finish(first, () => b.load([agentA("oldest", [])])), "the older reload is discarded");
+  assert(b.status.get("a") === "newest", "and changes nothing");
+  assert(!b.resync.holding, "nothing is held afterwards");
+  b.live(() => b.status.set("a", "direct"));
+  assert(b.status.get("a") === "direct", "with no reload in flight, news applies at once");
+}}
+
+// A failed reload still applies what it held, onto what the page had.
+{{
+  const b = board();
+  b.load([agentA("working", [])], false);
+  const gen = b.resync.begin();
+  b.live(() => b.status.set("a", "idle"));
+  b.resync.finish(gen, null);
+  assert(b.status.get("a") === "idle", "held news must not be lost when the fetch fails");
 }}
 
 // What a resync finds that the socket never announced.

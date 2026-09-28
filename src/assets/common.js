@@ -321,6 +321,12 @@ export function announceAttention(agentId, requestId) {
   paintTab();
 }
 
+/// A request was answered: free its claim, so a later request that reuses the
+/// id still chimes.
+export function releaseAttention(agentId, requestId) {
+  chimer.claims.release(attentionKey(agentId, requestId));
+}
+
 // One socket, one reconnect path, one schema. Handlers are keyed by the
 // envelope's `type`.
 export class Socket {

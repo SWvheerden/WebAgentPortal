@@ -1,7 +1,7 @@
 // Dashboard: the agent registry, account usage, notes, the spawn form, cloning
 // and settings.
-import { announceAttention, api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast } from '/assets/common.js';
-import { attentionKey, newKeys } from '/assets/attention.js';
+import { announceAttention, releaseAttention, api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast } from '/assets/common.js';
+import { PendingRequests, Resync } from '/assets/attention.js';
 
 const state = {
   agents: new Map(),
@@ -19,9 +19,11 @@ const state = {
   /// that has never been saved, or null when the editor is shut. One at a time:
   /// the editor is a place to work, not a stack of them.
   editing: null,
-  /// Every request waiting on a human, as `attentionKey`s. A request chimes
-  /// when it first lands here, whichever way it arrived.
-  pendingKeys: new Set(),
+  /// Every request waiting on a human. A request chimes when it first lands
+  /// here, whichever way it arrived.
+  pending: new PendingRequests(announceAttention),
+  /// Holds live agent news while `/api/agents` is in flight (see `Resync`).
+  resync: new Resync(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -225,23 +227,25 @@ function renderAgents() {
   setAttention(list.filter((a) => a.status === 'awaiting_approval').length);
 }
 
-/// `announce` on a resync after a reconnect: a request that arrived while the
-/// socket was down came in no `permission_request`, so the snapshot is the only
-/// place it shows. The load at startup stays quiet — nothing in it is news.
+/// `announce` on every socket open: a request that landed before the socket
+/// was up, or while it was down, came in no `permission_request`, so the
+/// snapshot is the only place it shows. The load at startup stays quiet —
+/// nothing in it is news. Live agent news that arrives while this is in flight
+/// is held and replayed on top of the snapshot, never overwritten by it.
 async function loadAgents({ announce = false } = {}) {
-  const data = await api('/api/agents');
-  state.agents = new Map(data.agents.map((a) => [a.id, a]));
-  const pending = new Map();
-  for (const agent of data.agents) {
-    for (const request of agent.pending_permissions || []) {
-      pending.set(attentionKey(agent.id, request.request_id), [agent.id, request.request_id]);
-    }
+  const generation = state.resync.begin();
+  let data;
+  try {
+    data = await api('/api/agents');
+  } catch (err) {
+    state.resync.finish(generation, null);
+    throw err;
   }
-  if (announce) {
-    for (const key of newKeys(state.pendingKeys, pending.keys())) announceAttention(...pending.get(key));
-  }
-  state.pendingKeys = new Set(pending.keys());
-  renderAgents();
+  state.resync.finish(generation, () => {
+    state.agents = new Map(data.agents.map((a) => [a.id, a]));
+    state.pending.snapshot(data.agents, { announce });
+    renderAgents();
+  });
 }
 
 // One verb per agent at a time. A double-clicked Resume would otherwise put
@@ -898,17 +902,19 @@ async function main() {
   $('clone-folder').oninput = () => { $('clone-folder').dataset.touched = '1'; };
 
   const socket = new Socket();
-  let opened = false;
   socket.onopen = () => {
     $('conn').textContent = 'live';
-    // The socket only carries changes. After a drop, everything that changed
-    // while it was down — statuses, and requests nobody announced — is only in
-    // a fresh snapshot.
-    if (opened) loadAgents({ announce: true }).catch((err) => toast(err.message, 'error'));
-    opened = true;
+    // The socket only carries changes. Whatever changed before it was up — the
+    // first time, the gap since the load above; after a drop, everything while
+    // it was down — is only in a fresh snapshot.
+    loadAgents({ announce: true }).catch((err) => toast(err.message, 'error'));
   };
+  // Agent news goes through the resync, so a snapshot in flight cannot land on
+  // top of it. Rate limits, notices and clones are not in that snapshot, so
+  // their order against it does not matter and they apply at once.
+  const live = (apply) => (msg) => state.resync.route(() => apply(msg));
   socket
-    .on('status', (msg) => {
+    .on('status', live((msg) => {
       const agent = state.agents.get(msg.agent_id);
       if (!agent) return;
       Object.assign(agent, {
@@ -920,43 +926,40 @@ async function main() {
         last_active_at: Date.now(),
       });
       renderAgents();
-    })
-    .on('agent_added', (msg) => {
+    }))
+    .on('agent_added', live((msg) => {
       state.agents.set(msg.agent.id, msg.agent);
       renderAgents();
-    })
-    .on('agent_renamed', (msg) => {
+    }))
+    .on('agent_renamed', live((msg) => {
       const agent = state.agents.get(msg.agent_id);
       if (!agent) return;
       agent.name = msg.name;
       renderAgents();
-    })
-    .on('agent_removed', (msg) => {
+    }))
+    .on('agent_removed', live((msg) => {
       state.agents.delete(msg.agent_id);
       renderAgents();
-    })
-    .on('permission_request', (msg) => {
+    }))
+    .on('permission_request', live((msg) => {
       const agent = state.agents.get(msg.agent_id);
       toast(`${agent ? agent.name : msg.agent_id} needs approval for ${msg.request.tool_name}`, 'warn');
       // Per request, not per render: every new one chimes, even when another
       // agent is already waiting.
-      const key = attentionKey(msg.agent_id, msg.request.request_id);
-      if (!state.pendingKeys.has(key)) {
-        state.pendingKeys.add(key);
-        announceAttention(msg.agent_id, msg.request.request_id);
-      }
-    })
-    .on('permission_resolved', (msg) => {
+      state.pending.request(msg.agent_id, msg.request.request_id);
+    }))
+    .on('permission_resolved', live((msg) => {
       // Ids are the child's to choose and may come round again once this one
       // is answered, so a resolved one must not mute its successor.
-      state.pendingKeys.delete(attentionKey(msg.agent_id, msg.request_id));
-    })
-    .on('permission_mode_changed', (msg) => {
+      state.pending.resolved(msg.agent_id, msg.request_id);
+      releaseAttention(msg.agent_id, msg.request_id);
+    }))
+    .on('permission_mode_changed', live((msg) => {
       const agent = state.agents.get(msg.agent_id);
       if (!agent) return;
       agent.permission_mode = msg.mode;
       renderAgents();
-    })
+    }))
     .on('rate_limit', (msg) => {
       state.rateLimit = msg.info;
       state.rateLimitAt = Date.now();

@@ -1,5 +1,5 @@
 // Agent detail: transcript, approvals, composer, slash commands.
-import { announceAttention, api, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast } from '/assets/common.js';
+import { announceAttention, releaseAttention, api, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 import { newKeys } from '/assets/attention.js';
 
@@ -11,9 +11,10 @@ const state = {
   transcript: new Transcript(),
   commands: [],
   pending: new Map(),
-  /// Set by the first replay. That one only confirms what the page loaded
-  /// with, so it stays quiet; later ones follow a reconnect, and a request that
-  /// arrived while the socket was down came in no `permission_request`.
+  /// Set once `pending` holds what the page loaded with. From then on every
+  /// replay — the first one included — chimes for what it holds that `pending`
+  /// did not: a request that landed between the load and the subscribe, or
+  /// while the socket was down, came in no `permission_request`.
   pendingSeeded: false,
   partial: null,
   queued: [],
@@ -805,6 +806,7 @@ async function main() {
   for (const request of data.agent.pending_permissions || []) {
     state.pending.set(request.request_id, request);
   }
+  state.pendingSeeded = true;
   renderHeader();
   renderSpawnWarning();
   renderApprovals();
@@ -939,6 +941,7 @@ async function main() {
     .on('permission_resolved', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
       state.pending.delete(msg.request_id);
+      releaseAttention(msg.agent_id, msg.request_id);
       renderApprovals();
     })
     .on('agent_renamed', (msg) => {

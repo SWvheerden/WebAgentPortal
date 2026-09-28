@@ -1026,14 +1026,19 @@ the first click or key press; until then a chime is skipped silently, never thro
 tabs would chime twice for the same request, so the first tab *able to play* claims it in
 `localStorage` and the others stay quiet — a locked tab never claims, or it would silence one
 that could have played. Claims are keyed `agent_id:request_id` (request ids are the child's
-to choose, unique only per agent), held as a small map pruned of anything older than five
-seconds on every write.
+to choose, unique only per agent), held as a small map pruned on every write. A claim lives
+ten minutes — a throttled background tab can reconnect a minute or more after the first tab
+chimed — and is released when its request is answered, so a reused id still chimes.
 
-A request that lands while the socket is down arrives in no `permission_request`. After a
-reconnect the agent page diffs the replay's pending set against what it held, and the
-dashboard reloads `/api/agents` and diffs every agent's `pending_permissions`; what is new
-chimes. The first load stays quiet — nothing in it is news. The decisions (tab look, flash
-phase, which tab chimes) live in the DOM-free `attention.js`, driven under node by a test.
+A request that lands while the socket is down, or before it is first up, arrives in no
+`permission_request`. The agent page seeds `pending` from its load and diffs every replay,
+the first included, against it. The dashboard reloads `/api/agents` on every socket open and
+diffs every agent's `pending_permissions`; what is new chimes, and the load at startup stays
+quiet. The socket keeps delivering while that reload is in flight, and the snapshot — taken
+at some unknown point in the window — must not overwrite newer news, so agent messages are
+held (`Resync`) and replayed on top of the snapshot in order; an overlapping older reload's
+result is discarded. The decisions (tab look, flash phase, which tab chimes, the resync)
+live in the DOM-free `attention.js`, driven under node by a test.
 
 Only `awaiting_approval` qualifies. `failed` looks like it belongs and does not: it is
 terminal, nothing is waiting on the human, and a flash with no answering action would simply

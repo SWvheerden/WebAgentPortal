@@ -64,7 +64,11 @@ export function attentionKey(agentId, requestId) {
 }
 
 export const CHIME_STORAGE_KEY = 'claude-web-chimed';
-export const CHIME_CLAIM_MS = 5000;
+/// Long enough to outlast a reconnect. A background tab's timers are throttled
+/// — Chrome's intensive throttling runs them once a minute — so a second tab
+/// can reach the same request well after the first chimed for it. The map is
+/// pruned on every write, so a long TTL only costs a few more entries.
+export const CHIME_CLAIM_MS = 10 * 60 * 1000;
 
 /// Cross-tab dedupe. Every tab of this app shares one localStorage, holding a
 /// small map of `key -> claimed at`; the first tab to claim a key chimes, and
@@ -77,22 +81,40 @@ export class ChimeClaims {
     this.ttl = ttl;
   }
 
+  /// The live claims, pruned of expired ones.
+  read() {
+    const at = this.now();
+    let claims = JSON.parse(this.storage.getItem(CHIME_STORAGE_KEY) || '{}');
+    if (!claims || typeof claims !== 'object' || Array.isArray(claims)) claims = {};
+    const fresh = {};
+    for (const [k, t] of Object.entries(claims)) {
+      if (typeof t === 'number' && at - t < this.ttl) fresh[k] = t;
+    }
+    return fresh;
+  }
+
   claim(key) {
     try {
-      const at = this.now();
-      let claims = JSON.parse(this.storage.getItem(CHIME_STORAGE_KEY) || '{}');
-      if (!claims || typeof claims !== 'object' || Array.isArray(claims)) claims = {};
-      const fresh = {};
-      for (const [k, t] of Object.entries(claims)) {
-        if (typeof t === 'number' && at - t < this.ttl) fresh[k] = t;
-      }
+      const fresh = this.read();
       if (Object.hasOwn(fresh, key)) return false;
-      fresh[key] = at;
+      fresh[key] = this.now();
       this.storage.setItem(CHIME_STORAGE_KEY, JSON.stringify(fresh));
     } catch {
       // Storage unavailable (private mode, quota): a double chime beats none.
     }
     return true;
+  }
+
+  /// A request was answered. Ids are the child's to choose and may come round
+  /// again, so an answered one must not mute its successor for the whole TTL.
+  release(key) {
+    try {
+      const fresh = this.read();
+      delete fresh[key];
+      this.storage.setItem(CHIME_STORAGE_KEY, JSON.stringify(fresh));
+    } catch {
+      // Nothing to release into; the claim simply expires.
+    }
   }
 }
 
@@ -135,4 +157,97 @@ export function newKeys(previous, snapshot) {
   const out = [];
   for (const key of snapshot) if (!previous.has(key)) out.push(key);
   return out;
+}
+
+/// The requests waiting on a human, across every agent, as `attentionKey`s. A
+/// request chimes when it first lands here, whichever way it arrived — live,
+/// or found in a snapshot after the socket was down.
+export class PendingRequests {
+  constructor(announce) {
+    this.announce = announce;
+    this.keys = new Set();
+  }
+
+  /// Replace everything with a server snapshot (`/api/agents`). With
+  /// `announce`, whatever the snapshot holds that was not already known chimes.
+  snapshot(agents, { announce = false } = {}) {
+    const next = new Map();
+    for (const agent of agents) {
+      for (const request of agent.pending_permissions || []) {
+        next.set(attentionKey(agent.id, request.request_id), [agent.id, request.request_id]);
+      }
+    }
+    if (announce) {
+      for (const key of newKeys(this.keys, next.keys())) this.announce(...next.get(key));
+    }
+    this.keys = new Set(next.keys());
+  }
+
+  /// A live `permission_request`. True when it was news (and so chimed).
+  request(agentId, requestId) {
+    const key = attentionKey(agentId, requestId);
+    if (this.keys.has(key)) return false;
+    this.keys.add(key);
+    this.announce(agentId, requestId);
+    return true;
+  }
+
+  /// A live `permission_resolved`.
+  resolved(agentId, requestId) {
+    this.keys.delete(attentionKey(agentId, requestId));
+  }
+}
+
+/// Keeps a snapshot fetched over HTTP from overwriting newer socket news. The
+/// socket keeps delivering while the fetch is in flight, and the response —
+/// taken at some unknown point in that window — would otherwise replace state
+/// the live messages had already moved past: an answered request put back, or
+/// a fresh one dropped.
+///
+/// So while a fetch is in flight, live messages are held; the snapshot is
+/// applied and the held messages replayed on top, in order. A newer fetch
+/// supersedes an older one: its snapshot is taken after everything held so
+/// far, so those are dropped, and the older fetch's result is discarded when it
+/// lands.
+export class Resync {
+  constructor() {
+    this.generation = 0;
+    this.held = null;
+  }
+
+  get holding() {
+    return this.held !== null;
+  }
+
+  /// A fetch is about to start. Returns the token to hand back to `finish`.
+  begin() {
+    this.generation += 1;
+    this.held = [];
+    return this.generation;
+  }
+
+  /// Apply a live message now, or hold it until the snapshot lands.
+  route(apply) {
+    if (this.held) this.held.push(apply);
+    else apply();
+  }
+
+  /// The fetch for `generation` is done. `applySnapshot` is null when it
+  /// failed: the held messages still apply, onto what the page already had.
+  /// False, and nothing applied, when a newer fetch has superseded this one.
+  finish(generation, applySnapshot) {
+    if (generation !== this.generation) return false;
+    const held = this.held || [];
+    this.held = null;
+    if (applySnapshot) applySnapshot();
+    for (const apply of held) {
+      try {
+        apply();
+      } catch (err) {
+        // One bad message must not strand the rest behind it.
+        console.error(err);
+      }
+    }
+    return true;
+  }
 }
