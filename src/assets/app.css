@@ -15,12 +15,18 @@
 
 * { box-sizing: border-box; }
 
+/* The base text size is a setting (`text_size`), applied by common.js as the
+   root font size. Every font size below is written against the 13px it
+   defaults to — `calc(11rem / 13)` is "11px at the default" — so the whole page
+   scales together rather than just the body copy. Spacing stays in px. */
+html { font-size: 13px; }
+
 body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 1rem;
   line-height: 1.5;
 }
 
@@ -44,7 +50,7 @@ header.top {
   top: 0;
   z-index: 5;
 }
-header.top h1 { font-size: 14px; margin: 0; font-weight: 600; }
+header.top h1 { font-size: calc(14rem / 13); margin: 0; font-weight: 600; }
 header.top .spacer { flex: 1; }
 /* Form controls are full-width in panels; in the header bar they sit next to
    the buttons and take only the room they need. */
@@ -70,11 +76,11 @@ main { padding: 16px; }
   padding: 12px;
   margin-bottom: 16px;
 }
-.panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0 0 10px; }
+.panel h2 { font-size: calc(12rem / 13); text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0 0 10px; }
 
 button, .btn {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: calc(12rem / 13);
   background: var(--panel-2);
   color: var(--fg);
   border: 1px solid var(--line);
@@ -89,7 +95,7 @@ button.danger { border-color: var(--err); color: var(--err); }
 
 input, select, textarea {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: calc(12rem / 13);
   background: var(--bg);
   color: var(--fg);
   border: 1px solid var(--line);
@@ -100,7 +106,7 @@ input, select, textarea {
 /* The first message is a prompt, not a one-line field: give it room, and let it
    be dragged taller for a long one. */
 #first-message { min-height: 180px; resize: vertical; }
-label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
+label { display: block; font-size: calc(11rem / 13); color: var(--dim); margin-bottom: 3px; }
 .field { margin-bottom: 10px; }
 /* A field that hugs its control and sits on the baseline of the row — a button
    next to a full-width input. A class, not a style attribute: `style-src 'self'`
@@ -124,7 +130,7 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 .inline label { margin-bottom: 0; }
 
 .muted { color: var(--dim); }
-.small { font-size: 11px; }
+.small { font-size: calc(11rem / 13); }
 .warnbox { border: 1px solid var(--warn); color: var(--warn); border-radius: 4px; padding: 6px 8px; margin: 8px 0; }
 .errbox { border: 1px solid var(--err); color: var(--err); border-radius: 4px; padding: 6px 8px; margin: 8px 0; white-space: pre-wrap; }
 
@@ -133,15 +139,15 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
    not make the panel jump around. */
 .meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 360px)); gap: 12px; }
 .meter { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
-.meter .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 11px; }
-.meter .head .pct { font-size: 15px; }
+.meter .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: calc(11rem / 13); }
+.meter .head .pct { font-size: calc(15rem / 13); }
 .meter .bar { height: 6px; margin: 6px 0 4px; border-radius: 3px; background: var(--bg); border: 1px solid var(--line); overflow: hidden; }
 .meter .bar > span { display: block; height: 100%; background: var(--accent); transition: width .3s ease; }
 .meter.warn .bar > span { background: var(--warn); }
 .meter.warn .pct { color: var(--warn); }
 .meter.err .bar > span { background: var(--err); }
 .meter.err .pct { color: var(--err); }
-.meter .foot { color: var(--dim); font-size: 11px; }
+.meter .foot { color: var(--dim); font-size: calc(11rem / 13); }
 /* A refused request is not a footnote: outline the whole panel. */
 .panel.warn-tint { border-color: var(--err); }
 
@@ -211,7 +217,7 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
   text-transform: none;
   letter-spacing: normal;
   color: var(--fg);
-  font-size: 13px;
+  font-size: 1rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -226,11 +232,11 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
-.card h3 { margin: 0 0 4px; font-size: 13px; }
-.card .meta { color: var(--dim); font-size: 11px; margin-bottom: 8px; word-break: break-all; }
+.card h3 { margin: 0 0 4px; font-size: 1rem; }
+.card .meta { color: var(--dim); font-size: calc(11rem / 13); margin-bottom: 8px; word-break: break-all; }
 .card .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 
-.status { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; }
+.status { display: inline-flex; align-items: center; gap: 5px; font-size: calc(11rem / 13); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); display: inline-block; }
 .s-starting .dot { background: var(--accent-2); }
 .s-idle .dot { background: var(--dim); }
@@ -243,7 +249,7 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 .s-failed .dot { background: var(--err); }
 @keyframes pulse { 50% { opacity: .3; } }
 
-.badge { font-size: 10px; border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; color: var(--dim); }
+.badge { font-size: calc(10rem / 13); border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; color: var(--dim); }
 .badge.git { border-color: #2a6b3c; color: var(--accent); }
 .badge.plain { border-color: #6e5a2a; color: var(--warn); }
 .badge.dirty { border-color: var(--warn); color: var(--warn); }
@@ -254,7 +260,7 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 .repo:hover { background: var(--panel-2); }
 .repo.selected { background: #1f6feb22; }
 .repo .name { flex: 1; }
-.group-label { padding: 4px 8px; font-size: 10px; text-transform: uppercase; color: var(--dim); background: var(--panel-2); }
+.group-label { padding: 4px 8px; font-size: calc(10rem / 13); text-transform: uppercase; color: var(--dim); background: var(--panel-2); }
 
 /* The agent page.
    Narrow — a phone, a half-screen window — is the layout this page has always
@@ -267,7 +273,7 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
 /* The agent's branch, cost and working directory. A path has no spaces to wrap
    at and the column is narrow, so it breaks anywhere rather than pushing the
    rail wider than its track. */
-.meta-list { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 11px; }
+.meta-list { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: calc(11rem / 13); }
 .meta-list dt { color: var(--dim); }
 .meta-list dd { margin: 0; word-break: break-all; }
 /* Nothing is waiting, so the panel says so in one line and gets out of the
@@ -287,12 +293,12 @@ label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; 
   word-break: break-word;
 }
 .ev { margin-bottom: 8px; }
-.ev .who { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
+.ev .who { color: var(--dim); font-size: calc(10rem / 13); text-transform: uppercase; letter-spacing: .06em; }
 .ev.user .body { color: var(--accent-2); }
 .ev.assistant .body { color: var(--fg); }
 .ev.stderr .body, .ev.error .body { color: var(--err); }
-.ev.system .body { color: var(--dim); font-size: 11px; }
-.ev.result .body { color: var(--accent); font-size: 11px; }
+.ev.system .body { color: var(--dim); font-size: calc(11rem / 13); }
+.ev.result .body { color: var(--accent); font-size: calc(11rem / 13); }
 details.tool { border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; background: var(--panel); }
 details.tool summary { cursor: pointer; color: var(--warn); }
 /* Attacker-influenced text. It must wrap: a `pre` that scrolls horizontally
@@ -301,7 +307,7 @@ details.tool summary { cursor: pointer; color: var(--warn); }
    reads as `npm test` in the approval prompt. */
 details.tool pre, .approval pre {
   margin: 6px 0 0;
-  font-size: 11px;
+  font-size: calc(11rem / 13);
   white-space: pre-wrap;
   word-break: break-all;
   overflow-x: hidden;
@@ -313,8 +319,8 @@ details.tool pre { color: var(--dim); }
 
 /* approvals */
 .approval { border: 1px solid var(--warn); border-radius: 6px; padding: 10px; margin-bottom: 10px; background: #1c1a10; }
-.approval h3 { margin: 0 0 6px; font-size: 12px; color: var(--warn); }
-.approval pre { background: #0a0e14; padding: 6px; border-radius: 4px; font-size: 11px; }
+.approval h3 { margin: 0 0 6px; font-size: calc(12rem / 13); color: var(--warn); }
+.approval pre { background: #0a0e14; padding: 6px; border-radius: 4px; font-size: calc(11rem / 13); }
 .approval .modified { color: var(--warn); }
 /* AskUserQuestion: a question with options, not a tool call to vet. */
 .approval .question { margin: 8px 0 12px; }
@@ -322,12 +328,12 @@ details.tool pre { color: var(--dim); }
 .approval .option { display: block; margin: 3px 0; cursor: pointer; }
 .approval .option input { width: auto; margin-right: 6px; }
 .approval .question .other { margin-top: 6px; }
-.truncated { color: var(--warn); font-size: 10px; }
+.truncated { color: var(--warn); font-size: calc(10rem / 13); }
 
 /* composer */
 .composer { display: flex; gap: 8px; margin-top: 10px; align-items: flex-start; position: relative; }
 .composer textarea { min-height: 58px; resize: vertical; }
-.queued { color: var(--dim); font-size: 11px; margin-top: 6px; }
+.queued { color: var(--dim); font-size: calc(11rem / 13); margin-top: 6px; }
 .queued .q { display: inline-flex; gap: 6px; align-items: center; border: 1px dashed var(--line); border-radius: 3px; padding: 1px 6px; margin-right: 6px; }
 .autocomplete {
   position: absolute;
@@ -343,10 +349,10 @@ details.tool pre { color: var(--dim); }
 }
 .autocomplete div { padding: 4px 8px; cursor: pointer; }
 .autocomplete div.active, .autocomplete div:hover { background: var(--panel-2); }
-.autocomplete .hint { color: var(--dim); font-size: 10px; }
+.autocomplete .hint { color: var(--dim); font-size: calc(10rem / 13); }
 .hidden { display: none !important; }
 .toasts { position: fixed; right: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 6px; z-index: 50; max-width: 420px; }
-.toast { background: var(--panel); border: 1px solid var(--line); border-left-width: 3px; border-radius: 4px; padding: 6px 10px; font-size: 11px; }
+.toast { background: var(--panel); border: 1px solid var(--line); border-left-width: 3px; border-radius: 4px; padding: 6px 10px; font-size: calc(11rem / 13); }
 .toast.warn { border-left-color: var(--warn); }
 .toast.error { border-left-color: var(--err); }
 .toast.info { border-left-color: var(--accent-2); }

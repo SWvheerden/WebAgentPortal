@@ -1,5 +1,5 @@
 // Agent detail: transcript, approvals, composer, slash commands.
-import { announceAttention, releaseAttention, api, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast } from '/assets/common.js';
+import { announceAttention, releaseAttention, api, applyTextSize, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 import { newKeys } from '/assets/attention.js';
 
@@ -797,6 +797,8 @@ async function loadEarlier() {
 }
 
 async function main() {
+  // The cached size is already applied; this catches a change saved elsewhere.
+  api('/api/config').then((cfg) => applyTextSize(cfg.text_size), () => {});
   const data = await api(`/api/agents/${encodeURIComponent(slug)}`);
   state.agent = data.agent;
   state.commands = data.agent.commands || [];

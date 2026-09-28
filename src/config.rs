@@ -10,6 +10,13 @@ use crate::agent::state::PermissionMode;
 
 pub const DEFAULT_PORT: u16 = 7717;
 pub const DEFAULT_BIND: &str = "127.0.0.1";
+/// The base text size of the UI, in CSS pixels: what it was before it was a
+/// setting.
+pub const DEFAULT_TEXT_SIZE: u8 = 13;
+/// The range Settings offers. Below 10 the smaller labels, which scale with the
+/// base, stop being readable; above 24 the panels no longer fit a laptop.
+pub const MIN_TEXT_SIZE: u8 = 10;
+pub const MAX_TEXT_SIZE: u8 = 24;
 
 /// User-editable server configuration, persisted as `config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,6 +58,10 @@ pub struct Config {
     /// next to `-p` without complaint but only ever reaches the interactive
     /// REPL's bridge, which a headless child never builds. See F12.
     pub remote_control: bool,
+    /// Base text size of the UI, in CSS pixels, within
+    /// [`MIN_TEXT_SIZE`]..=[`MAX_TEXT_SIZE`]. Every other size on the page is a
+    /// fixed fraction of it, so the whole page scales together.
+    pub text_size: u8,
 }
 
 impl Default for Config {
@@ -69,6 +80,7 @@ impl Default for Config {
             pinned_cli_version: "2.1.241".to_string(),
             auto_resume: true,
             remote_control: false,
+            text_size: DEFAULT_TEXT_SIZE,
         }
     }
 }
@@ -142,6 +154,12 @@ impl Config {
         }
         if self.claude_bin.trim().is_empty() {
             anyhow::bail!("claude_bin cannot be empty");
+        }
+        if !(MIN_TEXT_SIZE..=MAX_TEXT_SIZE).contains(&self.text_size) {
+            anyhow::bail!(
+                "text_size must be between {MIN_TEXT_SIZE} and {MAX_TEXT_SIZE}, got {}",
+                self.text_size
+            );
         }
         self.validate_bind(key_file)
     }
@@ -355,6 +373,44 @@ pinned_cli_version = "2.1.241"
         let off = Config::from_toml_str("auto_resume = false\n").expect("parse");
         assert!(!off.auto_resume);
         assert!(off.validate().is_ok(), "either way is a valid config");
+    }
+
+    /// The size the UI had before it was a setting, including for a config
+    /// file written before the option existed.
+    #[test]
+    fn text_size_defaults_to_the_old_fixed_size() {
+        assert_eq!(Config::default().text_size, 13);
+        assert_eq!(
+            Config::from_toml_str("port = 9000\n")
+                .expect("parse")
+                .text_size,
+            DEFAULT_TEXT_SIZE
+        );
+        let big = Config::from_toml_str("text_size = 18\n").expect("parse");
+        assert_eq!(big.text_size, 18);
+        assert!(big.validate().is_ok());
+    }
+
+    #[test]
+    fn text_size_is_held_to_its_bounds() {
+        for size in [MIN_TEXT_SIZE, DEFAULT_TEXT_SIZE, MAX_TEXT_SIZE] {
+            let cfg = Config {
+                text_size: size,
+                ..Config::default()
+            };
+            assert!(cfg.validate().is_ok(), "{size} must be allowed");
+        }
+        for size in [0, MIN_TEXT_SIZE - 1, MAX_TEXT_SIZE + 1, u8::MAX] {
+            let cfg = Config {
+                text_size: size,
+                ..Config::default()
+            };
+            let err = cfg.validate().expect_err("must be refused");
+            assert!(format!("{err:#}").contains("text_size"), "{err:#}");
+        }
+        // Not a number of pixels at all is a parse error, not a clamp.
+        assert!(Config::from_toml_str("text_size = \"large\"\n").is_err());
+        assert!(Config::from_toml_str("text_size = -1\n").is_err());
     }
 
     #[test]

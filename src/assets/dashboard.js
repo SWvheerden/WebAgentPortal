@@ -1,6 +1,6 @@
 // Dashboard: the agent registry, account usage, notes, the spawn form, cloning
 // and settings.
-import { announceAttention, releaseAttention, api, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast } from '/assets/common.js';
+import { announceAttention, releaseAttention, api, applyTextSize, DEFAULT_TEXT_SIZE, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast } from '/assets/common.js';
 import { PendingRequests, Resync, withDeadline } from '/assets/attention.js';
 
 const state = {
@@ -808,6 +808,7 @@ function fillSettings() {
   $('cfg-open').checked = cfg.open_browser;
   $('cfg-auto-resume').checked = cfg.auto_resume;
   $('cfg-remote-control').checked = cfg.remote_control;
+  $('cfg-text-size').value = cfg.text_size;
   // Shown, never edited: the server keeps its own values whatever this panel
   // sends back (§12).
   $('cfg-bind').value = `${cfg.bind}:${cfg.port}`;
@@ -827,10 +828,14 @@ async function saveSettings() {
     open_browser: $('cfg-open').checked,
     auto_resume: $('cfg-auto-resume').checked,
     remote_control: $('cfg-remote-control').checked,
+    // Sent as typed: the server holds it to its bounds and says so, rather than
+    // this quietly saving a different size from the one on screen.
+    text_size: $('cfg-text-size').value === '' ? DEFAULT_TEXT_SIZE : Number($('cfg-text-size').value),
   };
   try {
     state.config = await api('/api/config', { method: 'PUT', body: JSON.stringify(cfg) });
     toast('Settings saved');
+    applyTextSize(state.config.text_size);
     applySpawnDefaults();
     await loadRepos();
     updateBranchPreview();
@@ -849,6 +854,7 @@ function togglePanel(id) {
 
 async function main() {
   state.config = await api('/api/config').catch(() => null);
+  if (state.config) applyTextSize(state.config.text_size);
   fillSettings();
   applySpawnDefaults();
   await loadAgents();

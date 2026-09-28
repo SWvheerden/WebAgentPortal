@@ -1332,6 +1332,7 @@ claude_bin      = "claude"
 pinned_cli_version = "2.1.241"   # warn on mismatch
 auto_resume     = true           # resume agents the token limit stopped (§4)
 remote_control  = false          # launch every agent with --remote-control (§9)
+text_size       = 13             # base UI text size in px, 10–24; every size scales with it
 ```
 
 ### The two defaults reach the spawn form

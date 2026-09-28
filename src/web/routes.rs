@@ -1471,6 +1471,64 @@ console.log("ok");
         );
     }
 
+    /// The text size field is filled, sent back and applied, and the bounds the
+    /// browser offers are the bounds the server enforces — in the input and in
+    /// the helper that applies it.
+    #[test]
+    fn the_settings_panel_reads_writes_and_applies_the_text_size() {
+        use crate::config::{DEFAULT_TEXT_SIZE, MAX_TEXT_SIZE, MIN_TEXT_SIZE};
+        let asset = |name: &str| {
+            std::str::from_utf8(&Assets::get(name).expect(name).data)
+                .expect("utf-8")
+                .to_string()
+        };
+        let html = asset("index.html");
+        let js = asset("dashboard.js");
+        let common = asset("common.js");
+        let agent = asset("agent.js");
+        let css = asset("app.css");
+        assert!(
+            html.contains(&format!(
+                "id=\"cfg-text-size\" type=\"number\" min=\"{MIN_TEXT_SIZE}\" max=\"{MAX_TEXT_SIZE}\""
+            )),
+            "the input's bounds must match config.rs"
+        );
+        assert!(
+            html.contains(&format!("Text size (px, {MIN_TEXT_SIZE}–{MAX_TEXT_SIZE})")),
+            "the label's bounds must match config.rs"
+        );
+        for (name, value) in [
+            ("MIN_TEXT_SIZE", MIN_TEXT_SIZE),
+            ("MAX_TEXT_SIZE", MAX_TEXT_SIZE),
+            ("DEFAULT_TEXT_SIZE", DEFAULT_TEXT_SIZE),
+        ] {
+            assert!(
+                common.contains(&format!("export const {name} = {value};")),
+                "common.js {name} must match config.rs"
+            );
+        }
+        assert!(
+            css.contains(&format!("html {{ font-size: {DEFAULT_TEXT_SIZE}px; }}")),
+            "the stylesheet's own default must be the configured default"
+        );
+        assert!(
+            js.contains("$('cfg-text-size').value = cfg.text_size"),
+            "the panel never shows the saved value"
+        );
+        assert!(
+            js.contains("text_size: $('cfg-text-size').value"),
+            "the panel never sends the value back"
+        );
+        assert!(
+            js.contains("applyTextSize(state.config.text_size)"),
+            "the dashboard never applies it"
+        );
+        assert!(
+            agent.contains("applyTextSize(cfg.text_size)"),
+            "the agent page never applies it"
+        );
+    }
+
     #[test]
     fn every_permission_picker_offers_every_mode() {
         let html = std::str::from_utf8(&Assets::get("index.html").expect("index.html").data)
@@ -1967,6 +2025,58 @@ console.log("ok");
         .expect("parse");
         assert_eq!(on_disk.bind, crate::config::DEFAULT_BIND);
         assert!(on_disk.remote_control, "and it survives the round trip");
+    }
+
+    /// A text size outside the bounds is refused with a 400 and nothing is
+    /// written; one inside them is saved and served back.
+    #[tokio::test]
+    async fn the_settings_panel_text_size_is_held_to_its_bounds() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = test_state().await;
+        state.config_path = dir.path().join("config.toml");
+        let put = |state: AppState, text_size: Value| async move {
+            let mut body = serde_json::to_value(Config::default()).expect("config");
+            body["text_size"] = text_size;
+            let mut request = axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/config")
+                .header("host", "127.0.0.1:7717")
+                .header(TOKEN_HEADER, TEST_TOKEN)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("request");
+            request.extensions_mut().insert(ConnectInfo(
+                LOOPBACK_PEER.parse::<SocketAddr>().expect("peer"),
+            ));
+            router(state).oneshot(request).await.expect("response")
+        };
+
+        for bad in [json!(9), json!(25), json!(0)] {
+            let response = put(state.clone(), bad.clone()).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        for unparseable in [json!(-1), json!(300), json!(13.5), json!("big")] {
+            let response = put(state.clone(), unparseable.clone()).await;
+            assert!(
+                response.status().is_client_error(),
+                "{unparseable} must be refused"
+            );
+        }
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "a refused size is never written"
+        );
+        assert_eq!(state.sup.config().await.text_size, 13);
+
+        let response = put(state.clone(), json!(18)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.sup.config().await.text_size, 18);
+        let on_disk = Config::from_toml_str(
+            &std::fs::read_to_string(dir.path().join("config.toml")).expect("read"),
+        )
+        .expect("parse");
+        assert_eq!(on_disk.text_size, 18);
     }
 
     /// A GET through the whole stack, so the picker's payload is asserted as

@@ -107,6 +107,46 @@ export async function api(path, options = {}) {
   return body;
 }
 
+// -- text size --------------------------------------------------------------
+
+// Mirror `config::{MIN,MAX,DEFAULT}_TEXT_SIZE`; a test holds them together.
+export const MIN_TEXT_SIZE = 10;
+export const MAX_TEXT_SIZE = 24;
+export const DEFAULT_TEXT_SIZE = 13;
+const TEXT_SIZE_KEY = 'claude-web-text-size';
+
+/// A usable base text size from whatever `raw` is, or null. Anything that is
+/// not a whole number in range is refused rather than clamped: a value this
+/// build does not offer is a stale cache or a bug, and the stylesheet's own
+/// default is the right answer to both.
+export function textSize(raw) {
+  const px = Number(raw);
+  return Number.isInteger(px) && px >= MIN_TEXT_SIZE && px <= MAX_TEXT_SIZE ? px : null;
+}
+
+/// Set the page's base text size (`text_size`, in px). Every font size in
+/// app.css is a fraction of the root one, so this scales the whole page.
+///
+/// Remembered in localStorage as well, so the next page load starts at the
+/// configured size instead of flashing the default until `/api/config` answers.
+export function applyTextSize(raw) {
+  const px = textSize(raw);
+  if (px === null) return;
+  document.documentElement.style.fontSize = `${px}px`;
+  try {
+    localStorage.setItem(TEXT_SIZE_KEY, String(px));
+  } catch {
+    // Storage refused: the size still applies, it is just not remembered.
+  }
+}
+
+try {
+  const cached = textSize(localStorage.getItem(TEXT_SIZE_KEY));
+  if (cached !== null) document.documentElement.style.fontSize = `${cached}px`;
+} catch {
+  // No storage, no cache: the stylesheet's default stands until the config loads.
+}
+
 // Mirrors repo::git::slugify so the branch preview matches what the server
 // will actually create.
 export function slugify(name) {
