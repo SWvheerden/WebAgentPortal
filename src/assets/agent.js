@@ -2,6 +2,7 @@
 import { announceAttention, releaseAttention, api, applyTextSize, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 import { newKeys } from '/assets/attention.js';
+import { clampSideWidth, keyedSideWidth, loadSideWidth, saveSideWidth, sideWidthBounds } from '/assets/splitter.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
 const $ = (id) => document.getElementById(id);
@@ -783,6 +784,106 @@ function send() {
   input.value = '';
   updateAutocomplete();
 }
+
+// -- the divider ------------------------------------------------------------
+//
+// Between the conversation and the rail from 1200px (app.css hides it below,
+// where the two stack). The width lives in `--side-width` on the grid, so the
+// stylesheet's clamp still has the last word when the window shrinks.
+
+function storage() {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+/// The px the rail and the conversation share: the grid's content box less
+/// the divider's own column.
+function sharedWidth() {
+  const grid = document.querySelector('.detail-main');
+  const style = getComputedStyle(grid);
+  const inner = grid.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  return inner - $('splitter').offsetWidth;
+}
+
+function showSideWidth() {
+  const splitter = $('splitter');
+  if (!splitter.offsetWidth) return;
+  const { min, max } = sideWidthBounds(sharedWidth());
+  splitter.setAttribute('aria-valuemin', String(min));
+  splitter.setAttribute('aria-valuemax', String(max));
+  splitter.setAttribute('aria-valuenow', String(Math.round($('side').getBoundingClientRect().width)));
+}
+
+/// Set the rail to `px` (null: back to the stylesheet's default). A transcript
+/// that was read to the bottom stays there while its lines rewrap.
+function setSideWidth(px) {
+  const stick = atBottom();
+  const grid = document.querySelector('.detail-main');
+  if (px === null) grid.style.removeProperty('--side-width');
+  else grid.style.setProperty('--side-width', `${px}px`);
+  if (stick) $('transcript').scrollTop = $('transcript').scrollHeight;
+  showSideWidth();
+}
+
+function wireSplitter() {
+  const splitter = $('splitter');
+  const saved = loadSideWidth(storage());
+  if (saved !== null) setSideWidth(saved);
+
+  splitter.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    splitter.setPointerCapture(event.pointerId);
+    splitter.classList.add('dragging');
+    document.body.classList.add('resizing');
+    // The rail's right edge does not move; the pointer sets where its left
+    // edge is, less half the divider so the line stays under the pointer.
+    const right = $('side').getBoundingClientRect().right;
+    const half = splitter.offsetWidth / 2;
+    const total = sharedWidth();
+    let width = null;
+    const move = (e) => {
+      width = clampSideWidth(right - e.clientX - half, total);
+      setSideWidth(width);
+    };
+    const done = () => {
+      splitter.removeEventListener('pointermove', move);
+      splitter.removeEventListener('pointerup', done);
+      splitter.removeEventListener('pointercancel', done);
+      splitter.classList.remove('dragging');
+      document.body.classList.remove('resizing');
+      // Saved once, at the end, not on every pixel of the drag.
+      if (width !== null) saveSideWidth(storage(), width);
+    };
+    splitter.addEventListener('pointermove', move);
+    splitter.addEventListener('pointerup', done);
+    splitter.addEventListener('pointercancel', done);
+  });
+
+  splitter.addEventListener('keydown', (event) => {
+    const current = $('side').getBoundingClientRect().width;
+    const width = keyedSideWidth(event.key, current, sharedWidth(), event.shiftKey);
+    if (width === null) return;
+    event.preventDefault();
+    setSideWidth(width);
+    saveSideWidth(storage(), width);
+  });
+
+  splitter.addEventListener('dblclick', () => {
+    setSideWidth(null);
+    saveSideWidth(storage(), null);
+  });
+
+  // The bounds move with the window, and the divider appears and disappears
+  // as it crosses 1200px.
+  window.addEventListener('resize', showSideWidth);
+  showSideWidth();
+}
+
+wireSplitter();
 
 // -- wiring -----------------------------------------------------------------
 

@@ -1132,6 +1132,7 @@ mod tests {
             "favicon-alert.svg",
             "favicon-flash.svg",
             "attention.js",
+            "splitter.js",
         ] {
             assert!(
                 Assets::get(name).is_some(),
@@ -2555,6 +2556,105 @@ console.log("ok");
         assert!(
             output.status.success(),
             "transcript walk failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Drive the real `splitter.js` — the divider's bounds, keys and storage,
+    /// kept free of the DOM for exactly this — and hold the stylesheet's
+    /// fallback and backstop to the numbers it uses.
+    #[test]
+    fn the_side_panel_divider_clamps_steps_and_remembers_its_width() {
+        let css = std::str::from_utf8(&Assets::get("app.css").expect("app.css").data)
+            .expect("utf-8")
+            .to_string();
+        let html = std::str::from_utf8(&Assets::get("agent.html").expect("agent.html").data)
+            .expect("utf-8")
+            .to_string();
+        assert!(
+            css.contains("clamp(300px, var(--side-width, 480px), calc(100% - 496px))"),
+            "the stylesheet's rail track must match splitter.js"
+        );
+        assert!(
+            html.contains("id=\"splitter\" role=\"separator\""),
+            "the agent page must carry the divider"
+        );
+
+        let module =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/assets/splitter.js");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = dir.path().join("splitter.mjs");
+        let source = format!(
+            r#"
+import {{ MIN_SIDE_WIDTH, DEFAULT_SIDE_WIDTH, MIN_CONVERSATION_WIDTH, STEP, BIG_STEP, SIDE_WIDTH_KEY, sideWidthBounds, clampSideWidth, parseSideWidth, keyedSideWidth, loadSideWidth, saveSideWidth }} from "{module}";
+
+const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
+
+// The numbers app.css hard-codes.
+assert(MIN_SIDE_WIDTH === 300, "floor");
+assert(DEFAULT_SIDE_WIDTH === 480, "default");
+assert(MIN_CONVERSATION_WIDTH === 480, "conversation floor");
+
+// Bounds: the conversation keeps its floor, and a window too small for both
+// still leaves the rail its own.
+const b = sideWidthBounds(1200);
+assert(b.min === 300 && b.max === 720, "bounds at 1200: " + JSON.stringify(b));
+assert(sideWidthBounds(600).max === 300, "the floor wins when there is no room");
+
+// Clamping, both ends, rounding, and garbage.
+assert(clampSideWidth(100, 1200) === 300, "below the floor");
+assert(clampSideWidth(5000, 1200) === 720, "above the ceiling");
+assert(clampSideWidth(512.6, 1200) === 513, "rounded");
+assert(clampSideWidth(NaN, 1200) === DEFAULT_SIDE_WIDTH, "garbage is the default");
+
+// Keys move the divider the way they point.
+assert(keyedSideWidth("ArrowLeft", 480, 1200) === 480 + STEP, "left widens the rail");
+assert(keyedSideWidth("ArrowRight", 480, 1200) === 480 - STEP, "right narrows it");
+assert(keyedSideWidth("ArrowLeft", 480, 1200, true) === 480 + BIG_STEP, "shift is a big step");
+assert(keyedSideWidth("ArrowRight", 305, 1200) === 300, "stepping stops at the floor");
+assert(keyedSideWidth("ArrowLeft", 715, 1200) === 720, "and at the ceiling");
+assert(keyedSideWidth("Home", 480, 1200) === 720, "Home: divider to the far left");
+assert(keyedSideWidth("End", 480, 1200) === 300, "End: divider to the far right");
+assert(keyedSideWidth("a", 480, 1200) === null, "other keys are not ours");
+
+// Parsing what storage hands back.
+assert(parseSideWidth("520") === 520, "a stored width");
+assert(parseSideWidth(null) === null && parseSideWidth("") === null, "nothing stored");
+assert(parseSideWidth("299") === null, "below the floor is refused, not clamped");
+assert(parseSideWidth("12.5") === null && parseSideWidth("wide") === null, "not a width");
+assert(parseSideWidth("100000") === null, "not a width anyone chose");
+
+// Storage round trip, reset, and a store that refuses.
+const map = new Map();
+const store = {{
+  getItem: (k) => (map.has(k) ? map.get(k) : null),
+  setItem: (k, v) => map.set(k, String(v)),
+  removeItem: (k) => map.delete(k),
+}};
+assert(loadSideWidth(store) === null, "nothing saved yet");
+saveSideWidth(store, 560);
+assert(map.get(SIDE_WIDTH_KEY) === "560" && loadSideWidth(store) === 560, "saved and loaded");
+saveSideWidth(store, null);
+assert(!map.has(SIDE_WIDTH_KEY), "a reset forgets the choice");
+const broken = {{ getItem() {{ throw new Error("denied"); }}, setItem() {{ throw new Error("denied"); }}, removeItem() {{ throw new Error("denied"); }} }};
+saveSideWidth(broken, 560);
+assert(loadSideWidth(broken) === null, "a refusing store is no store");
+assert(loadSideWidth(null) === null, "no store at all");
+console.log("ok");
+"#,
+            module = module.display()
+        );
+        std::fs::write(&driver, source).expect("write driver");
+
+        let output = match std::process::Command::new("node").arg(&driver).output() {
+            Ok(output) => output,
+            // No node installed: nothing in the build depends on it.
+            Err(_) => return,
+        };
+        assert!(
+            output.status.success(),
+            "splitter driver failed:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );

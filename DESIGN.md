@@ -976,6 +976,17 @@ that pushed the conversation down the page to read it. 1200px rather than the wi
 two columns first fit: the rail's floor is 300px and it comes out of the transcript, so
 splitting a 1000px window left the conversation narrower than it had been as one column.
 
+**The rail is as wide as the operator makes it.** A divider sits between the two columns:
+drag it, or focus it and use the arrows (Shift for bigger steps, Home/End for either end);
+a double-click resets it. The rail defaults to 480px — the old 300–400px track was too
+cramped for an AskUserQuestion — has a floor of 300px, and never leaves the transcript
+less than 480px. The choice is kept in localStorage, not config.toml: it is a fact about
+this screen, and a width picked on a big monitor means nothing on the phone sharing the
+config. It is not clamped when read back; the stylesheet's `clamp()` holds it in on a
+smaller window and it comes back on a bigger one. Below 1200px the columns stack and the
+divider is not shown. The logic lives in the DOM-free `splitter.js`, driven under node by
+a test.
+
 Inside the transcript the text is *not* held to a reading measure. Most of what is in it is
 tool output — a diff, a build log, a file listing — which is written in columns and is worth
 the width; capping the text to ~110 characters left the pane visibly half empty, which is

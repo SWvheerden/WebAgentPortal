@@ -32,7 +32,7 @@
     <!-- Everything about the agent that is not the conversation. Beside it on a
          wide screen; above it, in this order, on a narrow one — which is why
          the thing that blocks the agent comes first. -->
-    <aside class="side">
+    <aside class="side" id="side">
       <div id="spawn-warning"></div>
       <section class="panel" id="approvals-panel">
         <h2>Waiting on you <span class="muted" id="approvals-count"></span></h2>
@@ -44,6 +44,12 @@
         <dl class="meta-list" id="agent-meta"></dl>
       </section>
     </aside>
+
+    <!-- The divider between the two, on a wide screen only: drag it, or focus
+         it and use the arrow keys; a double-click puts it back (splitter.js). -->
+    <div class="splitter" id="splitter" role="separator" aria-orientation="vertical"
+         aria-controls="side" aria-label="Resize the side panel" tabindex="0"
+         title="Drag to resize · double-click to reset"></div>
 
     <!-- The conversation: the transcript and the box you answer it in, one
          column, kept to a readable width however wide the window is. -->

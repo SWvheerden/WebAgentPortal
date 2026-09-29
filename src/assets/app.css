@@ -269,6 +269,9 @@ label { display: block; font-size: calc(11rem / 13); color: var(--dim); margin-b
    The wide layout below is an override of it, so nothing here depends on a
    media query being matched. */
 .detail-main { display: grid; gap: 16px; }
+/* The divider only exists once the two sit side by side; stacked, there is
+   nothing beside the rail to trade width with. */
+.splitter { display: none; }
 .side > .panel:last-child { margin-bottom: 0; }
 /* The agent's branch, cost and working directory. A path has no spaces to wrap
    at and the column is narrow, so it breaks anywhere rather than pushing the
@@ -392,14 +395,48 @@ details.tool pre { color: var(--dim); }
    capping the text left the pane half empty, which is the same complaint one
    layer in. Long prose lines on a very large monitor are the price. */
 @media (min-width: 1200px) {
+  /* The rail's width is the operator's: `--side-width` is set by agent.js from
+     the divider (splitter.js), and the fallback is the default there. The
+     clamp is the backstop that keeps a width chosen on a bigger window from
+     squeezing the transcript below 480px on this one — 496 is that plus the
+     divider's own 16px, which stands in for the column gap. */
   .detail-main {
-    grid-template-columns: minmax(0, 1fr) minmax(300px, 400px);
+    grid-template-columns:
+      minmax(0, 1fr) 16px clamp(300px, var(--side-width, 480px), calc(100% - 496px));
+    column-gap: 0;
     align-items: start;
   }
-  /* The rail is written first, for the stacked order; both are placed
+  /* The rail is written first, for the stacked order; all three are placed
      explicitly here rather than one being pushed past the other. */
   .detail-main > .conversation { grid-column: 1; grid-row: 1; }
-  .detail-main > .side { grid-column: 2; grid-row: 1; }
+  .detail-main > .splitter { grid-column: 2; grid-row: 1; }
+  .detail-main > .side { grid-column: 3; grid-row: 1; }
+  /* The whole 16px is the handle; the line down its middle is what shows. It
+     stretches even when the columns do not, or it would be zero pixels tall. */
+  .splitter {
+    display: block;
+    align-self: stretch;
+    position: relative;
+    cursor: col-resize;
+    touch-action: none;
+    outline: none;
+  }
+  .splitter::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 7px;
+    width: 2px;
+    border-radius: 1px;
+    background: var(--line);
+  }
+  .splitter:hover::before, .splitter:focus-visible::before, .splitter.dragging::before {
+    background: var(--accent-2);
+  }
+  /* A drag that strays over the transcript must not select it, and the cursor
+     should not flicker back to a text caret while it does. */
+  body.resizing { cursor: col-resize; user-select: none; }
 }
 
 /* The window as the frame rather than the top of a scroll. The composer stays
