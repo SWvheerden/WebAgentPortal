@@ -2614,8 +2614,8 @@ assert(keyedSideWidth("ArrowRight", 480, 1200) === 480 - STEP, "right narrows it
 assert(keyedSideWidth("ArrowLeft", 480, 1200, true) === 480 + BIG_STEP, "shift is a big step");
 assert(keyedSideWidth("ArrowRight", 305, 1200) === 300, "stepping stops at the floor");
 assert(keyedSideWidth("ArrowLeft", 715, 1200) === 720, "and at the ceiling");
-assert(keyedSideWidth("Home", 480, 1200) === 720, "Home: divider to the far left");
-assert(keyedSideWidth("End", 480, 1200) === 300, "End: divider to the far right");
+assert(keyedSideWidth("Home", 480, 1200) === 300, "Home: the narrowest rail (aria-valuemin)");
+assert(keyedSideWidth("End", 480, 1200) === 720, "End: the widest rail (aria-valuemax)");
 assert(keyedSideWidth("a", 480, 1200) === null, "other keys are not ours");
 
 // Parsing what storage hands back.

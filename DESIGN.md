@@ -977,8 +977,8 @@ two columns first fit: the rail's floor is 300px and it comes out of the transcr
 splitting a 1000px window left the conversation narrower than it had been as one column.
 
 **The rail is as wide as the operator makes it.** A divider sits between the two columns:
-drag it, or focus it and use the arrows (Shift for bigger steps, Home/End for either end);
-a double-click resets it. The rail defaults to 480px — the old 300–400px track was too
+drag it, or focus it and use the arrows (Shift for bigger steps; Home for the narrowest rail
+and End for the widest, following the separator's ARIA value); a double-click resets it. The rail defaults to 480px — the old 300–400px track was too
 cramped for an AskUserQuestion — has a floor of 300px, and never leaves the transcript
 less than 480px. The choice is kept in localStorage, not config.toml: it is a fact about
 this screen, and a width picked on a big monitor means nothing on the phone sharing the

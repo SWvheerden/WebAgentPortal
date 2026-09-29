@@ -845,22 +845,32 @@ function wireSplitter() {
     const half = splitter.offsetWidth / 2;
     const total = sharedWidth();
     let width = null;
-    const move = (e) => {
-      width = clampSideWidth(right - e.clientX - half, total);
-      setSideWidth(width);
-    };
+    // A drag can end without a pointerup reaching us — a context menu, the
+    // window losing focus, a release outside it — so it also ends when the
+    // capture goes or a move arrives with the button up. Whichever comes first
+    // ends it once; the aborted listeners cannot pile up on the next press.
+    const drag = new AbortController();
     const done = () => {
-      splitter.removeEventListener('pointermove', move);
-      splitter.removeEventListener('pointerup', done);
-      splitter.removeEventListener('pointercancel', done);
+      if (drag.signal.aborted) return;
+      drag.abort();
       splitter.classList.remove('dragging');
       document.body.classList.remove('resizing');
       // Saved once, at the end, not on every pixel of the drag.
       if (width !== null) saveSideWidth(storage(), width);
     };
-    splitter.addEventListener('pointermove', move);
-    splitter.addEventListener('pointerup', done);
-    splitter.addEventListener('pointercancel', done);
+    const move = (e) => {
+      if (!(e.buttons & 1)) {
+        done();
+        return;
+      }
+      width = clampSideWidth(right - e.clientX - half, total);
+      setSideWidth(width);
+    };
+    const opts = { signal: drag.signal };
+    splitter.addEventListener('pointermove', move, opts);
+    for (const kind of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+      splitter.addEventListener(kind, done, opts);
+    }
   });
 
   splitter.addEventListener('keydown', (event) => {

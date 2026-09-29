@@ -48,15 +48,17 @@ export function parseSideWidth(raw) {
 
 /// The rail's width after `key`, or null for a key the divider does not handle.
 /// The rail is on the right, so the arrows move the divider the way they point:
-/// left widens the rail, right narrows it. Home and End take it to either end.
+/// left widens the rail, right narrows it. Home and End follow the value the
+/// separator reports (`aria-valuenow`, the rail's width), as the WAI-ARIA
+/// window-splitter pattern has it: Home is the narrowest rail, End the widest.
 export function keyedSideWidth(key, current, total, big = false) {
   const { min, max } = sideWidthBounds(total);
   const step = big ? BIG_STEP : STEP;
   switch (key) {
     case 'ArrowLeft': return clampSideWidth(current + step, total);
     case 'ArrowRight': return clampSideWidth(current - step, total);
-    case 'Home': return max;
-    case 'End': return min;
+    case 'Home': return min;
+    case 'End': return max;
     default: return null;
   }
 }
