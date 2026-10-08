@@ -24,9 +24,6 @@ pub const MAX_NAME_BYTES: usize = 120;
 /// The name used when cleaning leaves nothing.
 const FALLBACK_NAME: &str = "upload";
 
-/// How many `-N` suffixes are tried before an upload is refused.
-const MAX_SUFFIX: u32 = 999;
-
 /// An attachment as it travels with a message: stored on the user event and
 /// listed in the trailer the agent reads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,8 +120,11 @@ fn fit(stem: &str, ext: &str, suffix: &str) -> String {
 ///
 /// Returns the open file, the name it got, and that name's suffix number, so
 /// a caller that finds the name taken elsewhere can carry on past it.
+///
+/// No practical cap: callers start past every suffix already recorded (see
+/// [`next_suffix`]), so the walk only ever steps over files the agent made.
 pub fn create_unique(dir: &Path, name: &str, first: u32) -> Result<(File, String, u32)> {
-    for n in first.max(1)..=MAX_SUFFIX {
+    for n in first.max(1)..=u32::MAX {
         let candidate = if n == 1 {
             name.to_string()
         } else {
@@ -144,6 +144,41 @@ pub fn create_unique(dir: &Path, name: &str, first: u32) -> Result<(File, String
         }
     }
     bail!("too many files called {name} already")
+}
+
+/// The first suffix worth trying for `wanted`: one past the highest already
+/// recorded for the same stem and extension (1, the bare name, if none).
+///
+/// `folds` are the agent's recorded [`fold_key`]s, so `IMAGE-7.PNG` counts
+/// against `image.png`. Without this, every pasted `image.png` would walk
+/// every earlier one, on disk and in the table, before finding a free name.
+/// A name `with_suffix` had to shorten to fit is not recognised; it only costs
+/// a few extra steps in [`create_unique`].
+pub fn next_suffix(wanted: &str, folds: &[String]) -> u32 {
+    let wanted = fold_key(wanted);
+    let (stem, ext) = split_ext(&wanted);
+    let prefix = format!("{}-", stem.trim_end_matches('-'));
+    let mut highest: u32 = 0;
+    for key in folds {
+        let (s, e) = split_ext(key);
+        if e != ext {
+            continue;
+        }
+        if s == stem {
+            highest = highest.max(1);
+            continue;
+        }
+        let Some(rest) = s.strip_prefix(&prefix) else {
+            continue;
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(n) = rest.parse::<u32>() {
+            highest = highest.max(n);
+        }
+    }
+    highest.saturating_add(1)
 }
 
 /// Make sure an agent's upload folder exists and is a real directory, not a
@@ -357,6 +392,49 @@ mod tests {
             assert_eq!(clean_name(&name), name, "{name} does not clean to itself");
             assert!(name.len() <= MAX_NAME_BYTES, "{name}");
         }
+    }
+
+    #[test]
+    fn probing_starts_past_the_highest_recorded_suffix() {
+        let folds = |names: &[&str]| names.iter().map(|n| fold_key(n)).collect::<Vec<_>>();
+        assert_eq!(next_suffix("image.png", &[]), 1);
+        assert_eq!(next_suffix("image.png", &folds(&["image.png"])), 2);
+        assert_eq!(
+            next_suffix(
+                "image.png",
+                &folds(&["image.png", "IMAGE-7.PNG", "image-3.png"])
+            ),
+            8,
+            "case variants count"
+        );
+        assert_eq!(
+            next_suffix(
+                "image.png",
+                &folds(&[
+                    "image-copy.png",
+                    "image-2x.png",
+                    "image-5.jpg",
+                    "other-9.png",
+                    "image-.png"
+                ])
+            ),
+            1,
+            "other stems and extensions do not"
+        );
+        // A stem ending in `-` is numbered the way `with_suffix` numbers it.
+        assert_eq!(
+            next_suffix("a-1-.pdf", &folds(&["a-1-.pdf", "a-1-4.pdf"])),
+            5
+        );
+        assert_eq!(
+            next_suffix("Makefile", &folds(&["makefile", "Makefile-2"])),
+            3
+        );
+        assert_eq!(
+            next_suffix("x.txt", &folds(&["x-99999999999.txt"])),
+            1,
+            "overflow is ignored"
+        );
     }
 
     #[test]

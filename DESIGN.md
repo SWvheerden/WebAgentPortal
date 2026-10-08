@@ -1247,7 +1247,12 @@ inserted with a plain `INSERT`, and on a conflict the file moves on to the next 
 sent message's chip and trailer can never come to name different content. Uniqueness is on
 the name as the filesystem compares it — NFC and lowercased, in a `fold` column with
 `UNIQUE (agent_id, fold)` — because the default macOS filesystem takes `A.txt` and `a.txt`, or
-a composed and a decomposed `café`, for one file. Names are stored in NFC. `upload_max_mb` (default
+a composed and a decomposed `café`, for one file. Names are stored in NFC. Numbering starts
+one past the highest suffix already recorded for that name, so the hundredth pasted
+`image.png` goes straight to `image-100.png` with no cap to run into. Once the bytes are in,
+recording the row (and any move to a free name) runs to completion on a blocking thread even
+if the client goes away, and removes the file on any failure: a row never names a missing file,
+and a file never lacks its row. `upload_max_mb` (default
 50) is enforced while the body streams; axum's 2 MB default is lifted on this one route only.
 There is no total quota yet.
 

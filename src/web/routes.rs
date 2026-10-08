@@ -998,11 +998,20 @@ async fn upload_file(
 
     let dir = state.sup.uploads_dir(&record.id);
     let wanted = uploads::clean_name(&q.name);
+    // Start past every suffix already recorded for this name: the tenth
+    // pasted `image.png` goes straight to `image-10.png`.
+    let agent_id = record.id.clone();
+    let folds = state
+        .sup
+        .db()
+        .run(move |db| db.upload_folds(&agent_id))
+        .await?;
+    let first = uploads::next_suffix(&wanted, &folds);
     let dir_for_create = dir.clone();
-    let wanted_again = uploads::clean_name(&q.name);
-    let (file, mut name, mut suffix) = tokio::task::spawn_blocking(move || {
+    let wanted_for_create = wanted.clone();
+    let (file, name, suffix) = tokio::task::spawn_blocking(move || {
         uploads::ensure_dir(&dir_for_create)?;
-        uploads::create_unique(&dir_for_create, &wanted, 1)
+        uploads::create_unique(&dir_for_create, &wanted_for_create, first)
     })
     .await
     .map_err(ApiError::bad_request)?
@@ -1049,45 +1058,69 @@ async fn upload_file(
         return Err(err);
     }
 
-    // The row is what makes the name ours. If one already holds it — an
-    // earlier upload whose file the agent moved away — the file moves on to
-    // the next free name and tries again; plain INSERT makes that race-free.
-    let upload = loop {
-        let agent_id = record.id.clone();
-        let stored = name.clone();
-        let inserted = state
-            .sup
-            .db()
-            .run(move |db| db.insert_upload(&agent_id, &stored, size))
-            .await?;
-        if let Some(upload) = inserted {
-            break upload;
-        }
-        let dir_for_move = dir.clone();
-        let wanted = wanted_again.clone();
-        let from = partial.path.clone();
-        let (next, next_suffix) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let (placeholder, next, n) =
-                uploads::create_unique(&dir_for_move, &wanted, suffix + 1)?;
-            drop(placeholder);
-            let to = dir_for_move.join(&next);
-            // Onto our own empty placeholder; a link planted there in the
-            // meantime is replaced, never followed.
-            if let Err(err) = std::fs::rename(&from, &to) {
-                std::fs::remove_file(&to).ok();
-                return Err(err.into());
-            }
-            Ok((next, n))
-        })
-        .await
-        .map_err(ApiError::bad_request)?
-        .map_err(ApiError::from)?;
-        partial.path = dir.join(&next);
-        name = next;
-        suffix = next_suffix;
-    };
+    // The bytes are all here. From now on the file belongs to the finaliser,
+    // which runs to the end on a blocking thread even if this handler is
+    // dropped while waiting for it — so the row and the file always end up
+    // together or not at all.
     partial.keep = true;
+    let db = state.sup.db().clone();
+    let agent_id = record.id.clone();
+    let upload = tokio::task::spawn_blocking(move || {
+        finish_upload(&db, &dir, &agent_id, &wanted, name, suffix, size)
+    })
+    .await
+    .map_err(ApiError::bad_request)?
+    .map_err(ApiError::from)?;
     Ok(Json(upload_json(&state, &record.id, &upload)))
+}
+
+/// Record a fully written upload, file and row together.
+///
+/// The row is what makes the name ours. If one already holds it, or a name
+/// the filesystem would take for it — an earlier upload whose file the agent
+/// moved away — the file moves on to the next free name and tries again;
+/// a plain INSERT makes that race-free. On any failure the file is removed, so
+/// there is never a file without a row or a row without a file.
+///
+/// Blocking: run it on `spawn_blocking`, which also keeps it running when the
+/// request that started it goes away.
+fn finish_upload(
+    db: &crate::db::Db,
+    dir: &std::path::Path,
+    agent_id: &str,
+    wanted: &str,
+    mut name: String,
+    mut suffix: u32,
+    size: u64,
+) -> anyhow::Result<crate::db::Upload> {
+    loop {
+        match db.insert_upload(agent_id, &name, size) {
+            Ok(Some(upload)) => return Ok(upload),
+            Ok(None) => {}
+            Err(err) => {
+                std::fs::remove_file(dir.join(&name)).ok();
+                return Err(err);
+            }
+        }
+        let next = uploads::create_unique(dir, wanted, suffix.saturating_add(1));
+        let (placeholder, next, n) = match next {
+            Ok(next) => next,
+            Err(err) => {
+                std::fs::remove_file(dir.join(&name)).ok();
+                return Err(err);
+            }
+        };
+        drop(placeholder);
+        // Onto our own empty placeholder; a link planted there in the
+        // meantime is replaced, never followed.
+        if let Err(err) = std::fs::rename(dir.join(&name), dir.join(&next)) {
+            std::fs::remove_file(dir.join(&next)).ok();
+            std::fs::remove_file(dir.join(&name)).ok();
+            return Err(err.into());
+        }
+        name = next;
+        suffix = n;
+    }
 }
 
 /// An upload file that is deleted when dropped, unless `keep` was set once
@@ -3249,6 +3282,119 @@ console.log("ok");
                 "the old chip must not serve the new file"
             );
         }
+    }
+
+    /// Pasted screenshots are all `image.png` and names are never reused, so
+    /// the next one starts past the highest recorded suffix rather than
+    /// walking every earlier name — and there is no cap to run into.
+    #[tokio::test]
+    async fn the_next_numbered_name_starts_past_every_recorded_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = upload_state(dir.path(), 50).await;
+        state
+            .sup
+            .db()
+            .run(|db| {
+                db.insert_upload("agent-1", "image.png", 1)?;
+                for n in 2..=1500 {
+                    db.insert_upload("agent-1", &format!("image-{n}.png"), 1)?;
+                }
+                // A case variant counts against the same name.
+                db.insert_upload("agent-1", "IMAGE-1600.PNG", 1)
+            })
+            .await
+            .expect("seed");
+        let started = Instant::now();
+        let response = call(
+            &state,
+            "POST",
+            "/api/agents/agent-1/uploads?name=image.png",
+            b"shot".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+        assert_eq!(json["name"], json!("image-1601.png"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no walk over earlier names"
+        );
+        let folder = dir.path().join("agent-1");
+        let on_disk: Vec<_> = std::fs::read_dir(&folder)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(on_disk.len(), 1, "no placeholders left behind: {on_disk:?}");
+    }
+
+    /// The finaliser leaves the file and its row together or neither: it
+    /// runs on a blocking thread so a client going away cannot stop it
+    /// half-way, and every way it can fail removes the file.
+    #[tokio::test]
+    async fn finishing_an_upload_keeps_the_file_and_the_row_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = upload_state(dir.path(), 50).await;
+        let db = state.sup.db().clone();
+        let folder = dir.path().join("agent-1");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+
+        // The plain case.
+        std::fs::write(folder.join("a.txt"), "one").expect("write");
+        let upload = finish_upload(&db, &folder, "agent-1", "a.txt", "a.txt".to_string(), 1, 3)
+            .expect("finish");
+        assert_eq!(upload.name, "a.txt");
+
+        // A row holds the name but its file is gone: ours moves on.
+        db.insert_upload("agent-1", "b.txt", 9).expect("row");
+        std::fs::write(folder.join("b.txt"), "two").expect("write");
+        let upload = finish_upload(&db, &folder, "agent-1", "b.txt", "b.txt".to_string(), 1, 3)
+            .expect("finish");
+        assert_eq!(upload.name, "b-2.txt");
+        assert!(!folder.join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("b-2.txt")).expect("read"),
+            "two"
+        );
+
+        // The insert fails outright — the agent was deleted meanwhile: the
+        // file goes, and there is no row.
+        std::fs::write(folder.join("c.txt"), "three").expect("write");
+        let gone = finish_upload(
+            &db,
+            &folder,
+            "no-such-agent",
+            "c.txt",
+            "c.txt".to_string(),
+            1,
+            5,
+        );
+        assert!(gone.is_err());
+        assert!(!folder.join("c.txt").exists(), "no file without a row");
+        assert!(
+            db.get_upload("no-such-agent", "c.txt")
+                .expect("get")
+                .is_none()
+        );
+
+        // Whatever is left: every row has its file and every file its row.
+        let rows: Vec<String> = db
+            .list_uploads("agent-1", false)
+            .expect("list")
+            .into_iter()
+            .map(|u| u.name)
+            .filter(|n| folder.join(n).exists())
+            .collect();
+        let mut files: Vec<String> = std::fs::read_dir(&folder)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        let mut rows = rows;
+        rows.sort();
+        assert_eq!(files, rows);
+        assert_eq!(files, vec!["a.txt", "b-2.txt"]);
     }
 
     /// A client that goes away mid-upload — the chip's ×, a dropped

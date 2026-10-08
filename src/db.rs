@@ -781,6 +781,15 @@ impl Db {
         Ok((inserted > 0).then_some(upload))
     }
 
+    /// Every name this agent has recorded, as [`crate::uploads::fold_key`]s.
+    pub fn upload_folds(&self, agent_id: &str) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT fold FROM uploads WHERE agent_id = ?1")?;
+            let rows = stmt.query_map(params![agent_id], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+        })
+    }
+
     /// An agent's uploads, oldest first; only the unsent ones if `pending`.
     pub fn list_uploads(&self, agent_id: &str, pending: bool) -> Result<Vec<Upload>> {
         self.with_conn(|conn| {
