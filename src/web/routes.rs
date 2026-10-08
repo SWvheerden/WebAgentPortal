@@ -1417,17 +1417,24 @@ const tracker = () => {{
 const board = () => {{
   const b = {{ status: new Map(), chimes: [] }};
   b.pending = new PendingRequests((agent, id) => b.chimes.push(agent + ":" + id));
-  b.settle = [];
+  b.settle = new Map();
+  b.nextTimer = 0;
+  b.released = [];
   b.done = new DoneTracker({{
     announce: (id) => b.chimes.push("done:" + id),
-    release: () => {{}},
-    start: (fn) => {{ b.settle.push(fn); return b.settle.length; }},
-    cancel: () => {{}},
+    release: (id) => b.released.push(id),
+    start: (fn) => {{ b.nextTimer += 1; b.settle.set(b.nextTimer, fn); return b.nextTimer; }},
+    cancel: (id) => b.settle.delete(id),
   }});
+  b.fireSettle = () => {{ const due = [...b.settle.values()]; b.settle.clear(); due.forEach((fn) => fn()); }};
   b.resync = new Resync();
   b.live = (apply) => b.resync.route(apply);
   b.load = (agents, announce = true) => {{
-    if (announce) for (const a of agents) if (b.status.has(a.id)) b.done.status(a.id, b.status.get(a.id), a.status);
+    if (announce) {{
+      for (const a of agents) if (b.status.has(a.id)) b.done.status(a.id, b.status.get(a.id), a.status);
+      const kept = new Set(agents.map((a) => a.id));
+      for (const id of b.status.keys()) if (!kept.has(id)) b.done.forget(id);
+    }}
     b.status = new Map(agents.map((a) => [a.id, a.status]));
     b.pending.snapshot(agents, {{ announce }});
   }};
@@ -1488,11 +1495,30 @@ const agentA = (status, ids) => ({{ id: "a", status, pending_permissions: ids.ma
   b.load([agentA("working", [])], false);
   const gen = b.resync.begin();
   b.resync.finish(gen, () => b.load([agentA("idle", [])]));
-  b.settle.splice(0).forEach((fn) => fn());
+  b.fireSettle();
   assert(JSON.stringify(b.chimes) === '["done:a"]', "the missed finish chimes: " + b.chimes);
   const again = b.resync.begin();
   b.resync.finish(again, () => b.load([agentA("idle", [])]));
-  assert(b.settle.length === 0 && b.chimes.length === 1, "a later reconnect does not chime it again");
+  assert(b.settle.size === 0 && b.chimes.length === 1, "a later reconnect does not chime it again");
+}}
+
+// Agents removed while the socket was down are missing from the snapshot:
+// forgotten, whether already done or still settling.
+{{
+  const b = board();
+  const agentB = (status) => ({{ id: "b", status, pending_permissions: [] }});
+  b.load([agentA("working", []), agentB("working")], false);
+  b.live(() => {{ b.done.status("a", "working", "idle"); b.status.set("a", "idle"); }});
+  b.fireSettle();
+  b.live(() => {{ b.done.status("b", "working", "idle"); b.status.set("b", "idle"); }});
+  assert(b.done.done.has("a") && b.settle.size === 1, "a is done and b is settling");
+  const gen = b.resync.begin();
+  b.resync.finish(gen, () => b.load([]));
+  assert(b.done.done.size === 0, "nothing removed stays done");
+  assert(JSON.stringify(b.released) === '["a"]', "the done agent's claim is released: " + b.released);
+  assert(b.settle.size === 0, "the settling agent's timer is cancelled");
+  b.fireSettle();
+  assert(JSON.stringify(b.chimes) === '["done:a"]', "and it never chimes: " + b.chimes);
 }}
 
 // Overlapping reloads: the older result is discarded, and what was held before

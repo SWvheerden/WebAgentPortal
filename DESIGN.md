@@ -1066,7 +1066,9 @@ way back to working; those must not chime. A turn that ends while a request is p
 off, not finished, and does not count. Looking at the tab clears the green; the agent leaving
 idle, or being removed, takes it off the list. Orange takes precedence: while anything awaits
 approval the tab shows only the approval alert, and a turn that settles then stays silent
-(it still turns green once the approvals clear). The chime is claimed across tabs like a
+(it still turns green once the approvals clear). That rule is per tab: an agent page only knows
+its own agent's approvals, so its done chime can sound while another agent awaits approval
+elsewhere — but any tab that shows the approval still shows orange over green. The chime is claimed across tabs like a
 request's, keyed `done:agent_id`, and released only when an announced agent leaves idle, so one
 finished turn never chimes twice. A finish missed while the socket was down is caught on
 reconnect: the dashboard diffs the snapshot's statuses, the agent page re-fetches its agent.

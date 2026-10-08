@@ -1012,6 +1012,8 @@ async function main() {
     const seen = liveStatuses;
     const fresh = (await api(`/api/agents/${state.agent.id}`)).agent;
     if (liveStatuses !== seen) return;
+    // Counted too, so an older recheck still in flight is dropped.
+    liveStatuses += 1;
     trackStatus(state.agent.id, before, fresh.status);
     Object.assign(state.agent, {
       status: fresh.status,

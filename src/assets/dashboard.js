@@ -254,6 +254,9 @@ async function loadAgents({ announce = false } = {}) {
         if (before) trackStatus(agent.id, before.status, agent.status);
       }
     }
+    // Removed while the socket was down: no `agent_removed` came for it.
+    const kept = new Set(data.agents.map((a) => a.id));
+    for (const id of state.agents.keys()) if (!kept.has(id)) forgetAgent(id);
     state.agents = new Map(data.agents.map((a) => [a.id, a]));
     state.pending.snapshot(data.agents, { announce });
     renderAgents();
