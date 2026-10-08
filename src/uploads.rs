@@ -84,13 +84,21 @@ fn split_ext(name: &str) -> (&str, &str) {
 
 /// `stem + suffix + ext`, with the stem cut (on a character boundary) so the
 /// whole fits in [`MAX_NAME_BYTES`].
+///
+/// Every name this returns is a fixed point of [`clean_name`]: the routes look
+/// a stored name up by checking it cleans to itself. So a stem ending in `-`
+/// loses it before a `-N` suffix goes on — `Screenshot-1-` and 2 must give
+/// `Screenshot-1-2`, not a `--` that cleaning would collapse.
 fn fit(stem: &str, ext: &str, suffix: &str) -> String {
     let room = MAX_NAME_BYTES.saturating_sub(ext.len() + suffix.len());
     let mut cut = stem.len().min(room);
     while !stem.is_char_boundary(cut) {
         cut -= 1;
     }
-    let stem = &stem[..cut];
+    let mut stem = &stem[..cut];
+    if !suffix.is_empty() {
+        stem = stem.trim_end_matches('-');
+    }
     let stem = if stem.is_empty() { FALLBACK_NAME } else { stem };
     format!("{stem}{suffix}{ext}")
 }
@@ -135,14 +143,18 @@ pub fn ensure_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read an uploaded file back, refusing anything that is not a plain file.
+/// Open an uploaded file for download, refusing anything that is not a plain
+/// file. Returns the open file and its length at the moment it was opened.
 ///
 /// The agent can write in this folder, so a name we stored may since have
 /// been replaced by a link to `~/.ssh/id_ed25519`. The entry is checked with
 /// `symlink_metadata`, then opened, and the opened file must be the same
 /// inode — so a swap between the check and the open is refused too.
-pub fn read_plain_file(dir: &Path, name: &str) -> Result<Vec<u8>> {
-    use std::io::Read;
+///
+/// The caller streams it rather than reading it whole: the agent can grow the
+/// file in place past the upload cap, and a download must not pull that into
+/// memory.
+pub fn open_plain_file(dir: &Path, name: &str) -> Result<(File, u64)> {
     use std::os::unix::fs::MetadataExt;
 
     let dir_meta = std::fs::symlink_metadata(dir)?;
@@ -154,14 +166,12 @@ pub fn read_plain_file(dir: &Path, name: &str) -> Result<Vec<u8>> {
     if !link.file_type().is_file() {
         bail!("{name} is not a plain file");
     }
-    let mut file = File::open(&path)?;
+    let file = File::open(&path)?;
     let opened = file.metadata()?;
     if opened.ino() != link.ino() || opened.dev() != link.dev() {
         bail!("{name} changed while it was being opened");
     }
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-    Ok(data)
+    Ok((file, opened.len()))
 }
 
 /// Remove an agent's whole upload folder. A missing folder is fine. A symlink
@@ -291,6 +301,37 @@ mod tests {
         assert!(suffixed.ends_with("-12.pdf"), "{suffixed}");
     }
 
+    /// The routes find a stored name by checking it cleans to itself, so
+    /// every generated name must — a `--` from a stem ending in `-` would
+    /// collapse, and that upload could never be downloaded or withdrawn.
+    #[test]
+    fn every_generated_name_is_a_fixed_point_of_cleaning() {
+        let ends_in_dash = clean_name("Screenshot (1).png");
+        assert_eq!(ends_in_dash, "Screenshot-1-.png");
+        assert_eq!(with_suffix(&ends_in_dash, 2), "Screenshot-1-2.png");
+        assert_eq!(with_suffix("a-", 2), "a-2");
+        assert_eq!(with_suffix("-.txt", 2), "upload-2.txt");
+
+        // Truncation that lands right after a `-`.
+        let long_dashed = format!("{}-{}.pdf", "a".repeat(115), "b".repeat(50));
+        let mut names = vec![
+            ends_in_dash.clone(),
+            clean_name(&long_dashed),
+            clean_name(&format!("{}.pdf", "a-".repeat(80))),
+            clean_name(&format!("{}.txt", "é-".repeat(60))),
+            clean_name("plain"),
+        ];
+        for base in names.clone() {
+            for n in [2, 9, 10, 99, 999] {
+                names.push(with_suffix(&base, n));
+            }
+        }
+        for name in names {
+            assert_eq!(clean_name(&name), name, "{name} does not clean to itself");
+            assert!(name.len() <= MAX_NAME_BYTES, "{name}");
+        }
+    }
+
     #[test]
     fn a_suffix_goes_before_the_extension() {
         assert_eq!(with_suffix("report.pdf", 2), "report-2.pdf");
@@ -337,11 +378,11 @@ mod tests {
         std::fs::write(uploads.join("plain.txt"), "hello").expect("write");
         std::os::unix::fs::symlink(&secret, uploads.join("link.txt")).expect("symlink");
 
-        assert_eq!(
-            read_plain_file(&uploads, "plain.txt").expect("plain"),
-            b"hello"
-        );
-        assert!(read_plain_file(&uploads, "link.txt").is_err());
+        let (mut file, len) = open_plain_file(&uploads, "plain.txt").expect("plain");
+        let mut data = String::new();
+        std::io::Read::read_to_string(&mut file, &mut data).expect("read");
+        assert_eq!((data.as_str(), len), ("hello", 5));
+        assert!(open_plain_file(&uploads, "link.txt").is_err());
 
         // A folder that has been swapped for a link is refused as a whole.
         let other = dir.path().join("other");
@@ -349,7 +390,7 @@ mod tests {
         std::fs::write(other.join("plain.txt"), "elsewhere").expect("write");
         let swapped = dir.path().join("swapped");
         std::os::unix::fs::symlink(&other, &swapped).expect("symlink");
-        assert!(read_plain_file(&swapped, "plain.txt").is_err());
+        assert!(open_plain_file(&swapped, "plain.txt").is_err());
     }
 
     #[test]

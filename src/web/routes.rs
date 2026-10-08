@@ -1109,12 +1109,29 @@ async fn download_upload(
     }
     let dir = state.sup.uploads_dir(&record.id);
     let key = name.clone();
-    let data = tokio::task::spawn_blocking(move || uploads::read_plain_file(&dir, &key))
+    let (file, len) = tokio::task::spawn_blocking(move || uploads::open_plain_file(&dir, &key))
         .await
         .map_err(ApiError::bad_request)?
         .map_err(|err| ApiError::not_found(format!("{name} cannot be downloaded: {err:#}")))?;
+    // Streamed in chunks, and no further than the length it had when opened:
+    // the agent may be growing it, and the length is what was promised.
+    let reader = tokio::io::AsyncReadExt::take(tokio::fs::File::from_std(file), len);
+    let chunks = futures_util::stream::unfold(Some(reader), |reader| async move {
+        use tokio::io::AsyncReadExt;
+        let mut reader = reader?;
+        let mut buf = vec![0u8; 64 * 1024];
+        match reader.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(axum::body::Bytes::from(buf)), Some(reader)))
+            }
+            Err(err) => Some((Err(err), None)),
+        }
+    });
     Ok((
         [
+            (header::CONTENT_LENGTH, len.to_string()),
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),
             (
                 header::CONTENT_DISPOSITION,
@@ -1127,7 +1144,7 @@ async fn download_upload(
             ),
             (header::CACHE_CONTROL, "no-store".to_string()),
         ],
-        data,
+        Body::from_stream(chunks),
     )
         .into_response())
 }
@@ -2901,6 +2918,7 @@ console.log("ok");
             headers.get(header::CONTENT_TYPE).expect("type"),
             "application/octet-stream"
         );
+        assert_eq!(headers.get(header::CONTENT_LENGTH).expect("length"), "6");
         assert_eq!(body_of(response).await, b"second");
 
         let response = call(
@@ -2955,6 +2973,86 @@ console.log("ok");
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A name whose cleaned stem ends in `-` still gets a numbered sibling
+    /// that can be downloaded and withdrawn.
+    #[tokio::test]
+    async fn a_numbered_upload_of_an_awkward_name_can_be_fetched_and_withdrawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = upload_state(dir.path(), 50).await;
+        let mut names = Vec::new();
+        for body in [b"first".to_vec(), b"second".to_vec()] {
+            let response = call(
+                &state,
+                "POST",
+                "/api/agents/agent-1/uploads?name=a%20(1).pdf",
+                body,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let uploaded: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+            names.push(uploaded["name"].as_str().expect("name").to_string());
+        }
+        assert_eq!(names, vec!["a-1-.pdf", "a-1-2.pdf"]);
+
+        let response = call(
+            &state,
+            "GET",
+            "/api/agents/agent-1/uploads/a-1-2.pdf",
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_of(response).await, b"second");
+        let response = call(
+            &state,
+            "DELETE",
+            "/api/agents/agent-1/uploads/a-1-2.pdf",
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!dir.path().join("agent-1").join("a-1-2.pdf").exists());
+        let response = call(
+            &state,
+            "GET",
+            "/api/agents/agent-1/uploads?pending=1",
+            vec![],
+        )
+        .await;
+        let listed: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+        assert_eq!(listed["uploads"].as_array().expect("list").len(), 1);
+    }
+
+    /// The download is streamed with the length the file had when it was
+    /// opened, so a large one is not read whole into memory.
+    #[tokio::test]
+    async fn a_large_download_is_streamed_with_its_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = upload_state(dir.path(), 50).await;
+        let response = call(
+            &state,
+            "POST",
+            "/api/agents/agent-1/uploads?name=big.bin",
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The agent grows it in place, past anything the upload would allow.
+        let big: Vec<u8> = (0..5 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("agent-1").join("big.bin"), &big).expect("grow");
+
+        let response = call(&state, "GET", "/api/agents/agent-1/uploads/big.bin", vec![]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .expect("length"),
+            big.len().to_string().as_str()
+        );
+        assert_eq!(body_of(response).await, big);
     }
 
     /// Over the cap is refused, whether the client says so up front or not,
@@ -3162,6 +3260,22 @@ console.log("ok");
             js.contains("xhr.upload.onprogress"),
             "uploads show progress"
         );
+        // Every delete mentions the uploads it takes, not only a forced one.
+        let dashboard =
+            std::str::from_utf8(&Assets::get("dashboard.js").expect("dashboard.js").data)
+                .expect("utf-8")
+                .to_string();
+        let preview = dashboard
+            .find("/delete_preview")
+            .expect("the dashboard asks for the delete preview");
+        let first_confirm = dashboard
+            .find("confirm(`Delete \"${agent.name}\"?")
+            .expect("the delete confirmation");
+        assert!(
+            preview < first_confirm,
+            "the preview comes before the first confirm"
+        );
+        assert!(dashboard.contains("report.uploads"));
         for id in [
             "id=\"attach\"",
             "id=\"file-input\" type=\"file\" multiple",

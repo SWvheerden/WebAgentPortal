@@ -308,7 +308,17 @@ async function remove(agent) {
   // An agent with no branch — a plain folder or the whole root — has none to
   // keep, so the promise is not made.
   const keeps = agent.branch ? ' The branch is kept by default.' : '';
-  if (!confirm(`Delete "${agent.name}"?${keeps}`)) return;
+  // Uploads go with the agent whatever kind it is, so every delete says how
+  // many — not just the forced one below. Informational: a preview that cannot
+  // be fetched does not stand in the way.
+  let uploads = '';
+  try {
+    const preview = await api(`/api/agents/${agent.id}/delete_preview`);
+    if (preview.report && preview.report.uploads) uploads = `\n\n${preview.report.uploads}.`;
+  } catch {
+    uploads = '';
+  }
+  if (!confirm(`Delete "${agent.name}"?${keeps}${uploads}`)) return;
   // A branch the agent did not create is not ours to destroy, so it is not
   // even offered — the server refuses it too.
   const deleteBranch = agent.branch && agent.branch_is_new !== false

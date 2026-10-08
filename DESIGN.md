@@ -1262,10 +1262,14 @@ and a download chip per file; the echo check compares against the full text the 
 **The folder is the agent's to write in**, so nothing trusts it: uploads are created with
 `create_new`, which fails rather than follow a planted symlink; downloads are refused unless the
 entry is still a plain file (checked with `symlink_metadata`, then the opened inode compared),
+are streamed up to the length the file had when opened (the agent can grow it past the cap),
 are always `Content-Disposition: attachment` with `nosniff`, and need the credential header
 like every other `/api` route (the page fetches them as a blob). Delete removes the folder and
 its rows for every kind of agent without following links, and the delete report carries an
-informational "N uploaded files (X MB) will be deleted" that never makes a delete unsafe.
+informational "N uploaded files (X MB) will be deleted" that never makes a delete unsafe; the
+dashboard fetches `delete_preview` so every delete confirmation says it, not only a forced one.
+A numbered name (`Screenshot-1-2.png`) is always one that cleans to itself, since that is how
+the routes recognise a stored name.
 
 ---
 
