@@ -53,13 +53,16 @@ export const DONE_SETTLE_MS = 1500;
 /// Once it does, `announce` fires (the chime) and the agent stays in `done`
 /// until the operator looks (`seen`), it leaves idle, or it is forgotten. The
 /// chime's claim is released only when an announced agent leaves idle, so a
-/// tab can never chime twice for one finished turn. The timer functions are
-/// injected so a test can fire them by hand.
+/// tab can never chime twice for one finished turn. While `quiet()` holds — an
+/// approval is pending, and orange wins — the agent still joins `done`, so the
+/// green shows once the approvals clear, but nothing is announced. The timer
+/// functions are injected so a test can fire them by hand.
 export class DoneTracker {
   constructor({
     announce,
     release,
     onChange = () => {},
+    quiet = () => false,
     settle = DONE_SETTLE_MS,
     // Wrapped for the same reason as Flasher's.
     start = (fn, ms) => setTimeout(fn, ms),
@@ -68,6 +71,7 @@ export class DoneTracker {
     this.announce = announce;
     this.release = release;
     this.onChange = onChange;
+    this.quiet = quiet;
     this.settle = settle;
     this.start = start;
     this.cancel = cancel;
@@ -86,9 +90,11 @@ export class DoneTracker {
     if (finishedTurn(previous, next)) {
       const timer = this.start(() => {
         this.settling.delete(agentId);
-        this.announced.add(agentId);
         this.done.add(agentId);
-        this.announce(agentId);
+        if (!this.quiet()) {
+          this.announced.add(agentId);
+          this.announce(agentId);
+        }
         this.onChange();
       }, this.settle);
       this.settling.set(agentId, timer);

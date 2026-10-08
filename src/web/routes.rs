@@ -1310,8 +1310,9 @@ const tab = (shared, state) => {{
 // The done tracker, on hand-fired timers: a finished turn must settle before
 // it counts, and claims are released only when an announced agent moves on.
 const tracker = () => {{
-  const t = {{ timers: new Map(), next: 1, announced: [], released: [], changes: 0, delays: [] }};
+  const t = {{ timers: new Map(), next: 1, announced: [], released: [], changes: 0, delays: [], quiet: false }};
   t.done = new DoneTracker({{
+    quiet: () => t.quiet,
     announce: (id) => t.announced.push(id),
     release: (id) => t.released.push(id),
     onChange: () => {{ t.changes += 1; }},
@@ -1366,6 +1367,19 @@ const tracker = () => {{
   t.fire();
   t.done.status("a", "idle", "stopped");
   assert(t.done.done.size === 0 && t.released.length === 1, "a stopped agent is no longer done");
+}}
+
+// While an approval is pending, orange wins: no done chime and no claim, but
+// the agent is still done, so the green shows once the approvals clear.
+{{
+  const t = tracker();
+  t.quiet = true;
+  t.done.status("a", "working", "idle");
+  t.fire();
+  assert(t.announced.length === 0, "no done chime while an approval is pending");
+  assert(t.done.done.has("a") && t.changes === 1, "but the agent is still done");
+  t.done.status("a", "idle", "working");
+  assert(t.released.length === 0, "nothing was claimed, so nothing is released");
 }}
 
 // A removed agent is forgotten, settling or done.

@@ -258,6 +258,7 @@ const doneTracker = new DoneTracker({
   },
   release: (agentId) => doneChimer.claims.release(doneKey(agentId)),
   onChange: () => scheduleFlash(),
+  quiet: () => attention > 0,
 });
 
 /// Is the operator actually looking at this tab? A visible tab in an unfocused

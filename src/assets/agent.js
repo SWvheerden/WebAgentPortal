@@ -1003,12 +1003,15 @@ async function main() {
   // A turn that ended while the socket was down came in no `status`, so after
   // a reconnect (not the first connect) ask for the agent again, as the
   // dashboard does. A live `status` that lands while this is in flight is
-  // newer than the answer, so the answer is dropped.
+  // newer than the answer, so the answer is dropped. Counted, not compared:
+  // idle -> working -> idle mid-fetch would look unchanged.
   let connected = false;
+  let liveStatuses = 0;
   const recheckStatus = async () => {
     const before = state.agent.status;
+    const seen = liveStatuses;
     const fresh = (await api(`/api/agents/${state.agent.id}`)).agent;
-    if (state.agent.status !== before) return;
+    if (liveStatuses !== seen) return;
     trackStatus(state.agent.id, before, fresh.status);
     Object.assign(state.agent, {
       status: fresh.status,
@@ -1058,6 +1061,7 @@ async function main() {
     })
     .on('status', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
+      liveStatuses += 1;
       trackStatus(msg.agent_id, state.agent.status, msg.status);
       Object.assign(state.agent, {
         status: msg.status,

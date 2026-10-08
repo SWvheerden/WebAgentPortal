@@ -1065,7 +1065,8 @@ settle time is there because queued prompts and held subagent turns pass through
 way back to working; those must not chime. A turn that ends while a request is pending was cut
 off, not finished, and does not count. Looking at the tab clears the green; the agent leaving
 idle, or being removed, takes it off the list. Orange takes precedence: while anything awaits
-approval the tab shows only the approval alert. The chime is claimed across tabs like a
+approval the tab shows only the approval alert, and a turn that settles then stays silent
+(it still turns green once the approvals clear). The chime is claimed across tabs like a
 request's, keyed `done:agent_id`, and released only when an announced agent leaves idle, so one
 finished turn never chimes twice. A finish missed while the socket was down is caught on
 reconnect: the dashboard diffs the snapshot's statuses, the agent page re-fetches its agent.
