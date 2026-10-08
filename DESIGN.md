@@ -167,8 +167,10 @@ CREATE TABLE uploads (
   name       TEXT NOT NULL,                -- cleaned, unique within the folder
   size       INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
+  fold       TEXT NOT NULL,                -- NFC + lowercase: how the filesystem compares it
   sent_at    INTEGER,                      -- NULL while pending in the composer
-  PRIMARY KEY (agent_id, name)
+  PRIMARY KEY (agent_id, name),
+  UNIQUE (agent_id, fold)
 );
 ```
 
@@ -1242,7 +1244,10 @@ digits, `.`, `_` and `-` (no leading dot or dash, at most 120 bytes, `upload` if
 left), and a clash becomes `report-2.pdf` rather than an overwrite. A name that has ever had a
 row is never handed out again, even if the agent has since moved its file away: the row is
 inserted with a plain `INSERT`, and on a conflict the file moves on to the next free name, so a
-sent message's chip and trailer can never come to name different content. `upload_max_mb` (default
+sent message's chip and trailer can never come to name different content. Uniqueness is on
+the name as the filesystem compares it — NFC and lowercased, in a `fold` column with
+`UNIQUE (agent_id, fold)` — because the default macOS filesystem takes `A.txt` and `a.txt`, or
+a composed and a decomposed `café`, for one file. Names are stored in NFC. `upload_max_mb` (default
 50) is enforced while the body streams; axum's 2 MB default is lifted on this one route only.
 There is no total quota yet.
 

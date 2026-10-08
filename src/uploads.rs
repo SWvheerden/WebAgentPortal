@@ -16,6 +16,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 /// The longest file name we store, in bytes.
 pub const MAX_NAME_BYTES: usize = 120;
@@ -46,7 +47,10 @@ pub struct Attachment {
 pub fn clean_name(raw: &str) -> String {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
     let mut out = String::new();
-    for c in base.chars() {
+    // NFC first: a Mac hands over `café` decomposed, and its combining accent
+    // is not a letter, so it would otherwise become `cafe-`. The name on disk
+    // and the row then agree on one spelling.
+    for c in base.nfc() {
         if c.is_control() {
             continue;
         }
@@ -62,7 +66,16 @@ pub fn clean_name(raw: &str) -> String {
         return FALLBACK_NAME.to_string();
     }
     let (stem, ext) = split_ext(out);
-    fit(stem, ext, "")
+    fit(stem, ext, "").nfc().collect()
+}
+
+/// The key two names collide on. The default macOS filesystem treats `A.txt`
+/// and `a.txt`, or NFC and NFD `café`, as one file, so uniqueness in the
+/// `uploads` table is on this rather than the exact name — otherwise a new
+/// upload could land on an old row's file under a different spelling.
+pub fn fold_key(name: &str) -> String {
+    let lower: String = name.nfc().collect::<String>().to_lowercase();
+    lower.nfc().collect()
 }
 
 /// `name` with a numeric suffix before its extension: `report.pdf` and 2 give
@@ -283,6 +296,18 @@ mod tests {
         assert_eq!(clean_name("$(rm -rf ~)`x`;'q'\".sh"), "rm-rf-x-q-.sh");
         // Letters in any script stay.
         assert_eq!(clean_name("résumé 日本.txt"), "résumé-日本.txt");
+        // A decomposed name comes out composed, accent intact.
+        let nfd = "cafe\u{301}.txt";
+        assert_eq!(clean_name(nfd), "caf\u{e9}.txt");
+        assert_eq!(clean_name(nfd), clean_name("caf\u{e9}.txt"));
+        assert_eq!(clean_name(&clean_name(nfd)), clean_name(nfd));
+    }
+
+    #[test]
+    fn names_that_one_file_on_macos_would_share_fold_to_one_key() {
+        assert_eq!(fold_key("Report.PDF"), fold_key("report.pdf"));
+        assert_eq!(fold_key("cafe\u{301}.txt"), fold_key("CAF\u{c9}.txt"));
+        assert_ne!(fold_key("report.pdf"), fold_key("report-2.pdf"));
     }
 
     #[test]

@@ -81,13 +81,19 @@ CREATE TABLE IF NOT EXISTS notes (
 -- `~/.claude-web/uploads/<agent_id>/<name>`; this is what the server knows
 -- about them. `sent_at` is NULL while the file waits in the composer, and set
 -- once a message carrying it has gone to the agent.
+--
+-- `fold` is the name as the filesystem compares it (NFC, lowercased): the
+-- default macOS filesystem treats `A.txt` and `a.txt` as one file, so two rows
+-- whose names differ only that way would name the same bytes.
 CREATE TABLE IF NOT EXISTS uploads (
   agent_id   TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   name       TEXT NOT NULL,
+  fold       TEXT NOT NULL,
   size       INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
   sent_at    INTEGER,
-  PRIMARY KEY (agent_id, name)
+  PRIMARY KEY (agent_id, name),
+  UNIQUE (agent_id, fold)
 );
 "#;
 
@@ -746,7 +752,8 @@ impl Db {
 
     /// Record a file that has just been written to the agent's upload folder.
     ///
-    /// `None` if a row already holds the name. That happens when the agent
+    /// `None` if a row already holds the name, or one the filesystem would
+    /// treat as the same (`A.txt` against `a.txt`). That happens when the agent
     /// moved or deleted an earlier upload's file, freeing the name on disk —
     /// but the old row may be a sent message's attachment, and reusing its
     /// name would point that message's chip and trailer at new content. A
@@ -760,9 +767,15 @@ impl Db {
         };
         let inserted = self.with_conn(|conn| {
             Ok(conn.execute(
-                "INSERT OR IGNORE INTO uploads (agent_id, name, size, created_at, sent_at)
-                 VALUES (?1, ?2, ?3, ?4, NULL)",
-                params![agent_id, upload.name, upload.size as i64, upload.created_at],
+                "INSERT OR IGNORE INTO uploads (agent_id, name, fold, size, created_at, sent_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                params![
+                    agent_id,
+                    upload.name,
+                    crate::uploads::fold_key(&upload.name),
+                    upload.size as i64,
+                    upload.created_at
+                ],
             )?)
         })?;
         Ok((inserted > 0).then_some(upload))
@@ -1298,7 +1311,13 @@ mod tests {
 
         db.claim_uploads("a", &["one.txt".to_string()])
             .expect("claim");
-        // The name is never handed out again, sent or not.
+        // The name is never handed out again, sent or not — nor any spelling
+        // the filesystem would take for the same file.
+        assert!(
+            db.insert_upload("a", "ONE.txt", 99)
+                .expect("insert")
+                .is_none()
+        );
         assert!(
             db.insert_upload("a", "one.txt", 99)
                 .expect("insert")

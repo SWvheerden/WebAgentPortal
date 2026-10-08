@@ -3182,6 +3182,75 @@ console.log("ok");
         );
     }
 
+    /// On a case- and normalisation-insensitive filesystem (default APFS)
+    /// `a.txt` is the old `A.txt` file. A name differing only in case or in
+    /// Unicode form from a recorded one is taken too.
+    #[tokio::test]
+    async fn a_name_differing_only_in_case_or_form_is_not_reused() {
+        for (first, second, expected) in [
+            ("A.txt", "a.txt", "a-2.txt"),
+            ("caf%C3%A9.txt", "cafe%CC%81.txt", "caf\u{e9}-2.txt"),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = upload_state(dir.path(), 50).await;
+            let folder = dir.path().join("agent-1");
+            let post = |name: &'static str, body: &'static [u8]| {
+                let state = state.clone();
+                async move {
+                    let path = format!("/api/agents/agent-1/uploads?name={name}");
+                    let response = call(&state, "POST", &path, body.to_vec()).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let json: Value =
+                        serde_json::from_slice(&body_of(response).await).expect("json");
+                    json["name"].as_str().expect("name").to_string()
+                }
+            };
+
+            let old = post(first, b"old").await;
+            let claim = old.clone();
+            state
+                .sup
+                .db()
+                .run(move |db| db.claim_uploads("agent-1", &[claim]))
+                .await
+                .expect("send");
+            std::fs::remove_file(folder.join(&old)).expect("the agent moves it");
+
+            assert_eq!(
+                post(second, b"new!").await,
+                expected,
+                "{first} then {second}"
+            );
+            let key = old.clone();
+            let row = state
+                .sup
+                .db()
+                .run(move |db| db.get_upload("agent-1", &key))
+                .await
+                .expect("get")
+                .expect("old row");
+            assert!(
+                row.sent_at.is_some() && row.size == 3,
+                "the old row is intact"
+            );
+            let response = call(
+                &state,
+                "GET",
+                &format!(
+                    "/api/agents/agent-1/uploads/{}",
+                    uploads::percent_encode(&old)
+                ),
+                vec![],
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "the old chip must not serve the new file"
+            );
+        }
+    }
+
     /// A client that goes away mid-upload — the chip's ×, a dropped
     /// connection — drops the handler at an `.await`. The half-written file
     /// must go with it, not linger with no row holding its name.
