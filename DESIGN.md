@@ -1268,7 +1268,10 @@ until the agent's own user event confirms them. Every open page shows the same p
 so a user event removes its files from any page's composer, whoever sent it; and on an error
 notice the composer is reconciled with the server's pending list — chips sent or withdrawn
 elsewhere go, uploads in flight stay — and the refused message's text is put back if the box
-is still empty. The CLI receives
+is still empty. The same settling runs when a send goes unconfirmed for 15 s, and after a
+reconnect once the replay has caught up — a frame lost on a half-open phone socket brings no
+event and no error. Then the files decide: one still pending means the message never went and
+its text comes back; none pending means it went and only the confirmation was lost. The CLI receives
 
 ```
 <text>

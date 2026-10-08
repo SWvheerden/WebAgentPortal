@@ -2,7 +2,7 @@
 import { announceAttention, releaseAttention, api, applyTextSize, el, needToken, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast, token, trackStatus, trackSnapshot } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 import { newKeys } from '/assets/attention.js';
-import { composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, reconcilePending, restoreDraft, uploadsUrl } from '/assets/uploads.js';
+import { awaitingConfirmation, composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, restoreDraft, settleSend, uploadsUrl } from '/assets/uploads.js';
 import { clampSideWidth, keyedSideWidth, loadSideWidth, saveSideWidth, sideWidthBounds } from '/assets/splitter.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
@@ -32,7 +32,15 @@ const state = {
   /// The text of a message that went with attachments, kept until the server
   /// confirms it, so a refused send can give it back.
   sentText: null,
+  /// The fallback that settles a send whose confirmation never came.
+  sendTimer: null,
 };
+
+/// How long a send with attachments may go unconfirmed before the page asks
+/// the server what happened to it. A frame lost on a half-open socket brings
+/// no event and no error, and would otherwise leave the chips `sending` for
+/// good.
+const SEND_CONFIRM_MS = 15000;
 
 // -- transcript -------------------------------------------------------------
 
@@ -308,6 +316,10 @@ function appendEvents(events) {
         state.sentText = null;
       }
       state.uploads = confirmSent(state.uploads, sent);
+      if (!awaitingConfirmation(state.uploads)) {
+        clearTimeout(state.sendTimer);
+        state.sendTimer = null;
+      }
       renderUploads();
     }
     const node = renderEvent(event);
@@ -886,6 +898,27 @@ async function removeUpload(chip) {
 
 /// Put back what was attached but not yet sent, after a reload or on another
 /// device.
+/// Settle an unconfirmed send with the server: chips that went or were
+/// withdrawn elsewhere go, ones still pending are ready again, and the text
+/// comes back if the message never went. A no-op once nothing is `sending`,
+/// so the notice, the reconnect and the timer can all call it.
+async function reconcileAfterSend(refused) {
+  if (!awaitingConfirmation(state.uploads)) return;
+  clearTimeout(state.sendTimer);
+  state.sendTimer = null;
+  const data = await api(`${uploadsUrl(state.agent.id)}?pending=1`);
+  // Confirmed while the list was being fetched: nothing left to settle.
+  if (!awaitingConfirmation(state.uploads)) return;
+  const settled = settleSend(state.uploads, data.uploads, refused);
+  state.uploads = settled.chips;
+  if (settled.restoreText) {
+    const input = $('input');
+    input.value = restoreDraft(input.value, state.sentText);
+  }
+  state.sentText = null;
+  renderUploads();
+}
+
 async function restoreUploads() {
   const data = await api(`${uploadsUrl(state.agent.id)}?pending=1`);
   state.uploads = mergePending(state.uploads, data.uploads);
@@ -991,6 +1024,10 @@ function send() {
   // A send with attachments can be refused (a chip gone stale in another
   // tab); keep its text so the refusal can put it back.
   state.sentText = attachments.length ? text : null;
+  clearTimeout(state.sendTimer);
+  state.sendTimer = attachments.length
+    ? setTimeout(() => reconcileAfterSend(false), SEND_CONFIRM_MS)
+    : null;
   if (text) rememberInput(text);
   // The CLI queues messages received during a turn (F6); show that.
   if (state.agent.status === 'working' || state.agent.status === 'awaiting_approval') {
@@ -1272,7 +1309,13 @@ async function main() {
       // the render state: a live event arriving mid-walk must not end it, or
       // everything between here and the head is lost for good.
       const next = nextWalkCursor(msg);
-      if (next !== null) subscribe(next);
+      if (next !== null) {
+        subscribe(next);
+        return;
+      }
+      // Caught up — after a reconnect, the replay has now confirmed whatever
+      // did arrive; anything still `sending` went missing with the old socket.
+      reconcileAfterSend(false).catch((err) => toast(err.message, 'error'));
     })
     .on('event', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
@@ -1333,17 +1376,8 @@ async function main() {
       toast(msg.text, msg.level);
       // A refused send: its files may never have gone. Put back whatever the
       // server still holds as pending, so the next message can carry them.
-      if (msg.agent_id === state.agent.id && msg.level === 'error'
-        && state.uploads.some((c) => c.status === 'sending')) {
-        const input = $('input');
-        input.value = restoreDraft(input.value, state.sentText);
-        state.sentText = null;
-        api(`${uploadsUrl(state.agent.id)}?pending=1`)
-          .then((data) => {
-            state.uploads = reconcilePending(state.uploads, data.uploads);
-            renderUploads();
-          })
-          .catch((err) => toast(err.message, 'error'));
+      if (msg.agent_id === state.agent.id && msg.level === 'error') {
+        reconcileAfterSend(true).catch((err) => toast(err.message, 'error'));
       }
     })
     .on('agent_removed', (msg) => {

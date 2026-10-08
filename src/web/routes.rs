@@ -3580,7 +3580,7 @@ console.log("ok");
             .collect();
         let source = format!(
             r#"
-import {{ composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, reconcilePending, restoreDraft, uploadsUrl }} from "{module}";
+import {{ awaitingConfirmation, composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, reconcilePending, restoreDraft, settleSend, uploadsUrl }} from "{module}";
 const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
 
 {sizes}
@@ -3652,6 +3652,29 @@ assert(pastedFiles(["text/plain"], []).length === 0, "plain text pastes as text"
   assert(chips.filter((c) => c.status === "done").length === 2, "pending ones are ready to send");
 }}
 
+// A send whose confirmation never came is settled against the server.
+{{
+  const inFlight = chip("uploading", null);
+  const chips = [chip("sending", "a.png"), chip("sending", "b.txt"), inFlight];
+  assert(awaitingConfirmation(chips), "sending chips wait for confirmation");
+  assert(!awaitingConfirmation([chip("done", "a.png"), inFlight]), "nothing sending, nothing to settle");
+
+  // Lost before the server saw it: the files are still pending, so the
+  // message never went — chips ready again, text back.
+  let s = settleSend(chips, [{{ name: "a.png", size: 1 }}, {{ name: "b.txt", size: 1 }}], false);
+  assert(s.restoreText, "an unclaimed send gives its text back");
+  assert(s.chips.filter((c) => c.status === "done").length === 2 && s.chips.includes(inFlight), "chips are ready again");
+  assert(!awaitingConfirmation(s.chips), "and nothing is left sending");
+
+  // It went; only the confirmation was lost: chips go, text stays gone.
+  s = settleSend(chips, [], false);
+  assert(!s.restoreText, "a claimed send does not give its text back");
+  assert(s.chips.length === 1 && s.chips[0] === inFlight, "sent chips go: " + s.chips.length);
+
+  // Refused outright: the text comes back whatever the files say.
+  assert(settleSend(chips, [], true).restoreText, "a refusal always gives the text back");
+}}
+
 // The text of a refused send comes back, unless something was typed since.
 assert(restoreDraft("", "look at this") === "look at this", "an empty box gets the text back");
 assert(restoreDraft("  ", "look at this") === "look at this", "blank counts as empty");
@@ -3696,6 +3719,24 @@ console.log("ok");
             "the message must carry the attachment names"
         );
         assert!(js.contains("p.attachments"), "sent attachments must render");
+        // A send whose confirmation never comes is settled by a timer, on
+        // reconnect once the replay has caught up, and on an error notice.
+        assert!(
+            js.contains("setTimeout(() => reconcileAfterSend(false), SEND_CONFIRM_MS)"),
+            "an unconfirmed send must be settled on a timer"
+        );
+        let replay = &js[js.find(".on('replay'").expect("replay handler")..];
+        let replay = &replay[..replay.find(".on('event'").expect("next handler")];
+        assert!(
+            replay.contains("reconcileAfterSend(false)"),
+            "a reconnect's replay must settle what went missing with the old socket"
+        );
+        let notice = &js[js.find(".on('notice'").expect("notice handler")..];
+        assert!(
+            notice[..notice.find(".on('agent_removed'").expect("next handler")]
+                .contains("reconcileAfterSend(true)"),
+            "an error notice settles the send as refused"
+        );
         assert!(
             js.contains("xhr.upload.onprogress"),
             "uploads show progress"

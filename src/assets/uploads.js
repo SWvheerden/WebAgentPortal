@@ -93,6 +93,23 @@ export function reconcilePending(chips, pending) {
   return mergePending(kept, pending);
 }
 
+/// Is a send still waiting for the server's word on its attachments?
+export function awaitingConfirmation(chips) {
+  return chips.some((c) => c.status === 'sending');
+}
+
+/// Settle a send that has not been confirmed, against the server's pending
+/// list. `refused` is true when the server said no outright (an error
+/// notice). Otherwise — a timeout, a reconnect — the files themselves tell:
+/// one still pending means the claim never happened, so the message never
+/// went and its text should come back; none pending means it went and only
+/// its confirmation was lost.
+export function settleSend(chips, pending, refused) {
+  const names = new Set((pending || []).map((u) => u.name));
+  const unsent = chips.some((c) => c.status === 'sending' && names.has(c.name));
+  return { chips: reconcilePending(chips, pending), restoreText: refused || unsent };
+}
+
 /// After a refused send, what the message box should hold: the text that was
 /// sent, unless something has been typed since — that is never overwritten.
 export function restoreDraft(current, sent) {
