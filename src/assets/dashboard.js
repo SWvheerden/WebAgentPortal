@@ -246,7 +246,7 @@ async function loadAgents({ announce = false } = {}) {
     state.resync.finish(generation, null);
     throw err;
   }
-  state.resync.finish(generation, () => {
+  const applied = state.resync.finish(generation, () => {
     // A turn that ended while the socket was down came in no `status`.
     if (announce) {
       for (const agent of data.agents) {
@@ -257,13 +257,17 @@ async function loadAgents({ announce = false } = {}) {
     // Removed while the socket was down: no `agent_removed` came for it.
     const kept = new Set(data.agents.map((a) => a.id));
     for (const id of state.agents.keys()) if (!kept.has(id)) forgetAgent(id);
-    // On every load, the first included: frees a done claim whose agent
-    // restarted while no tab was watching.
-    for (const agent of data.agents) trackSnapshot(agent.id, agent.status);
     state.agents = new Map(data.agents.map((a) => [a.id, a]));
     state.pending.snapshot(data.agents, { announce });
     renderAgents();
   });
+  // On every load, the first included: free the done claim of any agent that
+  // restarted while no tab was watching. After the held live news replayed,
+  // so a stale "working" in the snapshot cannot free a claim that a newer
+  // finish (held here, claimed by another tab) still holds.
+  if (applied) {
+    for (const agent of state.agents.values()) trackSnapshot(agent.id, agent.status);
+  }
 }
 
 // One verb per agent at a time. A double-clicked Resume would otherwise put

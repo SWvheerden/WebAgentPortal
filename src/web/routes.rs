@@ -1570,6 +1570,34 @@ const agentA = (status, ids) => ({{ id: "a", status, pending_permissions: ids.ma
   assert(JSON.stringify(b.chimes) === '["done:a"]', "and it never chimes: " + b.chimes);
 }}
 
+// A snapshot taken before the agent finished says "working", while the finish
+// itself is held. Another tab has already settled and claimed it. The release
+// pass runs on the statuses after the replay, so the claim stands and this tab
+// does not chime a second time.
+{{
+  const shared = storage();
+  const other = tab(shared, "running");
+  const here = tab(shared, "running");
+  const b = board();
+  const settle = [];
+  b.done = new DoneTracker({{
+    announce: (id) => here.chimer.announce(doneKey(id)),
+    release: (id) => here.chimer.claims.release(doneKey(id)),
+    start: (fn) => {{ settle.push(fn); return settle.length; }},
+    cancel: () => {{}},
+  }});
+  b.load([agentA("working", [])], false);
+  const gen = b.resync.begin();
+  b.live(() => {{ b.done.status("a", b.status.get("a"), "idle"); b.status.set("a", "idle"); }});
+  other.chimer.announce(doneKey("a"));
+  if (b.resync.finish(gen, () => b.load([agentA("working", [])]))) {{
+    for (const [id, status] of b.status) b.done.snapshot(id, status);
+  }}
+  settle.splice(0).forEach((fn) => fn());
+  assert(other.played === 1 && here.played === 0, "one finish, one chime across tabs: " + here.played);
+  assert(new ChimeClaims(shared, now).read()[doneKey("a")] !== undefined, "the other tab's claim still stands");
+}}
+
 // Overlapping reloads: the older result is discarded, and what was held before
 // the newer fetch began is covered by its snapshot.
 {{

@@ -1006,7 +1006,9 @@ async function main() {
   // dashboard does. The answer is dropped if a live `status` landed while it
   // was in flight (counted, not compared: idle -> working -> idle mid-fetch
   // would look unchanged), or if a newer recheck has started since.
-  let connected = false;
+  // The socket is made at module load, so it may already have opened during
+  // the fetch above, before `onopen` was set; that open was the first.
+  let connected = socket.ws?.readyState === WebSocket.OPEN;
   let liveStatuses = 0;
   let recheckGen = 0;
   const recheckStatus = async () => {
