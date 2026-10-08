@@ -2,7 +2,7 @@
 import { announceAttention, releaseAttention, api, applyTextSize, el, needToken, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast, token, trackStatus, trackSnapshot } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 import { newKeys } from '/assets/attention.js';
-import { composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, rejectSending, uploadsUrl } from '/assets/uploads.js';
+import { composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, reconcilePending, restoreDraft, uploadsUrl } from '/assets/uploads.js';
 import { clampSideWidth, keyedSideWidth, loadSideWidth, saveSideWidth, sideWidthBounds } from '/assets/splitter.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
@@ -29,6 +29,9 @@ const state = {
   /// where `status` is `uploading`, `done` or `failed`. `name` is what the
   /// server stored it as, once it has.
   uploads: [],
+  /// The text of a message that went with attachments, kept until the server
+  /// confirms it, so a refused send can give it back.
+  sentText: null,
 };
 
 // -- transcript -------------------------------------------------------------
@@ -301,6 +304,9 @@ function appendEvents(events) {
       ? event.payload.attachments.map((a) => a.name)
       : [];
     if (sent.length) {
+      if (state.uploads.some((c) => c.status === 'sending' && sent.includes(c.name))) {
+        state.sentText = null;
+      }
       state.uploads = confirmSent(state.uploads, sent);
       renderUploads();
     }
@@ -982,6 +988,9 @@ function send() {
     return;
   }
   socket.send({ type: 'send_message', agent_id: state.agent.id, text, attachments });
+  // A send with attachments can be refused (a chip gone stale in another
+  // tab); keep its text so the refusal can put it back.
+  state.sentText = attachments.length ? text : null;
   if (text) rememberInput(text);
   // The CLI queues messages received during a turn (F6); show that.
   if (state.agent.status === 'working' || state.agent.status === 'awaiting_approval') {
@@ -1326,9 +1335,15 @@ async function main() {
       // server still holds as pending, so the next message can carry them.
       if (msg.agent_id === state.agent.id && msg.level === 'error'
         && state.uploads.some((c) => c.status === 'sending')) {
-        state.uploads = rejectSending(state.uploads);
-        renderUploads();
-        restoreUploads().catch((err) => toast(err.message, 'error'));
+        const input = $('input');
+        input.value = restoreDraft(input.value, state.sentText);
+        state.sentText = null;
+        api(`${uploadsUrl(state.agent.id)}?pending=1`)
+          .then((data) => {
+            state.uploads = reconcilePending(state.uploads, data.uploads);
+            renderUploads();
+          })
+          .catch((err) => toast(err.message, 'error'));
       }
     })
     .on('agent_removed', (msg) => {

@@ -1264,8 +1264,11 @@ the agent's pending rows, all are marked sent or none are, so two tabs sending t
 a withdraw racing a send cannot both win, and a client never supplies a path. A send that then
 fails to reach the agent hands them back to pending — including one still queued when the
 agent's process exits, which the runner drains, releases and reports as an error notice. The page keeps the chips as "sending"
-until the agent's own user event confirms them, and on an error notice re-fetches what is still
-pending. The CLI receives
+until the agent's own user event confirms them. Every open page shows the same pending uploads,
+so a user event removes its files from any page's composer, whoever sent it; and on an error
+notice the composer is reconciled with the server's pending list — chips sent or withdrawn
+elsewhere go, uploads in flight stay — and the refused message's text is put back if the box
+is still empty. The CLI receives
 
 ```
 <text>

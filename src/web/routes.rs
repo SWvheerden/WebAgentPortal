@@ -3580,7 +3580,7 @@ console.log("ok");
             .collect();
         let source = format!(
             r#"
-import {{ composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, rejectSending, uploadsUrl }} from "{module}";
+import {{ composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, reconcilePending, restoreDraft, uploadsUrl }} from "{module}";
 const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
 
 {sizes}
@@ -3622,15 +3622,41 @@ assert(pastedFiles(["text/plain"], []).length === 0, "plain text pastes as text"
   const confirmed = confirmSent(chips, ["a.png"]);
   assert(confirmed.map((c) => c.name).join() === "b.txt,", "only the confirmed chip goes: " + confirmed.map((c) => c.name));
 
-  // A refusal drops the sending chips and the server's pending list brings
-  // back whichever were not sent.
-  chips = rejectSending(confirmed);
-  assert(chips.length === 1 && chips[0] === inFlight, "sending chips are dropped on refusal");
-  chips = mergePending(chips, [{{ name: "b.txt", size: 3 }}]);
-  assert(chips.length === 2 && chips[1].name === "b.txt" && chips[1].status === "done", "pending ones come back");
+  // A refusal reconciles with the server: still-pending ones are ready to
+  // send again, the rest go, and uploads in flight stay.
+  chips = reconcilePending(confirmed, [{{ name: "b.txt", size: 3 }}]);
+  assert(chips.length === 2, "kept: " + chips.map((c) => c.name));
+  assert(chips.some((c) => c === inFlight), "the upload in flight stays, same object");
+  const b = chips.find((c) => c.name === "b.txt");
+  assert(b && b.status === "done", "a still-pending chip is ready to send again");
   chips = mergePending(chips, [{{ name: "b.txt", size: 3 }}]);
   assert(chips.length === 2, "a chip already shown is not added twice");
 }}
+
+// Another tab sent or withdrew what this one still shows.
+{{
+  const inFlight = chip("uploading", null);
+  let chips = [chip("done", "a.png"), chip("done", "b.txt"), chip("done", "c.txt"), inFlight];
+  // Its user event clears ready chips too, not only ones this tab was sending.
+  chips = confirmSent(chips, ["a.png"]);
+  assert(!chips.some((c) => c.name === "a.png"), "a done chip sent elsewhere goes");
+  assert(chips.includes(inFlight), "an upload in flight is never confirmed away");
+  // b.txt was withdrawn elsewhere; a.png the server never heard of; d.txt is
+  // pending but new to this tab.
+  chips = reconcilePending(
+    [...chips, chip("sending", "z.txt"), chip("failed", null)],
+    [{{ name: "c.txt", size: 1 }}, {{ name: "d.txt", size: 2 }}],
+  );
+  const names = chips.map((c) => c.name).join();
+  assert(names === "c.txt,,d.txt", "stale chips go, pending ones stay or arrive: " + names);
+  assert(chips.filter((c) => c.status === "done").length === 2, "pending ones are ready to send");
+}}
+
+// The text of a refused send comes back, unless something was typed since.
+assert(restoreDraft("", "look at this") === "look at this", "an empty box gets the text back");
+assert(restoreDraft("  ", "look at this") === "look at this", "blank counts as empty");
+assert(restoreDraft("new draft", "look at this") === "new draft", "typing since is never overwritten");
+assert(restoreDraft("", null) === "", "nothing remembered, nothing restored");
 
 assert(uploadsUrl("a b") === "/api/agents/a%20b/uploads", uploadsUrl("a b"));
 assert(uploadsUrl("x", "r?é.png") === "/api/agents/x/uploads/r%3F%C3%A9.png", uploadsUrl("x", "r?é.png"));

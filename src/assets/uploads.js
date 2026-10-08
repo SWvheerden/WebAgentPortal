@@ -62,8 +62,12 @@ export function pastedFiles(types, files) {
 //
 // A sent chip stays on screen as `sending` until the server answers: the
 // agent's own user event carrying it confirms it, and an error notice means
-// the server refused — it may not have been sent at all, so whatever is still
-// pending is fetched back rather than silently dropped from the next message.
+// the server refused — it may not have been sent at all, so the composer is
+// reconciled with what the server still holds as pending.
+//
+// Every open page of the agent shows the same pending uploads, so another tab
+// may send or withdraw them. A user event removes its files here whoever sent
+// it, and a refusal (the usual sign a chip here had gone stale) reconciles.
 
 /// The finished chips a message carries become `sending`. Uploads in flight
 /// are left alone (Send is blocked while there are any).
@@ -71,16 +75,29 @@ export function markSending(chips) {
   return chips.map((c) => (c.status === 'done' ? { ...c, status: 'sending' } : c));
 }
 
-/// A user event arrived carrying `names`: those chips are the server's now.
+/// A user event arrived carrying `names`: those files are sent, by this page
+/// or another, and no longer belong in the composer.
 export function confirmSent(chips, names) {
   const sent = new Set(names);
-  return chips.filter((c) => !(c.status === 'sending' && sent.has(c.name)));
+  return chips.filter((c) => !(c.name && sent.has(c.name) && c.status !== 'uploading'));
 }
 
-/// The server refused a send: drop the `sending` chips, ready for
-/// `mergePending` to put back whichever are still pending.
-export function rejectSending(chips) {
-  return chips.filter((c) => c.status !== 'sending');
+/// Make the composer match the server's pending list: chips no longer pending
+/// (sent or withdrawn elsewhere) go, pending ones show as ready to send, and
+/// uploads still in flight are left alone.
+export function reconcilePending(chips, pending) {
+  const names = new Set((pending || []).map((u) => u.name));
+  const kept = chips
+    .filter((c) => c.status === 'uploading' || (c.name && names.has(c.name)))
+    .map((c) => (c.status === 'uploading' ? c : { ...c, status: 'done' }));
+  return mergePending(kept, pending);
+}
+
+/// After a refused send, what the message box should hold: the text that was
+/// sent, unless something has been typed since — that is never overwritten.
+export function restoreDraft(current, sent) {
+  if (!sent || current.trim()) return current;
+  return sent;
 }
 
 /// Add the server's pending uploads that the composer does not already show.
