@@ -205,6 +205,10 @@ struct RunnerHandle {
     /// Which launch this handle belongs to. A runner only ever deregisters its
     /// own generation, so a stale task cannot evict a live one.
     generation: u64,
+    /// Why this launch was not given its upload folder, if it was not. A
+    /// message with attachments would name paths the agent cannot read, so it
+    /// is refused instead.
+    uploads_unavailable: Option<String>,
 }
 
 /// The registry of live agents.
@@ -923,27 +927,47 @@ impl Supervisor {
             Ok(result) => result,
             Err(err) => Err(anyhow!(err)),
         };
-        let uploads = match made {
+        //
+        // A dot-entry that will not go means the folder is not handed over:
+        // the agent could read it as configuration. That is said out loud, and
+        // recorded on the handle so a message with attachments is refused for
+        // this launch rather than naming paths the agent cannot read.
+        let uploads_unavailable: Option<String> = match made {
             Ok(swept) => {
-                if !swept.is_empty() {
-                    tracing::warn!(agent = %record.slug, ?swept, "removed dot-entries from the upload folder");
+                if !swept.removed.is_empty() {
+                    tracing::warn!(agent = %record.slug, removed = ?swept.removed, "removed dot-entries from the upload folder");
                     self.broadcast(ServerMsg::Notice {
                         agent_id: Some(record.id.clone()),
                         level: "warn".to_string(),
                         text: format!(
                             "Removed {} from the agent's upload folder before launch: \
                              hidden entries there could be read as configuration.",
-                            swept.join(", ")
+                            swept.removed.join(", ")
                         ),
                     });
                 }
-                Some(uploads)
+                if swept.remaining.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "{} could not be removed from {}, and the folder is not handed to an \
+                         agent while hidden entries are in it. Remove them and resume the agent.",
+                        swept.remaining.join(", "),
+                        uploads.display()
+                    ))
+                }
             }
-            Err(err) => {
-                tracing::warn!(agent = %record.slug, ?err, "no upload folder for this launch");
-                None
-            }
+            Err(err) => Some(format!("the upload folder could not be prepared: {err:#}")),
         };
+        if let Some(reason) = &uploads_unavailable {
+            tracing::warn!(agent = %record.slug, %reason, "no upload folder for this launch");
+            self.broadcast(ServerMsg::Notice {
+                agent_id: Some(record.id.clone()),
+                level: "warn".to_string(),
+                text: format!("Attachments are unavailable for this launch: {reason}"),
+            });
+        }
+        let uploads = uploads_unavailable.is_none().then_some(uploads);
         let spawn_config = SpawnConfig {
             claude_bin: cfg.claude_bin.clone(),
             cwd: work_path,
@@ -970,6 +994,7 @@ impl Supervisor {
                     tx: cmd_tx,
                     commands: commands.clone(),
                     generation,
+                    uploads_unavailable: uploads_unavailable.clone(),
                 },
             );
         }
@@ -1095,6 +1120,14 @@ impl Supervisor {
             .collect();
         if names.len() > MAX_ATTACHMENTS {
             bail!("a message can carry at most {MAX_ATTACHMENTS} attachments");
+        }
+        // Checked before anything is claimed: a launch that was not given the
+        // upload folder cannot read what the trailer would name.
+        if !names.is_empty()
+            && let Some(handle) = self.runners.read().await.get(id)
+            && let Some(reason) = &handle.uploads_unavailable
+        {
+            bail!("attachments are unavailable for this launch: {reason}");
         }
         // Claimed before anything is sent, all or none: a second tab sending
         // the same file, or a withdraw racing this send, loses here rather
@@ -1486,9 +1519,16 @@ impl Supervisor {
         // fatal — the agent itself is already gone.
         let dir = self.uploads_dir(&record.id);
         let blobs = self.blobs_dir(&record.id);
+        // The private copies first — the agent cannot write there, so nothing
+        // it did can stop them going — and both are always tried.
         let wiped = match tokio::task::spawn_blocking(move || {
-            uploads::wipe_dir(&dir)?;
-            uploads::wipe_dir(&blobs)
+            let private = uploads::wipe_dir(&blobs);
+            let agent = uploads::wipe_dir(&dir);
+            match (private, agent) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+                (Err(private), Err(agent)) => Err(anyhow!("{private:#}; {agent:#}")),
+            }
         })
         .await
         {
@@ -3083,6 +3123,7 @@ mod tests {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
                 generation: 1,
+                uploads_unavailable: None,
             },
         );
         (sup, rx)
@@ -3615,6 +3656,7 @@ mod tests {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
                 generation: 2,
+                uploads_unavailable: None,
             },
         );
 
@@ -3906,6 +3948,7 @@ mod tests {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
                 generation: 7,
+                uploads_unavailable: None,
             },
         );
 
@@ -4107,6 +4150,7 @@ mod tests {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
                 generation: 1,
+                uploads_unavailable: None,
             },
         );
 
@@ -5151,7 +5195,7 @@ mod tests {
             let mut harness = Harness::start();
             harness
                 .db
-                .insert_upload("agent-1", "late.png", 5, "")
+                .insert_upload("agent-1", "late.png", 5, "", None)
                 .expect("upload");
             harness
                 .db
@@ -5220,7 +5264,7 @@ mod tests {
         let size = body.len() as u64;
         uploads::restore_copy(&blobs, &agent_dir, name, size, &sha).expect("agent copy");
         sup.db
-            .insert_upload(agent, name, size, &sha)
+            .insert_upload(agent, name, size, &sha, None)
             .expect("row")
             .expect("new row");
     }
@@ -5349,5 +5393,178 @@ mod tests {
             }
         }
         assert!(told, "the sweep is announced");
+    }
+
+    /// A launch that was not given its upload folder refuses messages with
+    /// attachments before claiming anything; plain messages still go.
+    #[tokio::test]
+    async fn attachments_are_refused_when_the_launch_has_no_upload_folder() {
+        let (sup, mut rx) = one_agent(Status::Idle).await;
+        seed_upload(&sup, "agent-limited", "a.txt", b"bytes");
+        sup.runners
+            .write()
+            .await
+            .get_mut("agent-limited")
+            .expect("handle")
+            .uploads_unavailable = Some(".claude could not be removed".to_string());
+        let err = sup
+            .send_message("agent-limited", "hi", &["a.txt".to_string()])
+            .await
+            .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("unavailable for this launch") && text.contains(".claude"),
+            "{text}"
+        );
+        assert!(rx.try_recv().is_err(), "nothing is typed");
+        let pending = sup
+            .db()
+            .run(|db| db.list_uploads("agent-limited", true))
+            .await
+            .expect("list");
+        assert_eq!(pending.len(), 1, "nothing was claimed");
+        sup.send_message("agent-limited", "just text", &[])
+            .await
+            .expect("plain messages still go");
+    }
+
+    /// A dot-entry that cannot be swept keeps the upload folder away from the
+    /// launch, says why, and stops attachments for that launch; an agent whose
+    /// folder sweeps clean is handed it as before.
+    #[tokio::test]
+    async fn an_unremovable_hidden_entry_keeps_the_folder_from_the_launch() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let bin_dir = tempfile::tempdir().expect("tempdir");
+        let path = bin_dir.path().join("args-cli");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PWD/args\"\nexec cat >/dev/null\n",
+        )
+        .expect("write");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let clean_work = tempfile::tempdir().expect("tempdir");
+        let stuck_work = tempfile::tempdir().expect("tempdir");
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&agent_record("clean", clean_work.path()))
+            .expect("insert");
+        db.insert_agent(&agent_record("stuck", stuck_work.path()))
+            .expect("insert");
+        let cfg = Config {
+            claude_bin: path.to_string_lossy().to_string(),
+            ..Config::default()
+        };
+        let sup =
+            Supervisor::with_files_root(db, Arc::new(RwLock::new(cfg)), root.path().to_path_buf());
+
+        // An entry the owner cannot remove: the user-immutable flag. Where
+        // that cannot be set (not macOS/BSD), there is nothing to test.
+        let stuck = sup.uploads_dir("stuck");
+        uploads::ensure_dir(&stuck).expect("mkdir");
+        let planted = stuck.join(".mcp.json");
+        std::fs::write(&planted, "{}").expect("write");
+        let locked = std::process::Command::new("chflags")
+            .arg("uchg")
+            .arg(&planted)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !locked {
+            return;
+        }
+        seed_upload(&sup, "stuck", "a.txt", b"bytes");
+        let mut events = sup.subscribe();
+
+        let args_of = |work: &Path| {
+            let file = work.join("args");
+            async move {
+                for _ in 0..200 {
+                    if let Ok(text) = std::fs::read_to_string(&file)
+                        && !text.is_empty()
+                    {
+                        return text.lines().map(str::to_string).collect::<Vec<_>>();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                panic!("the stub never recorded its arguments");
+            }
+        };
+
+        sup.resume("clean").await.expect("resume clean");
+        sup.resume("stuck").await.expect("resume stuck");
+        let clean_args = args_of(clean_work.path()).await;
+        let stuck_args = args_of(stuck_work.path()).await;
+        let clean_dir = sup.uploads_dir("clean").to_string_lossy().to_string();
+        let stuck_dir = stuck.to_string_lossy().to_string();
+        assert!(
+            clean_args
+                .windows(2)
+                .any(|w| w[0] == "--add-dir" && w[1] == clean_dir),
+            "a clean folder is handed over: {clean_args:?}"
+        );
+        assert!(
+            !stuck_args.iter().any(|a| a == &stuck_dir),
+            "a folder with a hidden entry is not: {stuck_args:?}"
+        );
+
+        let mut told = false;
+        while let Ok(msg) = events.try_recv() {
+            if let ServerMsg::Notice { agent_id, text, .. } = msg {
+                told |= agent_id.as_deref() == Some("stuck")
+                    && text.contains("Attachments are unavailable")
+                    && text.contains(".mcp.json");
+            }
+        }
+        assert!(told, "the operator is told why");
+        let err = sup
+            .send_message("stuck", "look", &["a.txt".to_string()])
+            .await
+            .expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("unavailable for this launch"),
+            "{err:#}"
+        );
+
+        std::process::Command::new("chflags")
+            .arg("nouchg")
+            .arg(&planted)
+            .status()
+            .ok();
+        sup.shutdown().await;
+    }
+
+    /// A read-only folder the agent left in its upload folder does not stop
+    /// the delete: the private copies go first, and both are removed.
+    #[tokio::test]
+    async fn a_read_only_folder_does_not_strand_the_private_copies() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let work = tempfile::tempdir().expect("tempdir");
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&agent_record("gopher", work.path()))
+            .expect("insert");
+        let sup = Supervisor::with_files_root(
+            db,
+            Arc::new(RwLock::new(Config::default())),
+            root.path().to_path_buf(),
+        );
+        seed_upload(&sup, "gopher", "a.txt", b"bytes");
+        let cache = sup.uploads_dir("gopher").join("gomodcache").join("pkg");
+        std::fs::create_dir_all(&cache).expect("mkdir");
+        std::fs::write(cache.join("go.mod"), "module x").expect("write");
+        for dir in [cache.clone(), cache.parent().expect("parent").to_path_buf()] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        }
+
+        sup.delete("gopher", false, false).await.expect("delete");
+        assert!(
+            !sup.blobs_dir("gopher").exists(),
+            "the private copies are gone"
+        );
+        assert!(
+            !sup.uploads_dir("gopher").exists(),
+            "and so is the agent's folder"
+        );
     }
 }

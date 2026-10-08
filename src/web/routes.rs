@@ -372,6 +372,7 @@ pub fn router(state: AppState) -> Router {
             "/api/agents/{id}/uploads",
             get(list_uploads)
                 .post(upload_file)
+                .delete(withdraw_by_client_id)
                 .layer(DefaultBodyLimit::disable()),
         )
         .route(
@@ -941,6 +942,30 @@ async fn post_message(
 struct UploadQuery {
     #[serde(default)]
     name: String,
+    /// The page's own id for this upload, so it can withdraw it by that id
+    /// if it is cancelled after its last byte — before it ever learned the
+    /// stored name.
+    #[serde(default)]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientIdQuery {
+    client_id: String,
+}
+
+/// A client id is the page's random token: at most 64 characters of
+/// `[A-Za-z0-9-]`. Anything else is refused rather than stored.
+fn valid_client_id(id: &str) -> ApiResult<&str> {
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if !ok {
+        return Err(ApiError::bad_request(
+            "client_id must be 1–64 of A-Z, a-z, 0-9 and -",
+        ));
+    }
+    Ok(id)
 }
 
 #[derive(Debug, Deserialize)]
@@ -955,6 +980,7 @@ fn upload_json(state: &AppState, agent_id: &str, upload: &crate::db::Upload) -> 
         "name": upload.name,
         "size": upload.size,
         "path": state.sup.uploads_dir(agent_id).join(&upload.name).to_string_lossy(),
+        "client_id": upload.client_id,
         "created_at": upload.created_at,
         "sent_at": upload.sent_at,
     })
@@ -993,6 +1019,10 @@ async fn upload_file(
     use tokio::io::AsyncWriteExt;
 
     let record = resolve(&state, &id).await?;
+    let client_id = match q.client_id.as_deref() {
+        Some(id) => Some(valid_client_id(id)?.to_string()),
+        None => None,
+    };
     let max_mb = state.sup.config().await.upload_max_mb;
     let max_bytes = max_mb.saturating_mul(1024 * 1024);
     let too_large = || ApiError::too_large(format!("files are limited to {max_mb} MB"));
@@ -1081,7 +1111,15 @@ async fn upload_file(
     let db = state.sup.db().clone();
     let agent_id = record.id.clone();
     let upload = tokio::task::spawn_blocking(move || {
-        finish_upload(&db, &agent_id, &wanted, guard, size, &sha256)
+        finish_upload(
+            &db,
+            &agent_id,
+            &wanted,
+            guard,
+            size,
+            &sha256,
+            client_id.as_deref(),
+        )
     })
     .await
     .map_err(ApiError::bad_request)?
@@ -1108,10 +1146,11 @@ fn finish_upload(
     mut guard: PartialUpload,
     size: u64,
     sha256: &str,
+    client_id: Option<&str>,
 ) -> anyhow::Result<crate::db::Upload> {
     loop {
         uploads::restore_copy(&guard.blob_dir, &guard.agent_dir, &guard.name, size, sha256)?;
-        if let Some(upload) = db.insert_upload(agent_id, &guard.name, size, sha256)? {
+        if let Some(upload) = db.insert_upload(agent_id, &guard.name, size, sha256, client_id)? {
             guard.keep = true;
             return Ok(upload);
         }
@@ -1251,6 +1290,47 @@ async fn download_upload(
         .into_response())
 }
 
+/// `DELETE /api/agents/{id}/uploads?client_id=<id>`: withdraw a pending upload
+/// by the page's own id for it.
+///
+/// For a cancel that came too late: the last byte had gone, the upload
+/// committed, but the page never learned the stored name. A no-op if there is
+/// no such pending upload — not committed yet, or already sent.
+async fn withdraw_by_client_id(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Query(q): Query<ClientIdQuery>,
+) -> ApiResult<Json<Value>> {
+    let record = resolve(&state, &id).await?;
+    let client_id = valid_client_id(&q.client_id)?.to_string();
+    let agent_id = record.id.clone();
+    let withdrawn = state
+        .sup
+        .db()
+        .run(move |db| {
+            let Some(upload) = db.pending_upload_by_client_id(&agent_id, &client_id)? else {
+                return Ok(None);
+            };
+            Ok(db
+                .delete_pending_upload(&agent_id, &upload.name)?
+                .then_some(upload.name))
+        })
+        .await?;
+    if let Some(name) = &withdrawn {
+        remove_copies(&state, &record.id, name).await;
+    }
+    Ok(Json(json!({ "ok": true, "withdrawn": withdrawn })))
+}
+
+/// Remove both copies of a withdrawn upload. `remove_file` takes a link away
+/// rather than what it points at.
+async fn remove_copies(state: &AppState, agent_id: &str, name: &str) {
+    let agent_copy = state.sup.uploads_dir(agent_id).join(name);
+    let private_copy = state.sup.blobs_dir(agent_id).join(name);
+    tokio::fs::remove_file(&agent_copy).await.ok();
+    tokio::fs::remove_file(&private_copy).await.ok();
+}
+
 /// `DELETE /api/agents/{id}/uploads/{name}`: withdraw a pending upload. A
 /// sent one is part of the transcript and is refused.
 async fn delete_upload(
@@ -1278,12 +1358,7 @@ async fn delete_upload(
         )),
         Some(false) => Err(ApiError::not_found(format!("no such upload: {name}"))),
         Some(true) => {
-            // Both copies. `remove_file` takes a link away rather than what it
-            // points at.
-            let agent_copy = state.sup.uploads_dir(&record.id).join(&name);
-            let private_copy = state.sup.blobs_dir(&record.id).join(&name);
-            tokio::fs::remove_file(&agent_copy).await.ok();
-            tokio::fs::remove_file(&private_copy).await.ok();
+            remove_copies(&state, &record.id, &name).await;
             Ok(Json(json!({"ok": true})))
         }
     }
@@ -2497,7 +2572,7 @@ console.log("ok");
 
     /// Every route that carries data or changes state, enumerated: one added
     /// later that forgets the check is exactly what this catches.
-    const GUARDED_ROUTES: [(&str, &str); 20] = [
+    const GUARDED_ROUTES: [(&str, &str); 21] = [
         ("GET", "/api/health"),
         ("GET", "/api/repos"),
         ("GET", "/api/agents"),
@@ -2517,6 +2592,7 @@ console.log("ok");
         ("POST", "/api/agents/x/uploads?name=a.txt"),
         ("GET", "/api/agents/x/uploads/a.txt"),
         ("DELETE", "/api/agents/x/uploads/a.txt"),
+        ("DELETE", "/api/agents/x/uploads?client_id=abc"),
         ("GET", "/ws"),
     ];
 
@@ -3377,12 +3453,12 @@ console.log("ok");
             .sup
             .db()
             .run(|db| {
-                db.insert_upload("agent-1", "image.png", 1, "")?;
+                db.insert_upload("agent-1", "image.png", 1, "", None)?;
                 for n in 2..=1500 {
-                    db.insert_upload("agent-1", &format!("image-{n}.png"), 1, "")?;
+                    db.insert_upload("agent-1", &format!("image-{n}.png"), 1, "", None)?;
                 }
                 // A case variant counts against the same name.
-                db.insert_upload("agent-1", "IMAGE-1600.PNG", 1, "")
+                db.insert_upload("agent-1", "IMAGE-1600.PNG", 1, "", None)
             })
             .await
             .expect("seed");
@@ -3441,7 +3517,7 @@ console.log("ok");
 
         // The plain case: the agent's copy is written from the private one.
         let (guard, sha) = reserved("a.txt", "one");
-        let upload = finish_upload(&db, "agent-1", "a.txt", guard, 3, &sha).expect("finish");
+        let upload = finish_upload(&db, "agent-1", "a.txt", guard, 3, &sha, None).expect("finish");
         assert_eq!(
             (upload.name.as_str(), upload.sha256.as_str()),
             ("a.txt", sha.as_str())
@@ -3452,9 +3528,10 @@ console.log("ok");
         );
 
         // A row holds the name but its files are gone: ours move on.
-        db.insert_upload("agent-1", "b.txt", 9, "").expect("row");
+        db.insert_upload("agent-1", "b.txt", 9, "", None)
+            .expect("row");
         let (guard, sha) = reserved("b.txt", "two");
-        let upload = finish_upload(&db, "agent-1", "b.txt", guard, 3, &sha).expect("finish");
+        let upload = finish_upload(&db, "agent-1", "b.txt", guard, 3, &sha, None).expect("finish");
         assert_eq!(upload.name, "b-2.txt");
         assert!(!agent.join("b.txt").exists() && !blobs.join("b.txt").exists());
         assert_eq!(
@@ -3469,12 +3546,12 @@ console.log("ok");
         // The insert fails outright — the agent was deleted meanwhile: both
         // files go, and there is no row.
         let (guard, sha) = reserved("c.txt", "three");
-        assert!(finish_upload(&db, "no-such-agent", "c.txt", guard, 5, &sha).is_err());
+        assert!(finish_upload(&db, "no-such-agent", "c.txt", guard, 5, &sha, None).is_err());
         assert!(!agent.join("c.txt").exists() && !blobs.join("c.txt").exists());
 
         // A private copy that does not match what was hashed is not spread.
         let (guard, _) = reserved("d.txt", "four");
-        assert!(finish_upload(&db, "agent-1", "d.txt", guard, 4, "0000").is_err());
+        assert!(finish_upload(&db, "agent-1", "d.txt", guard, 4, "0000", None).is_err());
         assert!(!agent.join("d.txt").exists() && !blobs.join("d.txt").exists());
 
         // Whatever is left: every row has both files and every file a row.
@@ -3496,6 +3573,142 @@ console.log("ok");
             assert_eq!(files, rows, "{}", folder.display());
         }
         assert_eq!(rows, vec!["a.txt", "b-2.txt"]);
+    }
+
+    /// A cancel that lands after the last byte cannot stop the commit, and
+    /// the page never learns the stored name — so it withdraws by its own id
+    /// for the upload. Only a pending upload is withdrawn; a bad id is refused.
+    #[tokio::test]
+    async fn a_late_cancel_withdraws_by_the_pages_own_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = upload_state(dir.path(), 50).await;
+        let post = |name: &'static str, client_id: &'static str| {
+            let state = state.clone();
+            async move {
+                let path = format!("/api/agents/agent-1/uploads?name={name}&client_id={client_id}");
+                call(&state, "POST", &path, b"bytes".to_vec()).await
+            }
+        };
+        let response = post("late.png", "c0ffee-1").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+        assert_eq!(json["client_id"], json!("c0ffee-1"));
+        let listed = call(
+            &state,
+            "GET",
+            "/api/agents/agent-1/uploads?pending=1",
+            vec![],
+        )
+        .await;
+        let listed: Value = serde_json::from_slice(&body_of(listed).await).expect("json");
+        assert_eq!(listed["uploads"][0]["client_id"], json!("c0ffee-1"));
+
+        let response = call(
+            &state,
+            "DELETE",
+            "/api/agents/agent-1/uploads?client_id=c0ffee-1",
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+        assert_eq!(json["withdrawn"], json!("late.png"));
+        assert!(
+            !dir.path()
+                .join("uploads")
+                .join("agent-1")
+                .join("late.png")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("blobs")
+                .join("agent-1")
+                .join("late.png")
+                .exists()
+        );
+
+        // Again, or for an id that never committed: nothing to do.
+        let response = call(
+            &state,
+            "DELETE",
+            "/api/agents/agent-1/uploads?client_id=c0ffee-1",
+            vec![],
+        )
+        .await;
+        let json: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+        assert_eq!(json["withdrawn"], Value::Null);
+
+        // A sent upload stays sent.
+        assert_eq!(post("sent.png", "c0ffee-2").await.status(), StatusCode::OK);
+        state
+            .sup
+            .db()
+            .run(|db| db.claim_uploads("agent-1", &["sent.png".to_string()]))
+            .await
+            .expect("send");
+        let response = call(
+            &state,
+            "DELETE",
+            "/api/agents/agent-1/uploads?client_id=c0ffee-2",
+            vec![],
+        )
+        .await;
+        let json: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+        assert_eq!(json["withdrawn"], Value::Null);
+        assert!(
+            dir.path()
+                .join("blobs")
+                .join("agent-1")
+                .join("sent.png")
+                .exists()
+        );
+
+        // An id outside the allowed shape is refused, and nothing is kept.
+        for bad in ["a%20b", "x%2F..", &"a".repeat(65)] {
+            let path = format!("/api/agents/agent-1/uploads?name=bad.png&client_id={bad}");
+            let response = call(&state, "POST", &path, b"bytes".to_vec()).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+            let path = format!("/api/agents/agent-1/uploads?client_id={bad}");
+            let response = call(&state, "DELETE", &path, vec![]).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert!(
+            !dir.path()
+                .join("uploads")
+                .join("agent-1")
+                .join("bad.png")
+                .exists()
+        );
+    }
+
+    /// The page withdraws a cancelled upload by its id, and keeps cancelled
+    /// ids out of every pending list it shows.
+    #[test]
+    fn the_page_withdraws_a_cancelled_upload_by_its_id() {
+        let js = std::str::from_utf8(&Assets::get("agent.js").expect("agent.js").data)
+            .expect("utf-8")
+            .to_string();
+        assert!(
+            js.contains("&client_id=${chip.clientId}"),
+            "uploads carry the id"
+        );
+        let abort = &js[js.find("xhr.onabort").expect("abort handler")..];
+        let abort = &abort[..abort.find("state.uploads.push(chip)").expect("end")];
+        assert!(
+            abort.contains("withdrawByClientId(chip.clientId)"),
+            "an abort withdraws"
+        );
+        assert!(
+            abort.contains("state.cancelled.add(chip.clientId)"),
+            "and remembers the id"
+        );
+        assert_eq!(
+            js.matches("?pending=1").count(),
+            1,
+            "every pending list goes through fetchPending, which drops cancelled ids"
+        );
+        assert!(js.contains("splitCancelled(data.uploads, state.cancelled)"));
     }
 
     /// A client that goes away mid-upload — the chip's ×, a dropped
@@ -3739,7 +3952,7 @@ console.log("ok");
             .collect();
         let source = format!(
             r#"
-import {{ awaitingConfirmation, composerState, confirmSent, frameTooLarge, MAX_SOCKET_MESSAGE, humanSize, markSending, mergePending, pastedFiles, reconcilePending, restoreDraft, settleSend, uploadsUrl }} from "{module}";
+import {{ awaitingConfirmation, composerState, confirmSent, frameTooLarge, MAX_SOCKET_MESSAGE, newClientId, splitCancelled, humanSize, markSending, mergePending, pastedFiles, reconcilePending, restoreDraft, settleSend, uploadsUrl }} from "{module}";
 const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
 
 {sizes}
@@ -3847,6 +4060,30 @@ assert(!frameTooLarge(frame("x".repeat(MAX_SOCKET_MESSAGE - 200))), "a long past
 assert(frameTooLarge(frame("x".repeat(MAX_SOCKET_MESSAGE))), "one over it is refused");
 assert(frameTooLarge(frame("é".repeat(MAX_SOCKET_MESSAGE / 2 + 1))), "measured in UTF-8 bytes");
 assert(frameTooLarge(frame("\n".repeat(MAX_SOCKET_MESSAGE / 2 + 1))), "and as escaped JSON");
+
+// Each upload gets an id the server will accept: 32 hex, never repeated.
+{{
+  const a = newClientId();
+  assert(/^[0-9a-f]{{32}}$/.test(a), "a client id is 32 hex: " + a);
+  assert(a !== newClientId(), "ids differ");
+}}
+
+// An upload cancelled here that committed anyway is withdrawn, not shown.
+{{
+  const pending = [
+    {{ name: "a.png", size: 1, client_id: "keep" }},
+    {{ name: "b.png", size: 1, client_id: "gone" }},
+    {{ name: "c.png", size: 1, client_id: null }},
+  ];
+  const {{ keep, withdraw }} = splitCancelled(pending, new Set(["gone", "never-seen"]));
+  assert(keep.map((u) => u.name).join() === "a.png,c.png", "kept: " + keep.map((u) => u.name));
+  assert(JSON.stringify(withdraw) === '["gone"]', "withdrawn: " + JSON.stringify(withdraw));
+  // And what is kept merges and reconciles as before.
+  const chips = reconcilePending([chip("done", "b.png")], keep);
+  assert(!chips.some((c) => c.name === "b.png"), "the cancelled one is not shown");
+  assert(mergePending([], keep).length === 2, "the rest come back");
+  assert(splitCancelled(undefined, new Set()).keep.length === 0, "no list, nothing to show");
+}}
 
 assert(uploadsUrl("a b") === "/api/agents/a%20b/uploads", uploadsUrl("a b"));
 assert(uploadsUrl("x", "r?é.png") === "/api/agents/x/uploads/r%3F%C3%A9.png", uploadsUrl("x", "r?é.png"));

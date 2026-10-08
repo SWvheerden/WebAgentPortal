@@ -169,6 +169,7 @@ CREATE TABLE uploads (
   fold       TEXT NOT NULL,                -- NFC + lowercase: how the filesystem compares it
   size       INTEGER NOT NULL,
   sha256     TEXT NOT NULL,                -- of the bytes uploaded; the agent's copy is checked
+  client_id  TEXT,                         -- the page's id for it; a late cancel withdraws by it
   created_at INTEGER NOT NULL,
   sent_at    INTEGER,                      -- NULL while pending in the composer
   PRIMARY KEY (agent_id, name),
@@ -1238,7 +1239,11 @@ text). Each uploads at once on its own XHR — `fetch` has no upload progress �
 else. Chips show progress and an × that aborts or withdraws. An aborted, dropped or stalled
 upload (no data for 60 s) leaves nothing: the guard that removes its partial files is created in
 the same blocking task that reserves the name, so it exists even if the client goes away
-before the first byte. Send stays grey until every
+before the first byte. Each upload carries the page's own random id (`client_id`). A cancel
+that lands after the last byte cannot stop the commit, and the page never learned the stored
+name, so it withdraws by that id (`DELETE /api/agents/:id/uploads?client_id=`) and remembers
+it: an upload with a cancelled id that turns up in a pending list later is withdrawn rather than
+shown again as ready to send. Send stays grey until every
 upload has finished; a stopped agent still takes uploads, which wait as pending for Resume, and
 a reload puts pending ones back (`?pending=1`).
 
@@ -1270,7 +1275,10 @@ There is no total quota yet.
 first, so it can read what it is given. Before every launch, dot-entries in that folder are
 removed (links as links) and announced: names we store never start with a dot, and a `.claude/`
 or `.mcp.json` in a folder the CLI is handed is configuration it may read. Other files the agent
-saved there are left alone; an agent already running when this shipped may see
+saved there are left alone. The sweep carries on past an entry it cannot remove; if any
+remain, the folder is not handed to that launch, a notice names them, and every message with
+attachments is refused for as long as that launch lasts — the trailer would name paths the
+agent cannot read; an agent already running when this shipped may see
 permission prompts for it until it is restarted. `send_message` (socket or REST) carries
 `attachments: [name]` — at most 32 distinct names, duplicates collapsed; the server claims them in one transaction — every name must be one of
 the agent's pending rows, all are marked sent or none are, so two tabs sending the same file or
@@ -1312,7 +1320,10 @@ a regular file — with a single link, for the agent's copies. Files are created
 `create_new`, which fails rather than follow anything at the name. Downloads are always
 `Content-Disposition: attachment` with `nosniff`, and need the credential header like every
 other `/api` route (the page fetches them as a blob). Withdrawing removes both copies; delete
-removes both folders and the rows for every kind of agent without following links, and the
+removes both folders and the rows for every kind of agent without following links — the private
+copies first, which the agent cannot have made hard to remove, and both always attempted. A
+read-only folder the agent left (a Go module cache is 0555) does not stop it: on a first
+failure every real folder in the tree is made `u+rwx`, links untouched, and the removal retried; and the
 delete report carries an informational note that never makes a delete unsafe — "3 uploaded
 files (2.0 MB) and 2 other files the agent saved there (1.0 MB) will be deleted", counting what
 the agent left in its folder too. The dashboard fetches `delete_preview` so every delete

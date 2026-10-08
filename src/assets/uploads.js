@@ -15,6 +15,28 @@ export function humanSize(bytes) {
   return `${value.toFixed(1)} ${units[unit]}`;
 }
 
+/// A random id for one upload, sent with it so a cancel can find it later.
+/// `getRandomValues` rather than `randomUUID`: the latter needs a secure
+/// context, and a phone reaches the portal over plain http on the tailnet.
+export function newClientId() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/// Split the server's pending list into what the composer should show and the
+/// client ids of uploads this page cancelled — ones whose cancel came after
+/// their last byte, so they committed anyway. Those are withdrawn, not shown.
+export function splitCancelled(pending, cancelled) {
+  const keep = [];
+  const withdraw = [];
+  for (const upload of pending || []) {
+    if (upload.client_id && cancelled.has(upload.client_id)) withdraw.push(upload.client_id);
+    else keep.push(upload);
+  }
+  return { keep, withdraw };
+}
+
 /// Where an agent's uploads live on the API. The name is a path segment, so
 /// it is encoded; the server refuses anything it would not have stored.
 export function uploadsUrl(agentId, name) {

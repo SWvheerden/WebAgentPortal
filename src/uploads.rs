@@ -374,32 +374,48 @@ pub fn restore_copy(
     written
 }
 
-/// Remove every dot-entry from an agent's upload folder, returning their names.
+/// What [`sweep_dot_entries`] did: the dot-entries it removed, and any it
+/// could not.
+#[derive(Debug, Default, PartialEq)]
+pub struct Sweep {
+    pub removed: Vec<String>,
+    pub remaining: Vec<String>,
+}
+
+/// Remove every dot-entry from an agent's upload folder.
 ///
 /// [`clean_name`] never produces a leading dot, so one is something the agent
 /// (or something it ran) put there — and a `.claude/` or `.mcp.json` in a
 /// folder the CLI is handed with `--add-dir` is configuration it may read.
 /// Called before every launch. Links are removed as links, folders without
-/// following anything inside; other files are left alone, since an agent may
-/// legitimately save its own work here.
-pub fn sweep_dot_entries(dir: &Path) -> Result<Vec<String>> {
+/// following anything inside (read-only ones included, see [`wipe_dir`]);
+/// other files are left alone, since an agent may legitimately save its own
+/// work here. One that cannot be removed does not stop the rest: it is
+/// reported in `remaining`, and the caller decides what that means.
+pub fn sweep_dot_entries(dir: &Path) -> Result<Sweep> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Sweep::default()),
         Err(err) => return Err(err).with_context(|| format!("reading {}", dir.display())),
     };
-    let mut removed = Vec::new();
+    let mut sweep = Sweep::default();
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.starts_with('.') {
             continue;
         }
-        wipe_dir(&entry.path())?;
-        removed.push(name);
+        match wipe_dir(&entry.path()) {
+            Ok(()) => sweep.removed.push(name),
+            Err(err) => {
+                tracing::warn!(?err, entry = %name, "could not remove a dot-entry from an upload folder");
+                sweep.remaining.push(name);
+            }
+        }
     }
-    removed.sort();
-    Ok(removed)
+    sweep.removed.sort();
+    sweep.remaining.sort();
+    Ok(sweep)
 }
 
 /// Files in an agent's upload folder that are not uploads — what the agent
@@ -429,14 +445,44 @@ pub fn other_files(dir: &Path, uploads: &HashSet<String>) -> (u64, u64) {
 /// Remove an agent's whole upload folder (or any one entry). A missing one is
 /// fine. A symlink where the folder should be is removed as a link;
 /// `remove_dir_all` itself never follows the links inside.
+///
+/// The agent can leave folders it cannot be cleaned out of as they are — a
+/// `chmod -w`, or a Go module cache, which is 0555 by design. If the first
+/// attempt fails, every real folder in the tree (links are not followed) is
+/// made `u+rwx` and the removal is tried once more.
 pub fn wipe_dir(dir: &Path) -> Result<()> {
     match std::fs::symlink_metadata(dir) {
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("inspecting {}", dir.display())),
         Ok(meta) if meta.file_type().is_dir() => {
+            if std::fs::remove_dir_all(dir).is_ok() {
+                return Ok(());
+            }
+            make_owner_writable(dir);
             std::fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))
         }
         Ok(_) => std::fs::remove_file(dir).with_context(|| format!("removing {}", dir.display())),
+    }
+}
+
+/// Give the owner full access to `dir` and every real folder under it, so
+/// their contents can be removed. Symlinks are never followed: each entry is
+/// checked with `symlink_metadata` before anything is done to it. Best
+/// effort — whatever still fails shows up in the removal that follows.
+fn make_owner_writable(dir: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !meta.file_type().is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode() | 0o700;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).ok();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        make_owner_writable(&entry.path());
     }
 }
 
@@ -875,17 +921,17 @@ mod tests {
         std::fs::write(agent.join("report.pdf"), "upload").expect("write");
         std::fs::write(agent.join("notes.md"), "the agent's own").expect("write");
 
-        let removed = sweep_dot_entries(&agent).expect("sweep");
-        assert_eq!(removed, vec![".claude", ".linked", ".mcp.json"]);
+        let swept = sweep_dot_entries(&agent).expect("sweep");
+        assert_eq!(swept.removed, vec![".claude", ".linked", ".mcp.json"]);
+        assert!(swept.remaining.is_empty());
         assert!(agent.join("report.pdf").exists() && agent.join("notes.md").exists());
         assert!(
             outside.join("keep.json").exists(),
             "links are removed, not followed"
         );
-        assert!(
-            sweep_dot_entries(&dir.path().join("never-made"))
-                .expect("missing")
-                .is_empty()
+        assert_eq!(
+            sweep_dot_entries(&dir.path().join("never-made")).expect("missing"),
+            Sweep::default()
         );
 
         let known: HashSet<String> = ["report.pdf".to_string()].into();
@@ -915,6 +961,71 @@ mod tests {
         let swapped = dir.path().join("swapped");
         std::os::unix::fs::symlink(&other, &swapped).expect("symlink");
         assert!(open_hardened(&swapped, "plain.txt", false).is_err());
+    }
+
+    /// Read-only folders the agent left — a Go module cache is 0555 — are
+    /// made writable and removed; a link inside never has its target touched.
+    #[test]
+    fn the_wipe_gets_through_read_only_folders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).expect("mkdir");
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let agent = dir.path().join("agent");
+        let deep = agent.join("cache").join("mod").join("pkg");
+        std::fs::create_dir_all(&deep).expect("mkdir");
+        std::fs::write(deep.join("go.mod"), "module x").expect("write");
+        std::os::unix::fs::symlink(&outside, agent.join("cache").join("escape")).expect("symlink");
+        for d in [
+            &deep,
+            &agent.join("cache").join("mod"),
+            &agent.join("cache"),
+        ] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        }
+
+        wipe_dir(&agent).expect("wipe");
+        assert!(!agent.exists());
+        let mode = std::fs::metadata(&outside)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o555, "a link's target is never chmodded");
+
+        // The sweep gets through them too.
+        let agent = dir.path().join("agent2");
+        std::fs::create_dir_all(agent.join(".claude").join("inner")).expect("mkdir");
+        std::fs::write(agent.join(".claude").join("inner").join("x"), "x").expect("write");
+        for d in [agent.join(".claude").join("inner"), agent.join(".claude")] {
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        }
+        let swept = sweep_dot_entries(&agent).expect("sweep");
+        assert_eq!(swept.removed, vec![".claude"]);
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).ok();
+    }
+
+    /// An entry that cannot be removed does not stop the sweep; it is
+    /// reported for the caller to act on.
+    #[test]
+    fn the_sweep_reports_what_it_could_not_remove() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = dir.path().join("agent");
+        std::fs::create_dir(&agent).expect("mkdir");
+        std::fs::write(agent.join(".a"), "").expect("write");
+        std::fs::write(agent.join(".z"), "").expect("write");
+        std::fs::write(agent.join("keep.txt"), "").expect("write");
+        // The folder itself read-only: nothing in it can be unlinked, and the
+        // sweep does not loosen the folder it is sweeping.
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let swept = sweep_dot_entries(&agent).expect("sweep");
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(swept.removed.is_empty());
+        assert_eq!(
+            swept.remaining,
+            vec![".a", ".z"],
+            "every one is tried and reported"
+        );
     }
 
     #[test]

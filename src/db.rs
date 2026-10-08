@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS uploads (
   fold       TEXT NOT NULL,
   size       INTEGER NOT NULL,
   sha256     TEXT NOT NULL,
+  -- The page's own id for the upload, so a cancel that raced the upload's
+  -- commit can still find and withdraw it.
+  client_id  TEXT,
   created_at INTEGER NOT NULL,
   sent_at    INTEGER,
   PRIMARY KEY (agent_id, name),
@@ -212,6 +215,8 @@ pub struct Upload {
     /// Of the bytes uploaded: what the agent's copy is checked against before
     /// a message names it.
     pub sha256: String,
+    /// The id the page gave the upload, if it gave one.
+    pub client_id: Option<String>,
     pub created_at: i64,
     pub sent_at: Option<i64>,
 }
@@ -768,24 +773,28 @@ impl Db {
         name: &str,
         size: u64,
         sha256: &str,
+        client_id: Option<&str>,
     ) -> Result<Option<Upload>> {
         let upload = Upload {
             name: name.to_string(),
             size,
             sha256: sha256.to_string(),
+            client_id: client_id.map(str::to_string),
             created_at: now_ms(),
             sent_at: None,
         };
         let inserted = self.with_conn(|conn| {
             Ok(conn.execute(
-                "INSERT OR IGNORE INTO uploads (agent_id, name, fold, size, sha256, created_at, sent_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                "INSERT OR IGNORE INTO uploads
+                   (agent_id, name, fold, size, sha256, client_id, created_at, sent_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
                 params![
                     agent_id,
                     upload.name,
                     crate::uploads::fold_key(&upload.name),
                     upload.size as i64,
                     upload.sha256,
+                    upload.client_id,
                     upload.created_at
                 ],
             )?)
@@ -806,7 +815,7 @@ impl Db {
     pub fn list_uploads(&self, agent_id: &str, pending: bool) -> Result<Vec<Upload>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT name, size, sha256, created_at, sent_at FROM uploads
+                "SELECT name, size, sha256, client_id, created_at, sent_at FROM uploads
                  WHERE agent_id = ?1 AND (?2 = 0 OR sent_at IS NULL)
                  ORDER BY created_at, name",
             )?;
@@ -818,11 +827,28 @@ impl Db {
     pub fn get_upload(&self, agent_id: &str, name: &str) -> Result<Option<Upload>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT name, size, sha256, created_at, sent_at FROM uploads
+                "SELECT name, size, sha256, client_id, created_at, sent_at FROM uploads
                  WHERE agent_id = ?1 AND name = ?2",
             )?;
             Ok(stmt
                 .query_row(params![agent_id, name], row_to_upload)
+                .optional()?)
+        })
+    }
+
+    /// The pending upload the page knows by `client_id`, if it has committed.
+    pub fn pending_upload_by_client_id(
+        &self,
+        agent_id: &str,
+        client_id: &str,
+    ) -> Result<Option<Upload>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name, size, sha256, client_id, created_at, sent_at FROM uploads
+                 WHERE agent_id = ?1 AND client_id = ?2 AND sent_at IS NULL",
+            )?;
+            Ok(stmt
+                .query_row(params![agent_id, client_id], row_to_upload)
                 .optional()?)
         })
     }
@@ -870,7 +896,7 @@ impl Db {
                     return Err(anyhow!("{name} is not one of this agent's uploads"));
                 }
                 claimed.push(tx.query_row(
-                    "SELECT name, size, sha256, created_at, sent_at FROM uploads
+                    "SELECT name, size, sha256, client_id, created_at, sent_at FROM uploads
                      WHERE agent_id = ?1 AND name = ?2",
                     params![agent_id, name],
                     row_to_upload,
@@ -914,8 +940,9 @@ fn row_to_upload(row: &rusqlite::Row<'_>) -> rusqlite::Result<Upload> {
         name: row.get(0)?,
         size: row.get::<_, i64>(1)? as u64,
         sha256: row.get(2)?,
-        created_at: row.get(3)?,
-        sent_at: row.get(4)?,
+        client_id: row.get(3)?,
+        created_at: row.get(4)?,
+        sent_at: row.get(5)?,
     })
 }
 
@@ -1285,8 +1312,10 @@ mod tests {
     fn claiming_uploads_is_atomic_and_exclusive() {
         let db = Db::open_in_memory().expect("db");
         db.insert_agent(&sample_agent("a", "a")).expect("insert");
-        db.insert_upload("a", "one.txt", 1, "").expect("upload");
-        db.insert_upload("a", "two.txt", 2, "").expect("upload");
+        db.insert_upload("a", "one.txt", 1, "", None)
+            .expect("upload");
+        db.insert_upload("a", "two.txt", 2, "", None)
+            .expect("upload");
         let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
 
         // One bad name claims nothing, including the good one before it.
@@ -1324,9 +1353,12 @@ mod tests {
         let db = Db::open_in_memory().expect("db");
         db.insert_agent(&sample_agent("a", "a")).expect("insert");
         db.insert_agent(&sample_agent("b", "b")).expect("insert");
-        db.insert_upload("a", "one.txt", 10, "").expect("upload");
-        db.insert_upload("a", "two.png", 2048, "").expect("upload");
-        db.insert_upload("b", "other.txt", 5, "").expect("upload");
+        db.insert_upload("a", "one.txt", 10, "", None)
+            .expect("upload");
+        db.insert_upload("a", "two.png", 2048, "", None)
+            .expect("upload");
+        db.insert_upload("b", "other.txt", 5, "", None)
+            .expect("upload");
 
         let pending = db.list_uploads("a", true).expect("list");
         assert_eq!(pending.len(), 2);
@@ -1337,17 +1369,17 @@ mod tests {
         // The name is never handed out again, sent or not — nor any spelling
         // the filesystem would take for the same file.
         assert!(
-            db.insert_upload("a", "ONE.txt", 99, "")
+            db.insert_upload("a", "ONE.txt", 99, "", None)
                 .expect("insert")
                 .is_none()
         );
         assert!(
-            db.insert_upload("a", "one.txt", 99, "")
+            db.insert_upload("a", "one.txt", 99, "", None)
                 .expect("insert")
                 .is_none()
         );
         assert!(
-            db.insert_upload("a", "two.png", 99, "")
+            db.insert_upload("a", "two.png", 99, "", None)
                 .expect("insert")
                 .is_none()
         );

@@ -2,7 +2,7 @@
 import { announceAttention, releaseAttention, api, applyTextSize, el, needToken, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast, token, trackStatus, trackSnapshot } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 import { newKeys } from '/assets/attention.js';
-import { awaitingConfirmation, composerState, frameTooLarge, confirmSent, humanSize, markSending, mergePending, pastedFiles, restoreDraft, settleSend, uploadsUrl } from '/assets/uploads.js';
+import { awaitingConfirmation, composerState, frameTooLarge, newClientId, splitCancelled, confirmSent, humanSize, markSending, mergePending, pastedFiles, restoreDraft, settleSend, uploadsUrl } from '/assets/uploads.js';
 import { clampSideWidth, keyedSideWidth, loadSideWidth, saveSideWidth, sideWidthBounds } from '/assets/splitter.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
@@ -34,6 +34,9 @@ const state = {
   sentText: null,
   /// The fallback that settles a send whose confirmation never came.
   sendTimer: null,
+  /// Client ids of uploads cancelled here. One cancelled after its last byte
+  /// may still commit; if it turns up as pending it is withdrawn, not shown.
+  cancelled: new Set(),
 };
 
 /// How long a send with attachments may go unconfirmed before the page asks
@@ -834,10 +837,10 @@ function renderUploads() {
 function uploadFiles(files) {
   if (!state.agent) return;
   for (const file of files) {
-    const chip = { label: file.name || 'upload', name: null, size: file.size, loaded: 0, status: 'uploading', xhr: null };
+    const chip = { label: file.name || 'upload', name: null, size: file.size, loaded: 0, status: 'uploading', xhr: null, clientId: newClientId() };
     const xhr = new XMLHttpRequest();
     chip.xhr = xhr;
-    xhr.open('POST', `${uploadsUrl(state.agent.id)}?name=${encodeURIComponent(chip.label)}`);
+    xhr.open('POST', `${uploadsUrl(state.agent.id)}?name=${encodeURIComponent(chip.label)}&client_id=${chip.clientId}`);
     xhr.setRequestHeader('x-claude-web-token', token);
     xhr.setRequestHeader('content-type', 'application/octet-stream');
     xhr.upload.onprogress = (event) => {
@@ -874,6 +877,10 @@ function uploadFiles(files) {
       chip.xhr = null;
       state.uploads = state.uploads.filter((c) => c !== chip);
       renderUploads();
+      // The server may already have every byte and commit it anyway: ask for
+      // it back by our id, and remember the id in case it commits later.
+      state.cancelled.add(chip.clientId);
+      withdrawByClientId(chip.clientId);
     };
     state.uploads.push(chip);
     xhr.send(file);
@@ -906,10 +913,10 @@ async function reconcileAfterSend(refused) {
   if (!awaitingConfirmation(state.uploads)) return;
   clearTimeout(state.sendTimer);
   state.sendTimer = null;
-  const data = await api(`${uploadsUrl(state.agent.id)}?pending=1`);
+  const pending = await fetchPending();
   // Confirmed while the list was being fetched: nothing left to settle.
   if (!awaitingConfirmation(state.uploads)) return;
-  const settled = settleSend(state.uploads, data.uploads, refused);
+  const settled = settleSend(state.uploads, pending, refused);
   state.uploads = settled.chips;
   if (settled.restoreText) {
     const input = $('input');
@@ -919,9 +926,22 @@ async function reconcileAfterSend(refused) {
   renderUploads();
 }
 
-async function restoreUploads() {
+function withdrawByClientId(clientId) {
+  api(`${uploadsUrl(state.agent.id)}?client_id=${clientId}`, { method: 'DELETE' }).catch(() => {});
+}
+
+/// The server's pending uploads, less any this page cancelled — those are
+/// withdrawn instead of being shown again as ready to send.
+async function fetchPending() {
   const data = await api(`${uploadsUrl(state.agent.id)}?pending=1`);
-  state.uploads = mergePending(state.uploads, data.uploads);
+  const { keep, withdraw } = splitCancelled(data.uploads, state.cancelled);
+  for (const clientId of withdraw) withdrawByClientId(clientId);
+  return keep;
+}
+
+async function restoreUploads() {
+  const pending = await fetchPending();
+  state.uploads = mergePending(state.uploads, pending);
   renderUploads();
 }
 
