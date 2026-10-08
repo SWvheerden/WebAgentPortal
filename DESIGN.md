@@ -1231,7 +1231,8 @@ The composer takes files from the 📎 button, a drop anywhere on the conversati
 (a screenshot, or a file copied in a file manager; rich text with `text/html` still pastes as
 text). Each uploads at once on its own XHR — `fetch` has no upload progress — as a raw body to
 `POST /api/agents/:id/uploads?name=`, so it works from a phone over the tailnet like everything
-else. Chips show progress and an × that aborts or withdraws. Send stays grey until every
+else. Chips show progress and an × that aborts or withdraws; an aborted or dropped upload's partial
+file is removed by a guard that runs when the handler is dropped. Send stays grey until every
 upload has finished; a stopped agent still takes uploads, which wait as pending for Resume, and
 a reload puts pending ones back (`?pending=1`).
 
@@ -1245,8 +1246,12 @@ There is no total quota yet.
 **Delivery.** The agent is launched and resumed with `--add-dir` on its folder, which is created
 first, so it can read what it is given; an agent already running when this shipped may see
 permission prompts for it until it is restarted. `send_message` (socket or REST) carries
-`attachments: [name]`; the server checks each against the agent's pending rows — a client
-never supplies a path — marks them sent, and the CLI receives
+`attachments: [name]`; the server claims them in one transaction — every name must be one of
+the agent's pending rows, all are marked sent or none are, so two tabs sending the same file or
+a withdraw racing a send cannot both win, and a client never supplies a path. A send that then
+fails to reach the agent hands them back to pending. The page keeps the chips as "sending"
+until the agent's own user event confirms them, and on an error notice re-fetches what is still
+pending. The CLI receives
 
 ```
 <text>

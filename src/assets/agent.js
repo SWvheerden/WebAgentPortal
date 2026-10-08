@@ -2,7 +2,7 @@
 import { announceAttention, releaseAttention, api, applyTextSize, el, needToken, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast, token, trackStatus, trackSnapshot } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 import { newKeys } from '/assets/attention.js';
-import { composerState, humanSize, pastedFiles, uploadsUrl } from '/assets/uploads.js';
+import { composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, rejectSending, uploadsUrl } from '/assets/uploads.js';
 import { clampSideWidth, keyedSideWidth, loadSideWidth, saveSideWidth, sideWidthBounds } from '/assets/splitter.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
@@ -295,6 +295,15 @@ function appendEvents(events) {
   const fresh = state.transcript.accept(events);
   if (!fresh.length) return;
   for (const event of fresh) {
+    // Our own message coming back is the server's word that its attachments
+    // went: their `sending` chips can go.
+    const sent = event.kind === 'user' && Array.isArray(event.payload?.attachments)
+      ? event.payload.attachments.map((a) => a.name)
+      : [];
+    if (sent.length) {
+      state.uploads = confirmSent(state.uploads, sent);
+      renderUploads();
+    }
     const node = renderEvent(event);
     if (!node) continue;
     node.dataset.seq = event.seq;
@@ -786,11 +795,14 @@ function renderUploads() {
       detail = `${pct}%`;
     } else if (chip.status === 'failed') {
       detail = 'failed';
+    } else if (chip.status === 'sending') {
+      detail = 'sending…';
     }
     return el('span', { class: `chip ${chip.status}` }, [
       el('span', { class: 'chip-name', text: `📎 ${label}` }),
       el('span', { class: 'muted', text: detail }),
-      el('button', {
+      // Nothing to withdraw while a send is deciding its fate.
+      chip.status === 'sending' ? null : el('button', {
         class: 'small',
         text: '×',
         title: chip.status === 'uploading' ? 'Cancel this upload' : 'Remove this attachment',
@@ -870,11 +882,7 @@ async function removeUpload(chip) {
 /// device.
 async function restoreUploads() {
   const data = await api(`${uploadsUrl(state.agent.id)}?pending=1`);
-  const known = new Set(state.uploads.map((c) => c.name));
-  for (const upload of data.uploads || []) {
-    if (known.has(upload.name)) continue;
-    state.uploads.push({ label: upload.name, name: upload.name, size: upload.size, loaded: upload.size, status: 'done', xhr: null });
-  }
+  state.uploads = mergePending(state.uploads, data.uploads);
   renderUploads();
 }
 
@@ -981,9 +989,9 @@ function send() {
     renderQueued();
   }
   input.value = '';
-  // Sent ones are the server's record now; a failed chip is dropped with them,
-  // its error already shown.
-  state.uploads = state.uploads.filter((c) => c.status === 'uploading');
+  // Sent ones wait as `sending` until the server confirms or refuses them; a
+  // failed chip is dropped, its error already shown.
+  state.uploads = markSending(state.uploads.filter((c) => c.status !== 'failed'));
   renderUploads();
   updateAutocomplete();
 }
@@ -1312,7 +1320,17 @@ async function main() {
       const still = Array.isArray(msg.still_queued) ? msg.still_queued.length : 0;
       toast(`Turn interrupted. ${still} message(s) still queued.`, 'warn');
     })
-    .on('notice', (msg) => toast(msg.text, msg.level))
+    .on('notice', (msg) => {
+      toast(msg.text, msg.level);
+      // A refused send: its files may never have gone. Put back whatever the
+      // server still holds as pending, so the next message can carry them.
+      if (msg.agent_id === state.agent.id && msg.level === 'error'
+        && state.uploads.some((c) => c.status === 'sending')) {
+        state.uploads = rejectSending(state.uploads);
+        renderUploads();
+        restoreUploads().catch((err) => toast(err.message, 'error'));
+      }
+    })
     .on('agent_removed', (msg) => {
       if (msg.agent_id === state.agent.id) location.href = '/';
     });

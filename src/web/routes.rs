@@ -1006,7 +1006,13 @@ async fn upload_file(
     .await
     .map_err(ApiError::bad_request)?
     .map_err(ApiError::from)?;
-    let path = dir.join(&name);
+    // Removes the file unless the upload completes. The handler future is
+    // simply dropped when the client aborts or the connection goes, so the
+    // cleanup has to live in a destructor, not after an `.await`.
+    let mut partial = PartialUpload {
+        path: dir.join(&name),
+        keep: false,
+    };
 
     let mut file = tokio::fs::File::from_std(file);
     let mut stream = body.into_data_stream();
@@ -1039,7 +1045,6 @@ async fn upload_file(
     }
     drop(file);
     if let Some(err) = failure {
-        tokio::fs::remove_file(&path).await.ok();
         return Err(err);
     }
 
@@ -1050,14 +1055,25 @@ async fn upload_file(
         .db()
         .run(move |db| db.insert_upload(&agent_id, &stored, size))
         .await;
-    let upload = match upload {
-        Ok(upload) => upload,
-        Err(err) => {
-            tokio::fs::remove_file(&path).await.ok();
-            return Err(ApiError::from(err));
-        }
-    };
+    let upload = upload.map_err(ApiError::from)?;
+    partial.keep = true;
     Ok(Json(upload_json(&state, &record.id, &upload)))
+}
+
+/// An upload file that is deleted when dropped, unless `keep` was set once
+/// its row was recorded. Without it an aborted upload leaves a file with no
+/// row: invisible, undeletable, and holding its name.
+struct PartialUpload {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+
+impl Drop for PartialUpload {
+    fn drop(&mut self) {
+        if !self.keep {
+            std::fs::remove_file(&self.path).ok();
+        }
+    }
 }
 
 /// `GET /api/agents/{id}/uploads[?pending=1]`. With `pending`, only what is
@@ -2943,7 +2959,7 @@ console.log("ok");
         state
             .sup
             .db()
-            .run(|db| db.mark_uploads_sent("agent-1", &["my-shot.png".to_string()]))
+            .run(|db| db.claim_uploads("agent-1", &["my-shot.png".to_string()]))
             .await
             .expect("mark");
         let response = call(
@@ -3053,6 +3069,54 @@ console.log("ok");
             big.len().to_string().as_str()
         );
         assert_eq!(body_of(response).await, big);
+    }
+
+    /// A client that goes away mid-upload — the chip's ×, a dropped
+    /// connection — drops the handler at an `.await`. The half-written file
+    /// must go with it, not linger with no row holding its name.
+    #[tokio::test]
+    async fn an_abandoned_upload_leaves_no_file_behind() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = upload_state(dir.path(), 50).await;
+
+        // One chunk, then a signal that the handler is waiting on the next,
+        // then silence for ever.
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+        let body =
+            futures_util::stream::unfold((0, Some(reached_tx)), |(step, mut reached)| async move {
+                if step == 0 {
+                    return Some((Ok::<_, std::io::Error>(vec![1u8; 1024]), (1, reached)));
+                }
+                if let Some(tx) = reached.take() {
+                    tx.send(()).ok();
+                }
+                futures_util::future::pending::<()>().await;
+                None
+            });
+        let mut request = api_request("/api/agents/agent-1/uploads?name=half.bin")
+            .method("POST")
+            .header(TOKEN_HEADER, TEST_TOKEN)
+            .body(axum::body::Body::from_stream(body))
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(
+            LOOPBACK_PEER.parse::<SocketAddr>().expect("peer"),
+        ));
+        let task = tokio::spawn(router(state.clone()).oneshot(request));
+        reached_rx.await.expect("the handler reads the body");
+        let file = dir.path().join("agent-1").join("half.bin");
+        assert!(file.exists(), "the upload is under way");
+
+        task.abort();
+        assert!(task.await.expect_err("aborted").is_cancelled());
+        assert!(!file.exists(), "an abandoned upload is removed");
+        let totals = state
+            .sup
+            .db()
+            .run(|db| db.upload_totals("agent-1"))
+            .await
+            .expect("totals");
+        assert_eq!(totals, (0, 0));
     }
 
     /// Over the cap is refused, whether the client says so up front or not,
@@ -3190,7 +3254,7 @@ console.log("ok");
             .collect();
         let source = format!(
             r#"
-import {{ composerState, humanSize, pastedFiles, uploadsUrl }} from "{module}";
+import {{ composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, rejectSending, uploadsUrl }} from "{module}";
 const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
 
 {sizes}
@@ -3217,6 +3281,30 @@ assert(pastedFiles(["Files"], [png]).length === 1, "a screenshot uploads");
 assert(pastedFiles(["text/plain", "Files"], [png]).length === 1, "a copied file uploads");
 assert(pastedFiles(["text/plain", "text/html", "Files"], [png]).length === 0, "rich text pastes as text");
 assert(pastedFiles(["text/plain"], []).length === 0, "plain text pastes as text");
+
+// After Send, chips wait as `sending` until the server answers.
+{{
+  const inFlight = chip("uploading", null);
+  let chips = markSending([chip("done", "a.png"), chip("done", "b.txt"), inFlight]);
+  assert(chips.filter((c) => c.status === "sending").length === 2, "finished chips become sending");
+  assert(chips[2] === inFlight, "an upload in flight is left alone, same object");
+  s = composerState({{ running: true, text: "", chips }});
+  assert(s.attachments.length === 0, "a sending chip is never attached twice");
+  assert(!s.blocked || chips.some((c) => c.status === "uploading"), "sending alone does not block");
+
+  // Confirmation removes exactly what the event carried.
+  const confirmed = confirmSent(chips, ["a.png"]);
+  assert(confirmed.map((c) => c.name).join() === "b.txt,", "only the confirmed chip goes: " + confirmed.map((c) => c.name));
+
+  // A refusal drops the sending chips and the server's pending list brings
+  // back whichever were not sent.
+  chips = rejectSending(confirmed);
+  assert(chips.length === 1 && chips[0] === inFlight, "sending chips are dropped on refusal");
+  chips = mergePending(chips, [{{ name: "b.txt", size: 3 }}]);
+  assert(chips.length === 2 && chips[1].name === "b.txt" && chips[1].status === "done", "pending ones come back");
+  chips = mergePending(chips, [{{ name: "b.txt", size: 3 }}]);
+  assert(chips.length === 2, "a chip already shown is not added twice");
+}}
 
 assert(uploadsUrl("a b") === "/api/agents/a%20b/uploads", uploadsUrl("a b"));
 assert(uploadsUrl("x", "r?é.png") === "/api/agents/x/uploads/r%3F%C3%A9.png", uploadsUrl("x", "r?é.png"));

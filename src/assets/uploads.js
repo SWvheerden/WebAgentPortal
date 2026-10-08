@@ -57,3 +57,37 @@ export function pastedFiles(types, files) {
   if (Array.from(types || []).includes('text/html')) return [];
   return list;
 }
+
+// -- after Send ---------------------------------------------------------------
+//
+// A sent chip stays on screen as `sending` until the server answers: the
+// agent's own user event carrying it confirms it, and an error notice means
+// the server refused — it may not have been sent at all, so whatever is still
+// pending is fetched back rather than silently dropped from the next message.
+
+/// The finished chips a message carries become `sending`. Uploads in flight
+/// are left alone (Send is blocked while there are any).
+export function markSending(chips) {
+  return chips.map((c) => (c.status === 'done' ? { ...c, status: 'sending' } : c));
+}
+
+/// A user event arrived carrying `names`: those chips are the server's now.
+export function confirmSent(chips, names) {
+  const sent = new Set(names);
+  return chips.filter((c) => !(c.status === 'sending' && sent.has(c.name)));
+}
+
+/// The server refused a send: drop the `sending` chips, ready for
+/// `mergePending` to put back whichever are still pending.
+export function rejectSending(chips) {
+  return chips.filter((c) => c.status !== 'sending');
+}
+
+/// Add the server's pending uploads that the composer does not already show.
+export function mergePending(chips, pending) {
+  const known = new Set(chips.map((c) => c.name).filter(Boolean));
+  const added = (pending || [])
+    .filter((u) => !known.has(u.name))
+    .map((u) => ({ label: u.name, name: u.name, size: u.size, loaded: u.size, status: 'done', xhr: null }));
+  return [...chips, ...added];
+}

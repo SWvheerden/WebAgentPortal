@@ -1065,40 +1065,45 @@ impl Supervisor {
                 names.push(name.clone());
             }
         }
-        let mut files = Vec::with_capacity(names.len());
-        let dir = self.uploads_dir(id);
-        for name in &names {
+        // Claimed before anything is sent, all or none: a second tab sending
+        // the same file, or a withdraw racing this send, loses here rather
+        // than leaving a trailer that names a file that is gone.
+        let claimed = if names.is_empty() {
+            Vec::new()
+        } else {
             let agent_id = id.to_string();
-            let key = name.clone();
-            let row = self
-                .db
-                .run(move |db| db.get_upload(&agent_id, &key))
-                .await?;
-            match row {
-                Some(row) if row.sent_at.is_none() => files.push(Attachment {
-                    path: dir.join(&row.name).to_string_lossy().to_string(),
-                    name: row.name,
-                    size: row.size,
-                }),
-                Some(_) => bail!("{name} has already been sent"),
-                None => bail!("{name} is not one of this agent's uploads"),
-            }
-        }
-        self.command(
-            id,
-            AgentCommand::Send {
-                text: text.to_string(),
-                attachments: files,
-            },
-        )
-        .await?;
-        if !names.is_empty() {
+            let to_claim = names.clone();
+            self.db
+                .run(move |db| db.claim_uploads(&agent_id, &to_claim))
+                .await?
+        };
+        let dir = self.uploads_dir(id);
+        let files = claimed
+            .into_iter()
+            .map(|row| Attachment {
+                path: dir.join(&row.name).to_string_lossy().to_string(),
+                name: row.name,
+                size: row.size,
+            })
+            .collect();
+        let sent = self
+            .command(
+                id,
+                AgentCommand::Send {
+                    text: text.to_string(),
+                    attachments: files,
+                },
+            )
+            .await;
+        if sent.is_err() && !names.is_empty() {
+            // Never reached the agent: back to pending, for the next send.
             let agent_id = id.to_string();
             self.db
-                .run(move |db| db.mark_uploads_sent(&agent_id, &names))
-                .await?;
+                .run(move |db| db.release_uploads(&agent_id, &names))
+                .await
+                .ok();
         }
-        Ok(())
+        sent
     }
 
     /// Answer a prompt the agent is waiting on.

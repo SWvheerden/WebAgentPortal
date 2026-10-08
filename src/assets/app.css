@@ -341,7 +341,7 @@ details.tool pre { color: var(--dim); }
 .uploads:empty { display: none; }
 .chip { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--line); border-radius: 3px; padding: 1px 6px; font-size: calc(11rem / 13); max-width: 100%; }
 .chip .chip-name { overflow-wrap: anywhere; }
-.chip.uploading { border-style: dashed; color: var(--dim); }
+.chip.uploading, .chip.sending { border-style: dashed; color: var(--dim); }
 .chip.failed { border-color: var(--err); color: var(--err); }
 .chip button { padding: 0 4px; }
 .ev .attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }

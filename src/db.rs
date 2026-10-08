@@ -804,13 +804,56 @@ impl Db {
         })
     }
 
-    pub fn mark_uploads_sent(&self, agent_id: &str, names: &[String]) -> Result<()> {
+    /// Claim pending uploads for a message, all or none, in one transaction.
+    ///
+    /// Each named row must still be pending; it is marked sent in the same
+    /// step, so two sends of the same file, or a withdraw racing a send, can
+    /// never both win — `delete_pending_upload` only touches unsent rows. If
+    /// any name cannot be claimed nothing is, and the error says why. Returns
+    /// the claimed rows in the order named.
+    pub fn claim_uploads(&self, agent_id: &str, names: &[String]) -> Result<Vec<Upload>> {
         let now = now_ms();
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut claimed = Vec::with_capacity(names.len());
+            for name in names {
+                let changed = tx.execute(
+                    "UPDATE uploads SET sent_at = ?3
+                     WHERE agent_id = ?1 AND name = ?2 AND sent_at IS NULL",
+                    params![agent_id, name, now],
+                )?;
+                if changed == 0 {
+                    let exists: bool = tx.query_row(
+                        "SELECT COUNT(*) > 0 FROM uploads WHERE agent_id = ?1 AND name = ?2",
+                        params![agent_id, name],
+                        |r| r.get(0),
+                    )?;
+                    // Dropping `tx` rolls back whatever was claimed so far.
+                    if exists {
+                        return Err(anyhow!("{name} has already been sent"));
+                    }
+                    return Err(anyhow!("{name} is not one of this agent's uploads"));
+                }
+                claimed.push(tx.query_row(
+                    "SELECT name, size, created_at, sent_at FROM uploads
+                     WHERE agent_id = ?1 AND name = ?2",
+                    params![agent_id, name],
+                    row_to_upload,
+                )?);
+            }
+            tx.commit()?;
+            Ok(claimed)
+        })
+    }
+
+    /// Hand claimed uploads back to the composer: the message carrying them
+    /// never reached the agent.
+    pub fn release_uploads(&self, agent_id: &str, names: &[String]) -> Result<()> {
         self.with_conn(|conn| {
             for name in names {
                 conn.execute(
-                    "UPDATE uploads SET sent_at = ?3 WHERE agent_id = ?1 AND name = ?2",
-                    params![agent_id, name, now],
+                    "UPDATE uploads SET sent_at = NULL WHERE agent_id = ?1 AND name = ?2",
+                    params![agent_id, name],
                 )?;
             }
             Ok(())
@@ -1199,6 +1242,46 @@ mod tests {
         assert!(db.events_after("a", 0, 500).expect("query").is_empty());
     }
 
+    /// A claim is all or none, cannot be taken twice, and shuts out a
+    /// withdraw; a release hands the files back.
+    #[test]
+    fn claiming_uploads_is_atomic_and_exclusive() {
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&sample_agent("a", "a")).expect("insert");
+        db.insert_upload("a", "one.txt", 1).expect("upload");
+        db.insert_upload("a", "two.txt", 2).expect("upload");
+        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+
+        // One bad name claims nothing, including the good one before it.
+        let err = db
+            .claim_uploads("a", &names(&["one.txt", "missing.txt"]))
+            .expect_err("a missing name fails the claim");
+        assert!(
+            format!("{err:#}").contains("missing.txt is not one"),
+            "{err:#}"
+        );
+        assert_eq!(db.list_uploads("a", true).expect("list").len(), 2);
+
+        let claimed = db
+            .claim_uploads("a", &names(&["two.txt", "one.txt"]))
+            .expect("claim");
+        let claimed: Vec<&str> = claimed.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(claimed, vec!["two.txt", "one.txt"]);
+
+        // A second tab sending the same file loses.
+        let err = db
+            .claim_uploads("a", &names(&["one.txt"]))
+            .expect_err("a double claim is refused");
+        assert!(format!("{err:#}").contains("already been sent"), "{err:#}");
+        // And a withdraw after the claim cannot take it from under the send.
+        assert!(!db.delete_pending_upload("a", "one.txt").expect("delete"));
+
+        db.release_uploads("a", &names(&["one.txt"]))
+            .expect("release");
+        assert_eq!(db.list_uploads("a", true).expect("list").len(), 1);
+        assert!(db.claim_uploads("a", &names(&["one.txt"])).is_ok());
+    }
+
     #[test]
     fn uploads_move_from_pending_to_sent_and_go_with_the_agent() {
         let db = Db::open_in_memory().expect("db");
@@ -1212,8 +1295,8 @@ mod tests {
         assert_eq!(pending.len(), 2);
         assert_eq!(db.upload_totals("a").expect("totals"), (2, 2058));
 
-        db.mark_uploads_sent("a", &["one.txt".to_string()])
-            .expect("mark");
+        db.claim_uploads("a", &["one.txt".to_string()])
+            .expect("claim");
         let pending = db.list_uploads("a", true).expect("list");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "two.png");
