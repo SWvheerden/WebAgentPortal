@@ -175,6 +175,14 @@ CREATE TABLE uploads (
   PRIMARY KEY (agent_id, name),
   UNIQUE (agent_id, fold)
 );
+
+-- A cancel by client id that arrived before its upload was recorded.
+CREATE TABLE upload_cancels (
+  agent_id   TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  client_id  TEXT NOT NULL,
+  created_at INTEGER NOT NULL,             -- pruned after an hour
+  PRIMARY KEY (agent_id, client_id)
+);
 ```
 
 **Implementation note — additive migrations.** The shipped schema carries one
@@ -1241,9 +1249,13 @@ upload (no data for 60 s) leaves nothing: the guard that removes its partial fil
 the same blocking task that reserves the name, so it exists even if the client goes away
 before the first byte. Each upload carries the page's own random id (`client_id`). A cancel
 that lands after the last byte cannot stop the commit, and the page never learned the stored
-name, so it withdraws by that id (`DELETE /api/agents/:id/uploads?client_id=`) and remembers
-it: an upload with a cancelled id that turns up in a pending list later is withdrawn rather than
-shown again as ready to send. Send stays grey until every
+name, so it withdraws by that id (`DELETE /api/agents/:id/uploads?client_id=`). The server
+remembers the cancel too: if the upload is not recorded yet — it is usually still being copied —
+a row goes into `upload_cancels`, and recording the upload checks for it in the same transaction
+as the insert, consumes it, records nothing, removes both copies and answers 410. So the cancel
+wins whichever way the race goes, across reloads and devices. Cancels older than an hour are
+pruned. The page also keeps the ids it cancelled, and withdraws any that turn up in a pending
+list rather than showing them as ready to send. Send stays grey until every
 upload has finished; a stopped agent still takes uploads, which wait as pending for Resume, and
 a reload puts pending ones back (`?pending=1`).
 

@@ -1124,6 +1124,13 @@ async fn upload_file(
     .await
     .map_err(ApiError::bad_request)?
     .map_err(ApiError::from)?;
+    // Cancelled by the page while it was being finished: nothing was kept.
+    let Some(upload) = upload else {
+        return Err(ApiError {
+            status: StatusCode::GONE,
+            body: json!({ "error": "the upload was cancelled" }),
+        });
+    };
     Ok(Json(upload_json(&state, &record.id, &upload)))
 }
 
@@ -1137,6 +1144,10 @@ async fn upload_file(
 /// makes that race-free. On any failure the guard removes both copies, so
 /// there is never a file without a row or a row without its files.
 ///
+/// `None` if the page cancelled the upload by its client id first: the
+/// cancel is consumed in the same transaction as the insert would have been,
+/// and the guard removes both copies.
+///
 /// Blocking: run it on `spawn_blocking`, which also keeps it running when the
 /// request that started it goes away.
 fn finish_upload(
@@ -1147,12 +1158,17 @@ fn finish_upload(
     size: u64,
     sha256: &str,
     client_id: Option<&str>,
-) -> anyhow::Result<crate::db::Upload> {
+) -> anyhow::Result<Option<crate::db::Upload>> {
+    use crate::db::Recorded;
     loop {
         uploads::restore_copy(&guard.blob_dir, &guard.agent_dir, &guard.name, size, sha256)?;
-        if let Some(upload) = db.insert_upload(agent_id, &guard.name, size, sha256, client_id)? {
-            guard.keep = true;
-            return Ok(upload);
+        match db.record_upload(agent_id, &guard.name, size, sha256, client_id)? {
+            Recorded::Inserted(upload) => {
+                guard.keep = true;
+                return Ok(Some(upload));
+            }
+            Recorded::Cancelled => return Ok(None),
+            Recorded::Taken => {}
         }
         let (placeholder, next, n) = uploads::create_unique(
             &[&guard.blob_dir, &guard.agent_dir],
@@ -1293,9 +1309,11 @@ async fn download_upload(
 /// `DELETE /api/agents/{id}/uploads?client_id=<id>`: withdraw a pending upload
 /// by the page's own id for it.
 ///
-/// For a cancel that came too late: the last byte had gone, the upload
-/// committed, but the page never learned the stored name. A no-op if there is
-/// no such pending upload — not committed yet, or already sent.
+/// For a cancel that came too late: the last byte had gone, so the upload
+/// commits or is about to, and the page never learned the stored name. If it
+/// is recorded and pending it is withdrawn; if it is not recorded yet, the
+/// server remembers the cancel and the upload is dropped when it finishes. A
+/// sent upload is left alone.
 async fn withdraw_by_client_id(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
@@ -1304,31 +1322,34 @@ async fn withdraw_by_client_id(
     let record = resolve(&state, &id).await?;
     let client_id = valid_client_id(&q.client_id)?.to_string();
     let agent_id = record.id.clone();
+    // Withdraws the row if it is recorded, or leaves a cancel for the upload
+    // to find when it is — so a cancel that beats the commit still wins.
     let withdrawn = state
         .sup
         .db()
-        .run(move |db| {
-            let Some(upload) = db.pending_upload_by_client_id(&agent_id, &client_id)? else {
-                return Ok(None);
-            };
-            Ok(db
-                .delete_pending_upload(&agent_id, &upload.name)?
-                .then_some(upload.name))
-        })
-        .await?;
+        .run(move |db| db.cancel_by_client_id(&agent_id, &client_id))
+        .await?
+        .map(|upload| upload.name);
     if let Some(name) = &withdrawn {
         remove_copies(&state, &record.id, name).await;
     }
     Ok(Json(json!({ "ok": true, "withdrawn": withdrawn })))
 }
 
-/// Remove both copies of a withdrawn upload. `remove_file` takes a link away
-/// rather than what it points at.
+/// Remove both copies of a withdrawn upload: the private one first — the
+/// agent cannot have made it hard to remove — and both always tried.
+/// `remove_file` takes a link away rather than what it points at. Anything
+/// but "already gone" is logged.
 async fn remove_copies(state: &AppState, agent_id: &str, name: &str) {
-    let agent_copy = state.sup.uploads_dir(agent_id).join(name);
     let private_copy = state.sup.blobs_dir(agent_id).join(name);
-    tokio::fs::remove_file(&agent_copy).await.ok();
-    tokio::fs::remove_file(&private_copy).await.ok();
+    let agent_copy = state.sup.uploads_dir(agent_id).join(name);
+    for path in [private_copy, agent_copy] {
+        if let Err(err) = tokio::fs::remove_file(&path).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(?err, path = %path.display(), "could not remove a withdrawn upload");
+        }
+    }
 }
 
 /// `DELETE /api/agents/{id}/uploads/{name}`: withdraw a pending upload. A
@@ -3517,7 +3538,9 @@ console.log("ok");
 
         // The plain case: the agent's copy is written from the private one.
         let (guard, sha) = reserved("a.txt", "one");
-        let upload = finish_upload(&db, "agent-1", "a.txt", guard, 3, &sha, None).expect("finish");
+        let upload = finish_upload(&db, "agent-1", "a.txt", guard, 3, &sha, None)
+            .expect("finish")
+            .expect("recorded");
         assert_eq!(
             (upload.name.as_str(), upload.sha256.as_str()),
             ("a.txt", sha.as_str())
@@ -3531,7 +3554,9 @@ console.log("ok");
         db.insert_upload("agent-1", "b.txt", 9, "", None)
             .expect("row");
         let (guard, sha) = reserved("b.txt", "two");
-        let upload = finish_upload(&db, "agent-1", "b.txt", guard, 3, &sha, None).expect("finish");
+        let upload = finish_upload(&db, "agent-1", "b.txt", guard, 3, &sha, None)
+            .expect("finish")
+            .expect("recorded");
         assert_eq!(upload.name, "b-2.txt");
         assert!(!agent.join("b.txt").exists() && !blobs.join("b.txt").exists());
         assert_eq!(
@@ -3553,6 +3578,26 @@ console.log("ok");
         let (guard, _) = reserved("d.txt", "four");
         assert!(finish_upload(&db, "agent-1", "d.txt", guard, 4, "0000", None).is_err());
         assert!(!agent.join("d.txt").exists() && !blobs.join("d.txt").exists());
+
+        // Cancelled by its client id before it could be recorded: the cancel
+        // wins — no row, no file in either folder, and the cancel is used up.
+        db.cancel_by_client_id("agent-1", "cancelled-early")
+            .expect("cancel");
+        let (guard, sha) = reserved("e.txt", "five");
+        let outcome = finish_upload(
+            &db,
+            "agent-1",
+            "e.txt",
+            guard,
+            4,
+            &sha,
+            Some("cancelled-early"),
+        )
+        .expect("finish");
+        assert!(outcome.is_none(), "a cancelled upload is not recorded");
+        assert!(!agent.join("e.txt").exists() && !blobs.join("e.txt").exists());
+        assert!(db.get_upload("agent-1", "e.txt").expect("get").is_none());
+        assert_eq!(db.upload_cancel_count("agent-1").expect("count"), 0);
 
         // Whatever is left: every row has both files and every file a row.
         let mut rows: Vec<String> = db
@@ -3638,6 +3683,38 @@ console.log("ok");
         .await;
         let json: Value = serde_json::from_slice(&body_of(response).await).expect("json");
         assert_eq!(json["withdrawn"], Value::Null);
+
+        // A cancel that beats the commit is remembered: the upload it names
+        // is refused as cancelled when it finishes, and leaves nothing.
+        let response = call(
+            &state,
+            "DELETE",
+            "/api/agents/agent-1/uploads?client_id=c0ffee-3",
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = post("raced.png", "c0ffee-3").await;
+        assert_eq!(response.status(), StatusCode::GONE);
+        for folder in ["uploads", "blobs"] {
+            assert!(
+                !dir.path()
+                    .join(folder)
+                    .join("agent-1")
+                    .join("raced.png")
+                    .exists(),
+                "{folder}"
+            );
+        }
+        let listed = call(
+            &state,
+            "GET",
+            "/api/agents/agent-1/uploads?pending=1",
+            vec![],
+        )
+        .await;
+        let listed: Value = serde_json::from_slice(&body_of(listed).await).expect("json");
+        assert_eq!(listed["uploads"], json!([]), "a reload shows nothing");
 
         // A sent upload stays sent.
         assert_eq!(post("sent.png", "c0ffee-2").await.status(), StatusCode::OK);

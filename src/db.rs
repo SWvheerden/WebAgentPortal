@@ -99,6 +99,17 @@ CREATE TABLE IF NOT EXISTS uploads (
   PRIMARY KEY (agent_id, name),
   UNIQUE (agent_id, fold)
 );
+
+-- Cancels that arrived before the upload they cancel was recorded: the page
+-- withdrew by its id after the last byte, while the server was still copying.
+-- Recording the upload consumes the matching row and records nothing. Rows
+-- older than an hour are pruned whenever a cancel is recorded.
+CREATE TABLE IF NOT EXISTS upload_cancels (
+  agent_id   TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  client_id  TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (agent_id, client_id)
+);
 "#;
 
 /// Additive migrations applied after [`SCHEMA`].
@@ -220,6 +231,19 @@ pub struct Upload {
     pub created_at: i64,
     pub sent_at: Option<i64>,
 }
+
+/// What [`Db::record_upload`] did with a finished upload.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Recorded {
+    Inserted(Upload),
+    /// A row already holds the name, or one the filesystem would take for it.
+    Taken,
+    /// The page cancelled it, by its client id, before it could be recorded.
+    Cancelled,
+}
+
+/// How long a cancel waits for the upload it cancels.
+const UPLOAD_CANCEL_TTL_MS: i64 = 60 * 60 * 1000;
 
 /// A row of the `events` table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -451,6 +475,10 @@ impl Db {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM events WHERE agent_id = ?1", params![id])?;
             conn.execute("DELETE FROM uploads WHERE agent_id = ?1", params![id])?;
+            conn.execute(
+                "DELETE FROM upload_cancels WHERE agent_id = ?1",
+                params![id],
+            )?;
             conn.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
             Ok(())
         })
@@ -761,20 +789,26 @@ impl Db {
 
     /// Record a file that has just been written to the agent's upload folder.
     ///
-    /// `None` if a row already holds the name, or one the filesystem would
-    /// treat as the same (`A.txt` against `a.txt`). That happens when the agent
-    /// moved or deleted an earlier upload's file, freeing the name on disk —
-    /// but the old row may be a sent message's attachment, and reusing its
-    /// name would point that message's chip and trailer at new content. A
-    /// name is never reused; the caller picks the next one.
-    pub fn insert_upload(
+    /// [`Recorded::Taken`] if a row already holds the name, or one the
+    /// filesystem would treat as the same (`A.txt` against `a.txt`). That
+    /// happens when the agent moved or deleted an earlier upload's file,
+    /// freeing the name on disk — but the old row may be a sent message's
+    /// attachment, and reusing its name would point that message's chip and
+    /// trailer at new content. A name is never reused; the caller picks the
+    /// next one.
+    ///
+    /// [`Recorded::Cancelled`] if the page already cancelled this upload by
+    /// its client id: the cancel is consumed and nothing is recorded. Checked
+    /// in the same transaction as the insert, so a cancel either lands before
+    /// it (and wins) or finds the row (and withdraws it).
+    pub fn record_upload(
         &self,
         agent_id: &str,
         name: &str,
         size: u64,
         sha256: &str,
         client_id: Option<&str>,
-    ) -> Result<Option<Upload>> {
+    ) -> Result<Recorded> {
         let upload = Upload {
             name: name.to_string(),
             size,
@@ -783,8 +817,19 @@ impl Db {
             created_at: now_ms(),
             sent_at: None,
         };
-        let inserted = self.with_conn(|conn| {
-            Ok(conn.execute(
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            if let Some(client_id) = client_id {
+                let cancelled = tx.execute(
+                    "DELETE FROM upload_cancels WHERE agent_id = ?1 AND client_id = ?2",
+                    params![agent_id, client_id],
+                )?;
+                if cancelled > 0 {
+                    tx.commit()?;
+                    return Ok(Recorded::Cancelled);
+                }
+            }
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO uploads
                    (agent_id, name, fold, size, sha256, client_id, created_at, sent_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
@@ -797,9 +842,102 @@ impl Db {
                     upload.client_id,
                     upload.created_at
                 ],
+            )?;
+            tx.commit()?;
+            Ok(if inserted > 0 {
+                Recorded::Inserted(upload)
+            } else {
+                Recorded::Taken
+            })
+        })
+    }
+
+    /// [`Db::record_upload`] for tests: the row, or `None` if not recorded.
+    #[cfg(test)]
+    pub fn insert_upload(
+        &self,
+        agent_id: &str,
+        name: &str,
+        size: u64,
+        sha256: &str,
+        client_id: Option<&str>,
+    ) -> Result<Option<Upload>> {
+        match self.record_upload(agent_id, name, size, sha256, client_id)? {
+            Recorded::Inserted(upload) => Ok(Some(upload)),
+            Recorded::Taken | Recorded::Cancelled => Ok(None),
+        }
+    }
+
+    /// Cancel an upload by the page's id for it.
+    ///
+    /// If it is recorded and still pending, the row is withdrawn and returned
+    /// (the caller removes its files). If it is not recorded yet — the cancel
+    /// came after the last byte, while the server was still copying — a cancel
+    /// is left for [`Db::record_upload`] to find, so the upload is never
+    /// recorded at all. A sent upload is left alone. Cancels older than an
+    /// hour are pruned on the way.
+    pub fn cancel_by_client_id(&self, agent_id: &str, client_id: &str) -> Result<Option<Upload>> {
+        let now = now_ms();
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM upload_cancels WHERE created_at < ?1",
+                params![now - UPLOAD_CANCEL_TTL_MS],
+            )?;
+            let row = tx
+                .query_row(
+                    "SELECT name, size, sha256, client_id, created_at, sent_at FROM uploads
+                     WHERE agent_id = ?1 AND client_id = ?2",
+                    params![agent_id, client_id],
+                    row_to_upload,
+                )
+                .optional()?;
+            let withdrawn = match row {
+                Some(upload) if upload.sent_at.is_none() => {
+                    tx.execute(
+                        "DELETE FROM uploads WHERE agent_id = ?1 AND name = ?2 AND sent_at IS NULL",
+                        params![agent_id, upload.name],
+                    )?;
+                    Some(upload)
+                }
+                // Sent: part of the transcript, not ours to cancel.
+                Some(_) => None,
+                None => {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO upload_cancels (agent_id, client_id, created_at)
+                         VALUES (?1, ?2, ?3)",
+                        params![agent_id, client_id, now],
+                    )?;
+                    None
+                }
+            };
+            tx.commit()?;
+            Ok(withdrawn)
+        })
+    }
+
+    /// How many cancels are waiting for this agent's uploads.
+    #[cfg(test)]
+    pub fn upload_cancel_count(&self, agent_id: &str) -> Result<i64> {
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM upload_cancels WHERE agent_id = ?1",
+                params![agent_id],
+                |r| r.get(0),
             )?)
-        })?;
-        Ok((inserted > 0).then_some(upload))
+        })
+    }
+
+    /// Make every waiting cancel `ms` older, to test pruning.
+    #[cfg(test)]
+    pub fn age_upload_cancels(&self, ms: i64) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE upload_cancels SET created_at = created_at - ?1",
+                params![ms],
+            )?;
+            Ok(())
+        })
     }
 
     /// Every name this agent has recorded, as [`crate::uploads::fold_key`]s.
@@ -832,23 +970,6 @@ impl Db {
             )?;
             Ok(stmt
                 .query_row(params![agent_id, name], row_to_upload)
-                .optional()?)
-        })
-    }
-
-    /// The pending upload the page knows by `client_id`, if it has committed.
-    pub fn pending_upload_by_client_id(
-        &self,
-        agent_id: &str,
-        client_id: &str,
-    ) -> Result<Option<Upload>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT name, size, sha256, client_id, created_at, sent_at FROM uploads
-                 WHERE agent_id = ?1 AND client_id = ?2 AND sent_at IS NULL",
-            )?;
-            Ok(stmt
-                .query_row(params![agent_id, client_id], row_to_upload)
                 .optional()?)
         })
     }
@@ -1308,6 +1429,77 @@ mod tests {
 
     /// A claim is all or none, cannot be taken twice, and shuts out a
     /// withdraw; a release hands the files back.
+    /// A cancel that arrives before its upload is recorded is kept and wins:
+    /// the upload is never recorded. One that arrives after withdraws the
+    /// row. A sent upload is not cancelled. Old cancels are pruned.
+    #[test]
+    fn a_cancel_by_client_id_wins_whichever_way_the_race_goes() {
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&sample_agent("a", "a")).expect("insert");
+
+        // Before: nothing to withdraw, so a cancel waits; the upload then
+        // finds it and records nothing.
+        assert_eq!(db.cancel_by_client_id("a", "early").expect("cancel"), None);
+        assert_eq!(db.upload_cancel_count("a").expect("count"), 1);
+        assert_eq!(
+            db.record_upload("a", "early.png", 1, "", Some("early"))
+                .expect("record"),
+            Recorded::Cancelled
+        );
+        assert_eq!(
+            db.upload_cancel_count("a").expect("count"),
+            0,
+            "the cancel is consumed"
+        );
+        assert!(db.get_upload("a", "early.png").expect("get").is_none());
+        // Without an id nothing can be cancelled.
+        assert!(matches!(
+            db.record_upload("a", "other.png", 1, "", None)
+                .expect("record"),
+            Recorded::Inserted(_)
+        ));
+
+        // After: the row is withdrawn, and no cancel is left behind.
+        db.insert_upload("a", "late.png", 1, "", Some("late"))
+            .expect("row");
+        let withdrawn = db.cancel_by_client_id("a", "late").expect("cancel");
+        assert_eq!(withdrawn.map(|u| u.name).as_deref(), Some("late.png"));
+        assert!(db.get_upload("a", "late.png").expect("get").is_none());
+        assert_eq!(db.upload_cancel_count("a").expect("count"), 0);
+
+        // Sent: left alone, and no cancel is left waiting either.
+        db.insert_upload("a", "sent.png", 1, "", Some("sent"))
+            .expect("row");
+        db.claim_uploads("a", &["sent.png".to_string()])
+            .expect("send");
+        assert_eq!(db.cancel_by_client_id("a", "sent").expect("cancel"), None);
+        assert!(db.get_upload("a", "sent.png").expect("get").is_some());
+        assert_eq!(db.upload_cancel_count("a").expect("count"), 0);
+
+        // Old cancels are pruned when another is recorded.
+        db.cancel_by_client_id("a", "stale").expect("cancel");
+        db.age_upload_cancels(UPLOAD_CANCEL_TTL_MS + 1)
+            .expect("age");
+        db.cancel_by_client_id("a", "fresh").expect("cancel");
+        assert_eq!(
+            db.upload_cancel_count("a").expect("count"),
+            1,
+            "only the fresh one"
+        );
+        assert!(
+            matches!(
+                db.record_upload("a", "stale.png", 1, "", Some("stale"))
+                    .expect("record"),
+                Recorded::Inserted(_)
+            ),
+            "a pruned cancel no longer applies"
+        );
+
+        // And they go with the agent.
+        db.delete_agent("a").expect("delete");
+        assert_eq!(db.upload_cancel_count("a").expect("count"), 0);
+    }
+
     #[test]
     fn claiming_uploads_is_atomic_and_exclusive() {
         let db = Db::open_in_memory().expect("db");
