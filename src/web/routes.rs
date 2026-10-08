@@ -1308,7 +1308,7 @@ const tab = (shared, state) => {{
 }}
 
 // The done tracker, on hand-fired timers: a finished turn must settle before
-// it counts, and claims are released only when an announced agent moves on.
+// it counts, and its claim is released whenever the agent moves on.
 const tracker = () => {{
   const t = {{ timers: new Map(), next: 1, announced: [], released: [], changes: 0, delays: [], quiet: false }};
   t.done = new DoneTracker({{
@@ -1340,10 +1340,10 @@ const tracker = () => {{
   t.done.status("a", "idle", "working");
   t.fire();
   assert(t.announced.length === 0 && t.done.done.size === 0, "idle then working inside the window: no chime, no green");
-  assert(t.released.length === 0, "and nothing to release");
+  assert(JSON.stringify(t.released) === '["a"]', "leaving idle still releases, announced or not");
 }}
 
-// The claim is released only once an announced agent really starts again.
+// Looking keeps the claim; the agent starting again releases it.
 {{
   const t = tracker();
   t.done.status("a", "working", "idle");
@@ -1354,7 +1354,6 @@ const tracker = () => {{
   t.done.status("a", "idle", "working");
   assert(JSON.stringify(t.released) === '["a"]', "starting again releases it");
   t.done.status("a", "working", "awaiting_approval");
-  assert(t.released.length === 1, "released once, not on every later change");
   t.done.status("a", "awaiting_approval", "idle");
   t.fire();
   assert(t.announced.length === 1, "a turn cut off mid-request does not chime");
@@ -1379,7 +1378,7 @@ const tracker = () => {{
   assert(t.announced.length === 0, "no done chime while an approval is pending");
   assert(t.done.done.has("a") && t.changes === 1, "but the agent is still done");
   t.done.status("a", "idle", "working");
-  assert(t.released.length === 0, "nothing was claimed, so nothing is released");
+  assert(JSON.stringify(t.released) === '["a"]', "leaving idle releases even so, which is harmless");
 }}
 
 // A removed agent is forgotten, settling or done.
@@ -1392,7 +1391,35 @@ const tracker = () => {{
   t.done.status("b", "working", "idle");
   t.fire();
   t.done.forget("b");
-  assert(!t.done.done.has("b") && JSON.stringify(t.released) === '["b"]', "forgetting a done agent clears it and frees its claim");
+  assert(!t.done.done.has("b") && JSON.stringify(t.released) === '["a","b"]', "forgetting clears it and frees its claim: " + t.released);
+}}
+
+// Regression: the tab that chimed is gone (navigated away, reloaded), so its
+// tracker never releases. A fresh tab sharing the storage sees the agent start
+// again, releases the stale claim, and the next finished turn still chimes.
+{{
+  const shared = storage();
+  const doneTab = () => {{
+    const t = tab(shared, "running");
+    t.timers = [];
+    t.done = new DoneTracker({{
+      announce: (id) => t.chimer.announce(doneKey(id)),
+      release: (id) => t.chimer.claims.release(doneKey(id)),
+      start: (fn) => {{ t.timers.push(fn); return t.timers.length; }},
+      cancel: () => {{}},
+    }});
+    t.fire = () => t.timers.splice(0).forEach((fn) => fn());
+    return t;
+  }};
+  const gone = doneTab();
+  gone.done.status("x", "working", "idle");
+  gone.fire();
+  assert(gone.played === 1, "the first tab chimes and claims");
+  const fresh = doneTab();
+  fresh.done.status("x", "idle", "working");
+  fresh.done.status("x", "working", "idle");
+  fresh.fire();
+  assert(fresh.played === 1, "a tab that never announced still frees the claim, so the next turn chimes");
 }}
 
 // The done chime has its own claim: one tab plays it per finished turn, it
@@ -1515,7 +1542,7 @@ const agentA = (status, ids) => ({{ id: "a", status, pending_permissions: ids.ma
   const gen = b.resync.begin();
   b.resync.finish(gen, () => b.load([]));
   assert(b.done.done.size === 0, "nothing removed stays done");
-  assert(JSON.stringify(b.released) === '["a"]', "the done agent's claim is released: " + b.released);
+  assert(JSON.stringify(b.released) === '["a","b"]', "both claims are released: " + b.released);
   assert(b.settle.size === 0, "the settling agent's timer is cancelled");
   b.fireSettle();
   assert(JSON.stringify(b.chimes) === '["done:a"]', "and it never chimes: " + b.chimes);

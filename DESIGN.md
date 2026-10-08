@@ -1068,9 +1068,12 @@ idle, or being removed, takes it off the list. Orange takes precedence: while an
 approval the tab shows only the approval alert, and a turn that settles then stays silent
 (it still turns green once the approvals clear). That rule is per tab: an agent page only knows
 its own agent's approvals, so its done chime can sound while another agent awaits approval
-elsewhere — but any tab that shows the approval still shows orange over green. The chime is claimed across tabs like a
-request's, keyed `done:agent_id`, and released only when an announced agent leaves idle, so one
-finished turn never chimes twice. A finish missed while the socket was down is caught on
+elsewhere — but any tab that shows the approval still shows orange over green. The chime is
+claimed across tabs like a request's, keyed `done:agent_id`. Every tab that sees the agent
+leave idle releases it, whether or not that tab chimed — the tab that did may have been
+navigated away or reloaded since, and a claim nobody releases would mute the agent's next
+finish for the whole TTL. One finished turn still never chimes twice: the claim holds until
+the agent moves on, and every tab cancels its pending settle on that same status. A finish missed while the socket was down is caught on
 reconnect: the dashboard diffs the snapshot's statuses, the agent page re-fetches its agent.
 The logic is `DoneTracker` in `attention.js`, tested with the rest.
 

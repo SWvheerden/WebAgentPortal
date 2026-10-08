@@ -51,12 +51,16 @@ export const DONE_SETTLE_MS = 1500;
 /// Which agents have finished a turn the operator has not yet seen. A finished
 /// turn waits `settle` ms; if the agent leaves idle first, it never counts.
 /// Once it does, `announce` fires (the chime) and the agent stays in `done`
-/// until the operator looks (`seen`), it leaves idle, or it is forgotten. The
-/// chime's claim is released only when an announced agent leaves idle, so a
-/// tab can never chime twice for one finished turn. While `quiet()` holds — an
-/// approval is pending, and orange wins — the agent still joins `done`, so the
-/// green shows once the approvals clear, but nothing is announced. The timer
-/// functions are injected so a test can fire them by hand.
+/// until the operator looks (`seen`), it leaves idle, or it is forgotten.
+///
+/// The chime's claim is released whenever the agent is seen to leave idle (or
+/// is forgotten), whether or not this tab announced it: the claim lives in
+/// shared storage, and the tab that chimed may since have been navigated away
+/// or reloaded. That cannot double-chime, since every tab cancels its pending
+/// settle on the same status. While `quiet()` holds — an approval is pending,
+/// and orange wins — the agent still joins `done`, so the green shows once the
+/// approvals clear, but nothing is announced. The timer functions are injected
+/// so a test can fire them by hand.
 export class DoneTracker {
   constructor({
     announce,
@@ -77,8 +81,6 @@ export class DoneTracker {
     this.cancel = cancel;
     /// Announced and not yet seen: what the tab blinks green for.
     this.done = new Set();
-    /// Announced, so holding a chime claim until the agent leaves idle.
-    this.announced = new Set();
     /// agentId -> settle timer.
     this.settling = new Map();
   }
@@ -91,10 +93,7 @@ export class DoneTracker {
       const timer = this.start(() => {
         this.settling.delete(agentId);
         this.done.add(agentId);
-        if (!this.quiet()) {
-          this.announced.add(agentId);
-          this.announce(agentId);
-        }
+        if (!this.quiet()) this.announce(agentId);
         this.onChange();
       }, this.settle);
       this.settling.set(agentId, timer);
@@ -123,7 +122,7 @@ export class DoneTracker {
   }
 
   leave(agentId) {
-    if (this.announced.delete(agentId)) this.release(agentId);
+    this.release(agentId);
     if (this.done.delete(agentId)) this.onChange();
   }
 }
