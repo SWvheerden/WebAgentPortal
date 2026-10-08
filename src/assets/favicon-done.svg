@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="turtle, agent done">
+  <!-- The loud half of the "agent done" flash. Like favicon-flash.svg, the
+       whole tile is coloured, so alternating it with the plain turtle
+       reads as the tab itself blinking green from across the tab strip. The
+       turtle stays, drawn dark on the green, so it is still this app's tab. -->
+  <rect width="64" height="64" rx="12" fill="#2ea043"/>
+  <g fill="#0b3d17">
+    <ellipse cx="32" cy="10" rx="10" ry="9.5"/>
+    <ellipse cx="12" cy="20" rx="8.5" ry="5" transform="rotate(-42 12 20)"/>
+    <ellipse cx="52" cy="20" rx="8.5" ry="5" transform="rotate(42 52 20)"/>
+    <ellipse cx="12" cy="48" rx="8.5" ry="5" transform="rotate(42 12 48)"/>
+    <ellipse cx="52" cy="48" rx="8.5" ry="5" transform="rotate(-42 52 48)"/>
+    <path d="M32 61 L28 47 L36 47 Z"/>
+  </g>
+  <ellipse cx="32" cy="35" rx="19" ry="16" fill="#052b10" stroke="#0b3d17" stroke-width="3"/>
+  <path d="M32 24 L41 30.5 L37.5 41.5 L26.5 41.5 L23 30.5 Z" fill="#8fe0a3"/>
+</svg>

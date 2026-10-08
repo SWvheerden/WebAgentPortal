@@ -1,6 +1,6 @@
 // Dashboard: the agent registry, account usage, notes, the spawn form, cloning
 // and settings.
-import { announceAttention, releaseAttention, api, applyTextSize, DEFAULT_TEXT_SIZE, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast } from '/assets/common.js';
+import { announceAttention, releaseAttention, api, applyTextSize, DEFAULT_TEXT_SIZE, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast, trackStatus } from '/assets/common.js';
 import { PendingRequests, Resync, withDeadline } from '/assets/attention.js';
 
 const state = {
@@ -247,6 +247,13 @@ async function loadAgents({ announce = false } = {}) {
     throw err;
   }
   state.resync.finish(generation, () => {
+    // A turn that ended while the socket was down came in no `status`.
+    if (announce) {
+      for (const agent of data.agents) {
+        const before = state.agents.get(agent.id);
+        if (before) trackStatus(agent.id, before.status, agent.status);
+      }
+    }
     state.agents = new Map(data.agents.map((a) => [a.id, a]));
     state.pending.snapshot(data.agents, { announce });
     renderAgents();
@@ -928,6 +935,7 @@ async function main() {
     .on('status', live((msg) => {
       const agent = state.agents.get(msg.agent_id);
       if (!agent) return;
+      trackStatus(msg.agent_id, agent.status, msg.status);
       Object.assign(agent, {
         status: msg.status,
         status_detail: msg.status_detail,

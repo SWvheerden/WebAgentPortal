@@ -1,5 +1,5 @@
 // Agent detail: transcript, approvals, composer, slash commands.
-import { announceAttention, releaseAttention, api, applyTextSize, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast } from '/assets/common.js';
+import { announceAttention, releaseAttention, api, applyTextSize, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast, trackStatus } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 import { newKeys } from '/assets/attention.js';
 import { clampSideWidth, keyedSideWidth, loadSideWidth, saveSideWidth, sideWidthBounds } from '/assets/splitter.js';
@@ -1036,6 +1036,7 @@ async function main() {
     })
     .on('status', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
+      trackStatus(msg.agent_id, state.agent.status, msg.status);
       Object.assign(state.agent, {
         status: msg.status,
         status_detail: msg.status_detail,

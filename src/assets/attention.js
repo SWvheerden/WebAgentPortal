@@ -6,17 +6,41 @@
 export const ICON = '/assets/favicon.svg';
 export const ICON_ALERT = '/assets/favicon-alert.svg';
 export const ICON_FLASH = '/assets/favicon-flash.svg';
+export const ICON_DONE_FLASH = '/assets/favicon-done.svg';
 
 /// What the tab should show. Watching, the badge sits still: the page already
 /// shows the amber card, and something blinking under their nose is just
 /// noise. Away, the icon alternates between the badge and a solid orange tile.
-export function tabLook({ attention, watching, loud, baseTitle }) {
-  if (!attention) return { title: baseTitle, icon: ICON };
-  if (watching) return { title: `(${attention}) ${baseTitle}`, icon: ICON_ALERT };
-  const noun = attention === 1 ? 'approval' : 'approvals';
+///
+/// `done` counts agents that finished their turn while the operator was away.
+/// It blinks green instead, but only when nothing needs approval: a request
+/// blocks an agent, a finished turn does not, so orange always wins.
+export function tabLook({ attention, done = 0, watching, loud, baseTitle }) {
+  if (attention) {
+    if (watching) return { title: `(${attention}) ${baseTitle}`, icon: ICON_ALERT };
+    const noun = attention === 1 ? 'approval' : 'approvals';
+    return loud
+      ? { title: `🔔 ${attention} ${noun} needed`, icon: ICON_FLASH }
+      : { title: `(${attention}) ${baseTitle}`, icon: ICON_ALERT };
+  }
+  if (!done || watching) return { title: baseTitle, icon: ICON };
+  const noun = done === 1 ? 'agent' : 'agents';
   return loud
-    ? { title: `🔔 ${attention} ${noun} needed`, icon: ICON_FLASH }
-    : { title: `(${attention}) ${baseTitle}`, icon: ICON_ALERT };
+    ? { title: `✅ ${done} ${noun} done`, icon: ICON_DONE_FLASH }
+    : { title: `(${done} done) ${baseTitle}`, icon: ICON };
+}
+
+/// Did this status change end a turn? Working (or waiting on a request that
+/// the turn then ended without) and now idle: the agent has done what it was
+/// asked and is waiting for the next prompt.
+export function finishedTurn(previous, next) {
+  return next === 'idle' && (previous === 'working' || previous === 'awaiting_approval');
+}
+
+/// The chime claim for an agent's finished turn. Released when the agent starts
+/// again, so its next finished turn chimes too.
+export function doneKey(agentId) {
+  return `done:${agentId}`;
 }
 
 /// The blink: a phase that flips on a timer while wanted. The timer functions

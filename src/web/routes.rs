@@ -1131,6 +1131,7 @@ mod tests {
             "favicon.svg",
             "favicon-alert.svg",
             "favicon-flash.svg",
+            "favicon-done.svg",
             "attention.js",
             "splitter.js",
         ] {
@@ -1152,7 +1153,7 @@ mod tests {
         let driver = dir.path().join("attention.mjs");
         let source = format!(
             r#"
-import {{ Chimer, ChimeClaims, Flasher, PendingRequests, Resync, withDeadline, attentionKey, newKeys, tabLook, ICON, ICON_ALERT, ICON_FLASH, CHIME_CLAIM_MS, CHIME_STORAGE_KEY }} from "{module}";
+import {{ Chimer, ChimeClaims, Flasher, PendingRequests, Resync, withDeadline, attentionKey, doneKey, finishedTurn, newKeys, tabLook, ICON, ICON_ALERT, ICON_FLASH, ICON_DONE_FLASH, CHIME_CLAIM_MS, CHIME_STORAGE_KEY }} from "{module}";
 
 const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
 
@@ -1281,6 +1282,46 @@ const tab = (shared, state) => {{
   assert(look(true, true).icon === ICON_ALERT, "watching, the badge sits still");
   assert(tabLook({{ attention: 0, watching: false, loud: true, baseTitle: "t" }}).icon === ICON, "nothing waiting, no alert");
   assert(tabLook({{ attention: 0, watching: false, loud: true, baseTitle: "t" }}).title === "t", "and the title is restored");
+}}
+
+// A finished agent blinks green, but a request for approval wins over it.
+{{
+  const look = (attention, done, loud, watching = false) => tabLook({{ attention, done, watching, loud, baseTitle: "t" }});
+  assert(look(0, 1, true).icon === ICON_DONE_FLASH, "the loud half of a done agent is the green icon");
+  assert(look(0, 1, false).icon === ICON, "the quiet half is the plain turtle");
+  assert(look(0, 2, true).title === "✅ 2 agents done", "the title counts the done agents: " + look(0, 2, true).title);
+  assert(look(1, 3, true).icon === ICON_FLASH, "orange takes precedence over green");
+  assert(look(1, 3, false).icon === ICON_ALERT, "even on the quiet half");
+  assert(look(1, 3, true).title.startsWith("🔔 1 approval"), "and the title is about the approval");
+  assert(look(0, 1, true, true).icon === ICON && look(0, 1, true, true).title === "t", "watching, nothing blinks green");
+  assert(ICON_DONE_FLASH !== ICON_FLASH, "the done flash is its own icon");
+}}
+
+// Which status changes count as a finished turn.
+{{
+  assert(finishedTurn("working", "idle"), "working to idle is a finished turn");
+  assert(finishedTurn("awaiting_approval", "idle"), "a turn that ends while waiting is finished too");
+  assert(!finishedTurn("starting", "idle"), "starting up is not finishing a turn");
+  assert(!finishedTurn("idle", "idle"), "no change is no news");
+  assert(!finishedTurn("working", "stopped") && !finishedTurn("working", "failed"), "stopping or failing is not done");
+  assert(!finishedTurn("idle", "working"), "starting a turn is not finishing one");
+}}
+
+// The done chime has its own claim: one tab plays it per finished turn, it
+// never collides with a request's claim, and releasing it lets the next turn
+// chime again.
+{{
+  const shared = storage();
+  const one = tab(shared, "running");
+  const two = tab(shared, "running");
+  const claims = new ChimeClaims(shared, now);
+  assert(doneKey("a") !== attentionKey("a", "done"), "a done claim is not a request claim");
+  one.chimer.announce(doneKey("a"));
+  two.chimer.announce(doneKey("a"));
+  assert(one.played + two.played === 1, "one finished turn, one chime");
+  claims.release(doneKey("a"));
+  two.chimer.announce(doneKey("a"));
+  assert(two.played === 1, "the next finished turn chimes again");
 }}
 
 // The dashboard's reconnect reload, modelled with the real Resync and

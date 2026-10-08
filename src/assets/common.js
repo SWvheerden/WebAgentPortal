@@ -1,6 +1,6 @@
 // Shared helpers: API calls, the multiplexed socket, small DOM utilities.
 // No build step, no dependencies — plain ES modules (§7).
-import { Chimer, ChimeClaims, Flasher, attentionKey, tabLook } from '/assets/attention.js';
+import { Chimer, ChimeClaims, Flasher, attentionKey, doneKey, finishedTurn, tabLook } from '/assets/attention.js';
 
 // The credential this page presents. There are two of them, and which one a
 // page holds depends on how it was opened (§7, §12).
@@ -237,11 +237,17 @@ export function fmtAgo(ms) {
 // Only `awaiting_approval`. `failed` looks like it belongs here but does not:
 // it is terminal, nothing is waiting on the human, and a flash that cannot be
 // resolved by answering it would simply never stop.
+//
+// An agent that finishes its turn while the operator is away gets a softer
+// version of the same: its own chime, and a green blink until they look at the
+// tab. Orange wins over green — a finished agent can wait, a blocked one cannot.
 
 const FLASH_MS = 1200;
 
 let baseTitle = document.title;
 let attention = 0;
+/// Agents that finished a turn since the operator last looked at this tab.
+const doneAgents = new Set();
 
 /// Is the operator actually looking at this tab? A visible tab in an unfocused
 /// window does not count — that is the case this whole feature exists for.
@@ -255,7 +261,13 @@ function setIcon(href) {
 }
 
 function paintTab() {
-  const look = tabLook({ attention, watching: watching(), loud: flasher.loud, baseTitle });
+  const look = tabLook({
+    attention,
+    done: doneAgents.size,
+    watching: watching(),
+    loud: flasher.loud,
+    baseTitle,
+  });
   document.title = look.title;
   setIcon(look.icon);
 }
@@ -263,7 +275,9 @@ function paintTab() {
 const flasher = new Flasher({ every: FLASH_MS, onTick: paintTab });
 
 function scheduleFlash() {
-  flasher.want(attention > 0 && !watching());
+  // Looking at the tab is seeing the finished agents, so the green is spent.
+  if (watching()) doneAgents.clear();
+  flasher.want((attention > 0 || doneAgents.size > 0) && !watching());
   paintTab();
 }
 
@@ -319,14 +333,13 @@ for (const kind of ['pointerdown', 'keydown', 'touchstart']) {
   window.addEventListener(kind, unlockAudio, { capture: true, passive: true });
 }
 
-/// Two rising notes: short enough not to grate on the tenth request, and
-/// distinct from the single tones most other apps use.
-function playChime(ctx) {
+/// `[frequency, offset in seconds]` pairs, each a short plucked note.
+function playNotes(ctx, type, notes) {
   const start = ctx.currentTime;
-  for (const [freq, offset] of [[880, 0], [1320, 0.14]]) {
+  for (const [freq, offset] of notes) {
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
-    osc.type = 'sine';
+    osc.type = type;
     osc.frequency.value = freq;
     const t = start + offset;
     gain.gain.setValueAtTime(0.0001, t);
@@ -336,6 +349,18 @@ function playChime(ctx) {
     osc.start(t);
     osc.stop(t + 0.3);
   }
+}
+
+/// Two rising notes: short enough not to grate on the tenth request, and
+/// distinct from the single tones most other apps use.
+function playChime(ctx) {
+  playNotes(ctx, 'sine', [[880, 0], [1320, 0.14]]);
+}
+
+/// Three falling notes on a softer triangle wave: a "that's done" cadence, so a
+/// finished turn never sounds like a request for approval.
+function playDoneChime(ctx) {
+  playNotes(ctx, 'triangle', [[1047, 0], [784, 0.12], [523, 0.24]]);
 }
 
 function sharedStorage() {
@@ -352,6 +377,12 @@ const chimer = new Chimer({
   play: playChime,
 });
 
+const doneChimer = new Chimer({
+  context: audioContext,
+  claims: chimer.claims,
+  play: playDoneChime,
+});
+
 /// Something new needs a human: chime, and jolt the tab back to the loud half
 /// of its flash. Call it once per new request — not per render — so that each
 /// request chimes exactly once, however many there already are.
@@ -365,6 +396,23 @@ export function announceAttention(agentId, requestId) {
 /// id still chimes.
 export function releaseAttention(agentId, requestId) {
   chimer.claims.release(attentionKey(agentId, requestId));
+}
+
+/// An agent's status changed. A finished turn chimes (once across tabs) and
+/// blinks the tab green until the operator looks; the agent starting again, or
+/// stopping, takes it back off the list and frees its claim for the next turn.
+export function trackStatus(agentId, previous, next) {
+  if (previous === next) return;
+  if (finishedTurn(previous, next)) {
+    doneChimer.announce(doneKey(agentId));
+    doneAgents.add(agentId);
+    scheduleFlash();
+    flasher.jolt();
+    paintTab();
+  } else if (next !== 'idle') {
+    doneChimer.claims.release(doneKey(agentId));
+    if (doneAgents.delete(agentId)) scheduleFlash();
+  }
 }
 
 // One socket, one reconnect path, one schema. Handlers are keyed by the
