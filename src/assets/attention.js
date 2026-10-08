@@ -22,7 +22,14 @@ export function tabLook({ attention, watching, loud, baseTitle }) {
 /// The blink: a phase that flips on a timer while wanted. The timer functions
 /// are injected so a test can tick it by hand.
 export class Flasher {
-  constructor({ every, start = setInterval, stop = clearInterval, onTick = () => {} }) {
+  constructor({
+    every,
+    // Wrapped, not passed bare: called as `this.start(...)`, a bare native
+    // would get the Flasher as its receiver and throw "Illegal invocation".
+    start = (fn, ms) => setInterval(fn, ms),
+    stop = (id) => clearInterval(id),
+    onTick = () => {},
+  }) {
     this.every = every;
     this.start = start;
     this.stop = stop;
@@ -256,7 +263,13 @@ export class Resync {
 /// promise rejects even if `run` ignores the signal. The timer is cleared
 /// however it settles. For fetches whose stall would hold something else up —
 /// a `Resync` holding every live message until the snapshot lands.
-export function withDeadline(run, ms, timers = { set: setTimeout, clear: clearTimeout }) {
+export function withDeadline(
+  run,
+  ms,
+  // Wrapped for the same reason as Flasher's: `timers.set(...)` would hand the
+  // native `timers` as its receiver.
+  timers = { set: (fn, delay) => setTimeout(fn, delay), clear: (id) => clearTimeout(id) },
+) {
   const controller = new AbortController();
   let timer = null;
   const expired = new Promise((_, reject) => {
