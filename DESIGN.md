@@ -1075,6 +1075,10 @@ navigated away or reloaded since, and a claim nobody releases would mute the age
 finish for the whole TTL. One finished turn still never chimes twice: the claim holds until
 the agent moves on, and every tab cancels its pending settle on that same status. A finish missed while the socket was down is caught on
 reconnect: the dashboard diffs the snapshot's statuses, the agent page re-fetches its agent.
+Only the status before and after the drop is compared, so a whole idle → working → idle turn
+inside the gap goes unnoticed; catching that would take a per-turn marker from the server,
+which is out of scope. Every snapshot — page loads included — also frees the claim of any
+agent it shows not idle, so a restart that no tab was watching cannot mute the next finish.
 The logic is `DoneTracker` in `attention.js`, tested with the rest.
 
 **Agent cards hold their place.** They are ordered by `created_at`, which never changes: a

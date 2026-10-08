@@ -1,5 +1,5 @@
 // Agent detail: transcript, approvals, composer, slash commands.
-import { announceAttention, releaseAttention, api, applyTextSize, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast, trackStatus } from '/assets/common.js';
+import { announceAttention, releaseAttention, api, applyTextSize, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast, trackStatus, trackSnapshot } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 import { newKeys } from '/assets/attention.js';
 import { clampSideWidth, keyedSideWidth, loadSideWidth, saveSideWidth, sideWidthBounds } from '/assets/splitter.js';
@@ -912,6 +912,7 @@ async function main() {
   api('/api/config').then((cfg) => applyTextSize(cfg.text_size), () => {});
   const data = await api(`/api/agents/${encodeURIComponent(slug)}`);
   state.agent = data.agent;
+  trackSnapshot(state.agent.id, state.agent.status);
   state.commands = data.agent.commands || [];
   // Oldest first, as the walk indexes it. Read from the event log, so a phone
   // opening this page recalls what was typed on the laptop.
@@ -1002,19 +1003,19 @@ async function main() {
   });
   // A turn that ended while the socket was down came in no `status`, so after
   // a reconnect (not the first connect) ask for the agent again, as the
-  // dashboard does. A live `status` that lands while this is in flight is
-  // newer than the answer, so the answer is dropped. Counted, not compared:
-  // idle -> working -> idle mid-fetch would look unchanged.
+  // dashboard does. The answer is dropped if a live `status` landed while it
+  // was in flight (counted, not compared: idle -> working -> idle mid-fetch
+  // would look unchanged), or if a newer recheck has started since.
   let connected = false;
   let liveStatuses = 0;
+  let recheckGen = 0;
   const recheckStatus = async () => {
-    const before = state.agent.status;
+    const gen = ++recheckGen;
     const seen = liveStatuses;
     const fresh = (await api(`/api/agents/${state.agent.id}`)).agent;
-    if (liveStatuses !== seen) return;
-    // Counted too, so an older recheck still in flight is dropped.
-    liveStatuses += 1;
-    trackStatus(state.agent.id, before, fresh.status);
+    if (gen !== recheckGen || liveStatuses !== seen) return;
+    trackStatus(state.agent.id, state.agent.status, fresh.status);
+    trackSnapshot(state.agent.id, fresh.status);
     Object.assign(state.agent, {
       status: fresh.status,
       status_detail: fresh.status_detail,

@@ -1,6 +1,6 @@
 // Dashboard: the agent registry, account usage, notes, the spawn form, cloning
 // and settings.
-import { announceAttention, releaseAttention, api, applyTextSize, DEFAULT_TEXT_SIZE, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast, trackStatus, forgetAgent } from '/assets/common.js';
+import { announceAttention, releaseAttention, api, applyTextSize, DEFAULT_TEXT_SIZE, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast, trackStatus, trackSnapshot, forgetAgent } from '/assets/common.js';
 import { PendingRequests, Resync, withDeadline } from '/assets/attention.js';
 
 const state = {
@@ -257,6 +257,9 @@ async function loadAgents({ announce = false } = {}) {
     // Removed while the socket was down: no `agent_removed` came for it.
     const kept = new Set(data.agents.map((a) => a.id));
     for (const id of state.agents.keys()) if (!kept.has(id)) forgetAgent(id);
+    // On every load, the first included: frees a done claim whose agent
+    // restarted while no tab was watching.
+    for (const agent of data.agents) trackSnapshot(agent.id, agent.status);
     state.agents = new Map(data.agents.map((a) => [a.id, a]));
     state.pending.snapshot(data.agents, { announce });
     renderAgents();

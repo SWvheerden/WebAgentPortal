@@ -417,6 +417,12 @@ export function trackStatus(agentId, previous, next) {
   doneTracker.status(agentId, previous, next);
 }
 
+/// A snapshot (page load, reconnect) shows the agent in `status`; see
+/// `DoneTracker.snapshot`.
+export function trackSnapshot(agentId, status) {
+  doneTracker.snapshot(agentId, status);
+}
+
 /// An agent was removed: it can no longer be done, nor about to be.
 export function forgetAgent(agentId) {
   doneTracker.forget(agentId);

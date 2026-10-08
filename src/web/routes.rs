@@ -1394,6 +1394,22 @@ const tracker = () => {{
   assert(!t.done.done.has("b") && JSON.stringify(t.released) === '["a","b"]', "forgetting clears it and frees its claim: " + t.released);
 }}
 
+// A snapshot showing the agent not idle frees its claim, even in a tab that
+// never saw it finish; an idle one leaves a done agent alone.
+{{
+  const t = tracker();
+  t.done.snapshot("a", "working");
+  assert(JSON.stringify(t.released) === '["a"]', "a non-idle snapshot releases: " + t.released);
+  t.done.status("b", "working", "idle");
+  t.fire();
+  t.done.snapshot("b", "idle");
+  assert(t.done.done.has("b") && t.released.length === 1, "an idle snapshot keeps the done agent and its claim");
+  t.done.status("c", "working", "idle");
+  t.done.snapshot("c", "stopped");
+  t.fire();
+  assert(t.announced.length === 1, "a non-idle snapshot cancels a pending settle");
+}}
+
 // Regression: the tab that chimed is gone (navigated away, reloaded), so its
 // tracker never releases. A fresh tab sharing the storage sees the agent start
 // again, releases the stale claim, and the next finished turn still chimes.
@@ -1420,6 +1436,12 @@ const tracker = () => {{
   fresh.done.status("x", "working", "idle");
   fresh.fire();
   assert(fresh.played === 1, "a tab that never announced still frees the claim, so the next turn chimes");
+  // The agent restarts while no tab watches; a later page load sees it working.
+  fresh.done.snapshot("x", "working");
+  const later = doneTab();
+  later.done.status("x", "working", "idle");
+  later.fire();
+  assert(later.played === 1, "a snapshot frees a claim no live status released");
 }}
 
 // The done chime has its own claim: one tab plays it per finished turn, it

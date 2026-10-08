@@ -102,6 +102,14 @@ export class DoneTracker {
     }
   }
 
+  /// A snapshot (a page load, a reconnect) shows the agent in `status`. Not
+  /// idle means it has moved on since any finish, even if no tab saw it go —
+  /// so free its claim, or a restart nobody watched would mute its next
+  /// finish. Safe: a non-idle agent has nothing settling or done.
+  snapshot(agentId, status) {
+    if (status !== 'idle') this.forget(agentId);
+  }
+
   /// The operator looked at the tab: the green is spent. Claims stay held, so
   /// the same finished turn cannot chime again. No `onChange`: the caller is
   /// already repainting.
