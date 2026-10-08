@@ -9,6 +9,7 @@ axum = { version = "0.8.9", features = ["ws", "macros"] }
 clap = { version = "4.6.6", features = ["derive"] }
 futures-util = "0.3.34"
 getrandom = "0.4.3"
+libc = "0.2.190"
 mime_guess = "2.0.5"
 nix = { version = "0.31.3", features = ["signal"] }
 open = "5.4.2"

@@ -39,9 +39,11 @@ does not achieve.
 ## Attaching files
 
 The agent page takes files from the 📎 button, drag-and-drop or a pasted
-screenshot. They are stored in `~/.claude-web/uploads/<agent-id>/` (outside the
-repository), the agent is launched with `--add-dir` on that folder, and the
-message it receives lists each file's absolute path. `upload_max_mb` in
+screenshot. The agent's copy goes in `~/.claude-web/uploads/<agent-id>/`
+(outside the repository) and the portal keeps a private one in
+`~/.claude-web/blobs/<agent-id>/`, which downloads are served from. The agent is
+launched with `--add-dir` on its folder, and the message it receives lists each
+file's absolute path. `upload_max_mb` in
 `config.toml` caps one file (default 50). Deleting the agent deletes its
 uploads. See DESIGN §7, "Attaching files".
 

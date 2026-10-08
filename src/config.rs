@@ -321,12 +321,6 @@ pub fn default_db_path() -> PathBuf {
     state_dir().join("agents.db")
 }
 
-/// `~/.claude-web/uploads` — one folder per agent, keyed by id, holding the
-/// files attached from the agent page. Outside every repository on purpose.
-pub fn uploads_dir() -> PathBuf {
-    state_dir().join("uploads")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

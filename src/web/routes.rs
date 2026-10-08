@@ -970,11 +970,18 @@ fn stored_name(name: &str) -> ApiResult<&str> {
     Ok(name)
 }
 
+/// How long an upload may go without a byte before it is given up. A client
+/// that stops sending would otherwise hold its partial files, and a name, for
+/// as long as the connection stays open.
+const UPLOAD_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// `POST /api/agents/{id}/uploads?name=<original>`: the raw body is the file.
 ///
-/// Streamed to disk chunk by chunk and cut off at `upload_max_mb`; a refused
-/// or abandoned upload leaves nothing behind. Allowed whatever the agent's
-/// status — a stopped agent's attachments wait in the composer for Resume.
+/// Streamed into the portal's private copy chunk by chunk, hashed as it
+/// arrives, cut off at `upload_max_mb` or after [`UPLOAD_IDLE`] without data;
+/// the agent's copy is then written from the private one. A refused or
+/// abandoned upload leaves nothing behind. Allowed whatever the agent's status
+/// — a stopped agent's attachments wait in the composer for Resume.
 async fn upload_file(
     State(state): State<AppState>,
     AxPath(id): AxPath<String>,
@@ -982,6 +989,7 @@ async fn upload_file(
     headers: HeaderMap,
     body: Body,
 ) -> ApiResult<Json<Value>> {
+    use sha2::Digest;
     use tokio::io::AsyncWriteExt;
 
     let record = resolve(&state, &id).await?;
@@ -996,7 +1004,6 @@ async fn upload_file(
         return Err(too_large());
     }
 
-    let dir = state.sup.uploads_dir(&record.id);
     let wanted = uploads::clean_name(&q.name);
     // Start past every suffix already recorded for this name: the tenth
     // pasted `image.png` goes straight to `image-10.png`.
@@ -1007,66 +1014,74 @@ async fn upload_file(
         .run(move |db| db.upload_folds(&agent_id))
         .await?;
     let first = uploads::next_suffix(&wanted, &folds);
-    let dir_for_create = dir.clone();
+    // The name is reserved in both folders at once, and the guard that
+    // removes the reservation is made in the same blocking task: if this
+    // handler is dropped while waiting, the task's result — guard included —
+    // is dropped with it, so nothing is left behind.
+    let blob_dir = state.sup.blobs_dir(&record.id);
+    let agent_dir = state.sup.uploads_dir(&record.id);
     let wanted_for_create = wanted.clone();
-    let (file, name, suffix) = tokio::task::spawn_blocking(move || {
-        uploads::ensure_dir(&dir_for_create)?;
-        uploads::create_unique(&dir_for_create, &wanted_for_create, first)
+    let (file, guard) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        uploads::ensure_dir(&blob_dir)?;
+        uploads::ensure_dir(&agent_dir)?;
+        let (file, name, suffix) =
+            uploads::create_unique(&[&blob_dir, &agent_dir], &wanted_for_create, first)?;
+        let guard = PartialUpload {
+            blob_dir,
+            agent_dir,
+            name,
+            suffix,
+            keep: false,
+        };
+        Ok((file, guard))
     })
     .await
     .map_err(ApiError::bad_request)?
     .map_err(ApiError::from)?;
-    // Removes the file unless the upload completes. The handler future is
-    // simply dropped when the client aborts or the connection goes, so the
-    // cleanup has to live in a destructor, not after an `.await`.
-    let mut partial = PartialUpload {
-        path: dir.join(&name),
-        keep: false,
-    };
 
     let mut file = tokio::fs::File::from_std(file);
     let mut stream = body.into_data_stream();
+    let mut hasher = sha2::Sha256::new();
     let mut size: u64 = 0;
-    let mut failure: Option<ApiError> = None;
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(err) => {
-                failure = Some(ApiError::bad_request(format!(
+    loop {
+        let chunk = match tokio::time::timeout(UPLOAD_IDLE, stream.next()).await {
+            Err(_) => {
+                return Err(ApiError {
+                    status: StatusCode::REQUEST_TIMEOUT,
+                    body: json!({ "error": "the upload stalled and was given up" }),
+                });
+            }
+            Ok(None) => break,
+            Ok(Some(Err(err))) => {
+                return Err(ApiError::bad_request(format!(
                     "the upload was cut off: {err}"
                 )));
-                break;
             }
+            Ok(Some(Ok(chunk))) => chunk,
         };
         size += chunk.len() as u64;
         if size > max_bytes {
-            failure = Some(too_large());
-            break;
+            return Err(too_large());
         }
-        if let Err(err) = file.write_all(&chunk).await {
-            failure = Some(ApiError::bad_request(format!("writing the upload: {err}")));
-            break;
-        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|err| ApiError::bad_request(format!("writing the upload: {err}")))?;
     }
-    if failure.is_none()
-        && let Err(err) = file.flush().await
-    {
-        failure = Some(ApiError::bad_request(format!("writing the upload: {err}")));
-    }
+    file.flush()
+        .await
+        .map_err(|err| ApiError::bad_request(format!("writing the upload: {err}")))?;
     drop(file);
-    if let Some(err) = failure {
-        return Err(err);
-    }
+    let sha256 = format!("{:x}", hasher.finalize());
 
-    // The bytes are all here. From now on the file belongs to the finaliser,
-    // which runs to the end on a blocking thread even if this handler is
-    // dropped while waiting for it — so the row and the file always end up
-    // together or not at all.
-    partial.keep = true;
+    // The bytes are all here. The guard goes to the finaliser, which runs to
+    // the end on a blocking thread even if this handler is dropped while
+    // waiting for it — so the row and the files always end up together or
+    // not at all.
     let db = state.sup.db().clone();
     let agent_id = record.id.clone();
     let upload = tokio::task::spawn_blocking(move || {
-        finish_upload(&db, &dir, &agent_id, &wanted, name, suffix, size)
+        finish_upload(&db, &agent_id, &wanted, guard, size, &sha256)
     })
     .await
     .map_err(ApiError::bad_request)?
@@ -1074,67 +1089,69 @@ async fn upload_file(
     Ok(Json(upload_json(&state, &record.id, &upload)))
 }
 
-/// Record a fully written upload, file and row together.
+/// Record a fully written upload: the agent's copy, the private copy and the
+/// row together.
 ///
-/// The row is what makes the name ours. If one already holds it, or a name
-/// the filesystem would take for it — an earlier upload whose file the agent
-/// moved away — the file moves on to the next free name and tries again;
-/// a plain INSERT makes that race-free. On any failure the file is removed, so
-/// there is never a file without a row or a row without a file.
+/// The agent's copy is written from the private one, then the row is
+/// inserted. If a row already holds the name, or a name the filesystem would
+/// take for it — an earlier upload whose file the agent moved away — both
+/// copies move on to the next free name and it tries again; a plain INSERT
+/// makes that race-free. On any failure the guard removes both copies, so
+/// there is never a file without a row or a row without its files.
 ///
 /// Blocking: run it on `spawn_blocking`, which also keeps it running when the
 /// request that started it goes away.
 fn finish_upload(
     db: &crate::db::Db,
-    dir: &std::path::Path,
     agent_id: &str,
     wanted: &str,
-    mut name: String,
-    mut suffix: u32,
+    mut guard: PartialUpload,
     size: u64,
+    sha256: &str,
 ) -> anyhow::Result<crate::db::Upload> {
     loop {
-        match db.insert_upload(agent_id, &name, size) {
-            Ok(Some(upload)) => return Ok(upload),
-            Ok(None) => {}
-            Err(err) => {
-                std::fs::remove_file(dir.join(&name)).ok();
-                return Err(err);
-            }
+        uploads::restore_copy(&guard.blob_dir, &guard.agent_dir, &guard.name, size, sha256)?;
+        if let Some(upload) = db.insert_upload(agent_id, &guard.name, size, sha256)? {
+            guard.keep = true;
+            return Ok(upload);
         }
-        let next = uploads::create_unique(dir, wanted, suffix.saturating_add(1));
-        let (placeholder, next, n) = match next {
-            Ok(next) => next,
-            Err(err) => {
-                std::fs::remove_file(dir.join(&name)).ok();
-                return Err(err);
-            }
-        };
+        let (placeholder, next, n) = uploads::create_unique(
+            &[&guard.blob_dir, &guard.agent_dir],
+            wanted,
+            guard.suffix.saturating_add(1),
+        )?;
         drop(placeholder);
-        // Onto our own empty placeholder; a link planted there in the
-        // meantime is replaced, never followed.
-        if let Err(err) = std::fs::rename(dir.join(&name), dir.join(&next)) {
-            std::fs::remove_file(dir.join(&next)).ok();
-            std::fs::remove_file(dir.join(&name)).ok();
+        // Onto our own empty placeholder in the private folder.
+        if let Err(err) =
+            std::fs::rename(guard.blob_dir.join(&guard.name), guard.blob_dir.join(&next))
+        {
+            std::fs::remove_file(guard.blob_dir.join(&next)).ok();
+            std::fs::remove_file(guard.agent_dir.join(&next)).ok();
             return Err(err.into());
         }
-        name = next;
-        suffix = n;
+        std::fs::remove_file(guard.agent_dir.join(&guard.name)).ok();
+        guard.name = next;
+        guard.suffix = n;
     }
 }
 
-/// An upload file that is deleted when dropped, unless `keep` was set once
-/// its row was recorded. Without it an aborted upload leaves a file with no
-/// row: invisible, undeletable, and holding its name.
+/// An upload's two files — the private copy and the agent's — removed when
+/// dropped unless `keep` was set once its row was recorded. Without it an
+/// aborted upload leaves files with no row: invisible, undeletable, and
+/// holding their name.
 struct PartialUpload {
-    path: std::path::PathBuf,
+    blob_dir: std::path::PathBuf,
+    agent_dir: std::path::PathBuf,
+    name: String,
+    suffix: u32,
     keep: bool,
 }
 
 impl Drop for PartialUpload {
     fn drop(&mut self) {
         if !self.keep {
-            std::fs::remove_file(&self.path).ok();
+            std::fs::remove_file(self.blob_dir.join(&self.name)).ok();
+            std::fs::remove_file(self.agent_dir.join(&self.name)).ok();
         }
     }
 }
@@ -1166,9 +1183,11 @@ async fn list_uploads(
 
 /// `GET /api/agents/{id}/uploads/{name}`: always a download, never rendered.
 ///
-/// The agent can write in its upload folder, so the entry is refused unless
-/// it is still a plain file — a symlink planted in place of an upload would
-/// otherwise hand out whatever it points at.
+/// Served from the portal's private copy, never from the agent's folder: the
+/// agent can write there, and a link or a hard link it left in place of an
+/// upload would otherwise hand out whatever it points at. The private copy is
+/// opened hardened and must still be the recorded size; it is streamed up to
+/// that size.
 async fn download_upload(
     State(state): State<AppState>,
     AxPath((id, name)): AxPath<(String, String)>,
@@ -1177,24 +1196,28 @@ async fn download_upload(
     let name = stored_name(&name)?.to_string();
     let agent_id = record.id.clone();
     let key = name.clone();
-    if state
+    let Some(row) = state
         .sup
         .db()
         .run(move |db| db.get_upload(&agent_id, &key))
         .await?
-        .is_none()
-    {
+    else {
         return Err(ApiError::not_found(format!("no such upload: {name}")));
-    }
-    let dir = state.sup.uploads_dir(&record.id);
+    };
+    let dir = state.sup.blobs_dir(&record.id);
     let key = name.clone();
-    let (file, len) = tokio::task::spawn_blocking(move || uploads::open_plain_file(&dir, &key))
-        .await
-        .map_err(ApiError::bad_request)?
-        .map_err(|err| ApiError::not_found(format!("{name} cannot be downloaded: {err:#}")))?;
-    // Streamed in chunks, and no further than the length it had when opened:
-    // the agent may be growing it, and the length is what was promised.
-    let reader = tokio::io::AsyncReadExt::take(tokio::fs::File::from_std(file), len);
+    let size = row.size;
+    let file = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
+        let file = uploads::open_hardened(&dir, &key, false)?;
+        if file.metadata()?.len() != size {
+            anyhow::bail!("the stored copy is not the size that was uploaded");
+        }
+        Ok(file)
+    })
+    .await
+    .map_err(ApiError::bad_request)?
+    .map_err(|err| ApiError::not_found(format!("{name} cannot be downloaded: {err:#}")))?;
+    let reader = tokio::io::AsyncReadExt::take(tokio::fs::File::from_std(file), size);
     let chunks = futures_util::stream::unfold(Some(reader), |reader| async move {
         use tokio::io::AsyncReadExt;
         let mut reader = reader?;
@@ -1210,7 +1233,7 @@ async fn download_upload(
     });
     Ok((
         [
-            (header::CONTENT_LENGTH, len.to_string()),
+            (header::CONTENT_LENGTH, size.to_string()),
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),
             (
                 header::CONTENT_DISPOSITION,
@@ -1255,9 +1278,12 @@ async fn delete_upload(
         )),
         Some(false) => Err(ApiError::not_found(format!("no such upload: {name}"))),
         Some(true) => {
-            // `remove_file` takes a link away rather than what it points at.
-            let path = state.sup.uploads_dir(&record.id).join(&name);
-            tokio::fs::remove_file(&path).await.ok();
+            // Both copies. `remove_file` takes a link away rather than what it
+            // points at.
+            let agent_copy = state.sup.uploads_dir(&record.id).join(&name);
+            let private_copy = state.sup.blobs_dir(&record.id).join(&name);
+            tokio::fs::remove_file(&agent_copy).await.ok();
+            tokio::fs::remove_file(&private_copy).await.ok();
             Ok(Json(json!({"ok": true})))
         }
     }
@@ -2859,7 +2885,7 @@ console.log("ok");
             ..Config::default()
         }));
         let state = AppState {
-            sup: Supervisor::with_uploads_root(db, config, dir.to_path_buf()),
+            sup: Supervisor::with_files_root(db, config, dir.to_path_buf()),
             ..test_state().await
         };
         state
@@ -2941,9 +2967,33 @@ console.log("ok");
         let uploaded: Value = serde_json::from_slice(&body_of(response).await).expect("json");
         assert_eq!(uploaded["name"], json!("my-shot.png"));
         assert_eq!(uploaded["size"], json!(big.len()));
-        let on_disk = dir.path().join("agent-1").join("my-shot.png");
+        let on_disk = dir
+            .path()
+            .join("uploads")
+            .join("agent-1")
+            .join("my-shot.png");
         assert_eq!(uploaded["path"], json!(on_disk.to_string_lossy()));
         assert_eq!(std::fs::read(&on_disk).expect("read"), big);
+        // A private copy alongside, and both private to the user.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let blob = dir.path().join("blobs").join("agent-1").join("my-shot.png");
+            assert_eq!(std::fs::read(&blob).expect("private copy"), big);
+            let mode = |p: &std::path::Path| {
+                std::fs::metadata(p).expect("meta").permissions().mode() & 0o777
+            };
+            for file in [&on_disk, &blob] {
+                assert_eq!(mode(file), 0o600, "{}", file.display());
+            }
+            for folder in ["uploads", "blobs"] {
+                assert_eq!(mode(&dir.path().join(folder)), 0o700, "{folder}");
+                assert_eq!(
+                    mode(&dir.path().join(folder).join("agent-1")),
+                    0o700,
+                    "{folder}"
+                );
+            }
+        }
 
         // The same name again is numbered, not overwritten.
         let response = call(
@@ -3008,7 +3058,13 @@ console.log("ok");
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(!dir.path().join("agent-1").join("my-shot-2.png").exists());
+        assert!(
+            !dir.path()
+                .join("uploads")
+                .join("agent-1")
+                .join("my-shot-2.png")
+                .exists()
+        );
         let response = call(
             &state,
             "GET",
@@ -3092,7 +3148,13 @@ console.log("ok");
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(!dir.path().join("agent-1").join("a-1-2.pdf").exists());
+        assert!(
+            !dir.path()
+                .join("uploads")
+                .join("agent-1")
+                .join("a-1-2.pdf")
+                .exists()
+        );
         let response = call(
             &state,
             "GET",
@@ -3104,23 +3166,30 @@ console.log("ok");
         assert_eq!(listed["uploads"].as_array().expect("list").len(), 1);
     }
 
-    /// The download is streamed with the length the file had when it was
-    /// opened, so a large one is not read whole into memory.
+    /// The download is streamed from the private copy with its recorded
+    /// length, so a large one is not read whole into memory — and whatever the
+    /// agent does to its own copy, growing it included, changes nothing.
     #[tokio::test]
-    async fn a_large_download_is_streamed_with_its_length() {
+    async fn a_large_download_is_streamed_from_the_private_copy() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = upload_state(dir.path(), 50).await;
+        let big: Vec<u8> = (0..5 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
         let response = call(
             &state,
             "POST",
             "/api/agents/agent-1/uploads?name=big.bin",
-            b"x".to_vec(),
+            big.clone(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        // The agent grows it in place, past anything the upload would allow.
-        let big: Vec<u8> = (0..5 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
-        std::fs::write(dir.path().join("agent-1").join("big.bin"), &big).expect("grow");
+        // The agent grows its copy in place, past anything an upload allows.
+        let mut grown = big.clone();
+        grown.extend(vec![0u8; 1024 * 1024]);
+        std::fs::write(
+            dir.path().join("uploads").join("agent-1").join("big.bin"),
+            &grown,
+        )
+        .expect("grow");
 
         let response = call(&state, "GET", "/api/agents/agent-1/uploads/big.bin", vec![]).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -3132,6 +3201,15 @@ console.log("ok");
             big.len().to_string().as_str()
         );
         assert_eq!(body_of(response).await, big);
+
+        // A private copy that is no longer the recorded size is refused.
+        std::fs::write(
+            dir.path().join("blobs").join("agent-1").join("big.bin"),
+            b"short",
+        )
+        .expect("corrupt");
+        let response = call(&state, "GET", "/api/agents/agent-1/uploads/big.bin", vec![]).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// The agent may move a sent file away, freeing its name on disk. A new
@@ -3141,7 +3219,7 @@ console.log("ok");
     async fn a_name_once_recorded_is_never_reused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = upload_state(dir.path(), 50).await;
-        let folder = dir.path().join("agent-1");
+        let folder = dir.path().join("uploads").join("agent-1");
         let upload = |body: &'static [u8]| {
             let state = state.clone();
             async move {
@@ -3192,9 +3270,12 @@ console.log("ok");
             vec![],
         )
         .await;
+        // The old chip still serves exactly what was sent, from the private
+        // copy, never the new upload.
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.status(),
-            StatusCode::NOT_FOUND,
+            body_of(response).await,
+            b"old",
             "the old chip never serves new content"
         );
 
@@ -3226,7 +3307,7 @@ console.log("ok");
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let state = upload_state(dir.path(), 50).await;
-            let folder = dir.path().join("agent-1");
+            let folder = dir.path().join("uploads").join("agent-1");
             let post = |name: &'static str, body: &'static [u8]| {
                 let state = state.clone();
                 async move {
@@ -3276,10 +3357,11 @@ console.log("ok");
                 vec![],
             )
             .await;
+            assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "the old chip must not serve the new file"
+                body_of(response).await,
+                b"old",
+                "the old chip serves what was sent, not the new file"
             );
         }
     }
@@ -3295,12 +3377,12 @@ console.log("ok");
             .sup
             .db()
             .run(|db| {
-                db.insert_upload("agent-1", "image.png", 1)?;
+                db.insert_upload("agent-1", "image.png", 1, "")?;
                 for n in 2..=1500 {
-                    db.insert_upload("agent-1", &format!("image-{n}.png"), 1)?;
+                    db.insert_upload("agent-1", &format!("image-{n}.png"), 1, "")?;
                 }
                 // A case variant counts against the same name.
-                db.insert_upload("agent-1", "IMAGE-1600.PNG", 1)
+                db.insert_upload("agent-1", "IMAGE-1600.PNG", 1, "")
             })
             .await
             .expect("seed");
@@ -3319,7 +3401,7 @@ console.log("ok");
             started.elapsed() < Duration::from_secs(5),
             "no walk over earlier names"
         );
-        let folder = dir.path().join("agent-1");
+        let folder = dir.path().join("uploads").join("agent-1");
         let on_disk: Vec<_> = std::fs::read_dir(&folder)
             .expect("dir")
             .flatten()
@@ -3328,73 +3410,92 @@ console.log("ok");
         assert_eq!(on_disk.len(), 1, "no placeholders left behind: {on_disk:?}");
     }
 
-    /// The finaliser leaves the file and its row together or neither: it
-    /// runs on a blocking thread so a client going away cannot stop it
-    /// half-way, and every way it can fail removes the file.
+    /// The finaliser leaves both copies and the row together or none of
+    /// them: it runs on a blocking thread so a client going away cannot stop
+    /// it half-way, and every way it can fail removes the files.
     #[tokio::test]
-    async fn finishing_an_upload_keeps_the_file_and_the_row_together() {
+    async fn finishing_an_upload_keeps_the_files_and_the_row_together() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = upload_state(dir.path(), 50).await;
         let db = state.sup.db().clone();
-        let folder = dir.path().join("agent-1");
-        std::fs::create_dir_all(&folder).expect("mkdir");
+        let blobs = state.sup.blobs_dir("agent-1");
+        let agent = state.sup.uploads_dir("agent-1");
+        uploads::ensure_dir(&blobs).expect("blobs");
+        uploads::ensure_dir(&agent).expect("agent");
+        // What the upload route has done by the time it finishes: both names
+        // reserved, the private copy written.
+        let reserved = |name: &str, body: &str| {
+            let (_, name, suffix) =
+                uploads::create_unique(&[&blobs, &agent], name, 1).expect("reserve");
+            std::fs::write(blobs.join(&name), body).expect("write");
+            let sha = uploads::sha256_hex(body.as_bytes()).expect("hash");
+            let guard = PartialUpload {
+                blob_dir: blobs.clone(),
+                agent_dir: agent.clone(),
+                name,
+                suffix,
+                keep: false,
+            };
+            (guard, sha)
+        };
 
-        // The plain case.
-        std::fs::write(folder.join("a.txt"), "one").expect("write");
-        let upload = finish_upload(&db, &folder, "agent-1", "a.txt", "a.txt".to_string(), 1, 3)
-            .expect("finish");
-        assert_eq!(upload.name, "a.txt");
-
-        // A row holds the name but its file is gone: ours moves on.
-        db.insert_upload("agent-1", "b.txt", 9).expect("row");
-        std::fs::write(folder.join("b.txt"), "two").expect("write");
-        let upload = finish_upload(&db, &folder, "agent-1", "b.txt", "b.txt".to_string(), 1, 3)
-            .expect("finish");
-        assert_eq!(upload.name, "b-2.txt");
-        assert!(!folder.join("b.txt").exists());
+        // The plain case: the agent's copy is written from the private one.
+        let (guard, sha) = reserved("a.txt", "one");
+        let upload = finish_upload(&db, "agent-1", "a.txt", guard, 3, &sha).expect("finish");
         assert_eq!(
-            std::fs::read_to_string(folder.join("b-2.txt")).expect("read"),
+            (upload.name.as_str(), upload.sha256.as_str()),
+            ("a.txt", sha.as_str())
+        );
+        assert_eq!(
+            std::fs::read_to_string(agent.join("a.txt")).expect("read"),
+            "one"
+        );
+
+        // A row holds the name but its files are gone: ours move on.
+        db.insert_upload("agent-1", "b.txt", 9, "").expect("row");
+        let (guard, sha) = reserved("b.txt", "two");
+        let upload = finish_upload(&db, "agent-1", "b.txt", guard, 3, &sha).expect("finish");
+        assert_eq!(upload.name, "b-2.txt");
+        assert!(!agent.join("b.txt").exists() && !blobs.join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(agent.join("b-2.txt")).expect("read"),
+            "two"
+        );
+        assert_eq!(
+            std::fs::read_to_string(blobs.join("b-2.txt")).expect("read"),
             "two"
         );
 
-        // The insert fails outright — the agent was deleted meanwhile: the
-        // file goes, and there is no row.
-        std::fs::write(folder.join("c.txt"), "three").expect("write");
-        let gone = finish_upload(
-            &db,
-            &folder,
-            "no-such-agent",
-            "c.txt",
-            "c.txt".to_string(),
-            1,
-            5,
-        );
-        assert!(gone.is_err());
-        assert!(!folder.join("c.txt").exists(), "no file without a row");
-        assert!(
-            db.get_upload("no-such-agent", "c.txt")
-                .expect("get")
-                .is_none()
-        );
+        // The insert fails outright — the agent was deleted meanwhile: both
+        // files go, and there is no row.
+        let (guard, sha) = reserved("c.txt", "three");
+        assert!(finish_upload(&db, "no-such-agent", "c.txt", guard, 5, &sha).is_err());
+        assert!(!agent.join("c.txt").exists() && !blobs.join("c.txt").exists());
 
-        // Whatever is left: every row has its file and every file its row.
-        let rows: Vec<String> = db
+        // A private copy that does not match what was hashed is not spread.
+        let (guard, _) = reserved("d.txt", "four");
+        assert!(finish_upload(&db, "agent-1", "d.txt", guard, 4, "0000").is_err());
+        assert!(!agent.join("d.txt").exists() && !blobs.join("d.txt").exists());
+
+        // Whatever is left: every row has both files and every file a row.
+        let mut rows: Vec<String> = db
             .list_uploads("agent-1", false)
             .expect("list")
             .into_iter()
             .map(|u| u.name)
-            .filter(|n| folder.join(n).exists())
+            .filter(|n| n != "b.txt")
             .collect();
-        let mut files: Vec<String> = std::fs::read_dir(&folder)
-            .expect("dir")
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        files.sort();
-        let mut rows = rows;
         rows.sort();
-        assert_eq!(files, rows);
-        assert_eq!(files, vec!["a.txt", "b-2.txt"]);
+        for folder in [&agent, &blobs] {
+            let mut files: Vec<String> = std::fs::read_dir(folder)
+                .expect("dir")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            files.sort();
+            assert_eq!(files, rows, "{}", folder.display());
+        }
+        assert_eq!(rows, vec!["a.txt", "b-2.txt"]);
     }
 
     /// A client that goes away mid-upload — the chip's ×, a dropped
@@ -3430,12 +3531,15 @@ console.log("ok");
         ));
         let task = tokio::spawn(router(state.clone()).oneshot(request));
         reached_rx.await.expect("the handler reads the body");
-        let file = dir.path().join("agent-1").join("half.bin");
+        let file = dir.path().join("uploads").join("agent-1").join("half.bin");
+        let blob = dir.path().join("blobs").join("agent-1").join("half.bin");
+        assert!(blob.exists(), "the private copy is under way too");
         assert!(file.exists(), "the upload is under way");
 
         task.abort();
         assert!(task.await.expect_err("aborted").is_cancelled());
         assert!(!file.exists(), "an abandoned upload is removed");
+        assert!(!blob.exists(), "and so is its private copy");
         let totals = state
             .sup
             .db()
@@ -3443,6 +3547,44 @@ console.log("ok");
             .await
             .expect("totals");
         assert_eq!(totals, (0, 0));
+    }
+
+    /// A client that stops sending without going away is given up after
+    /// `UPLOAD_IDLE`, and its partial files go with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_upload_is_given_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = upload_state(dir.path(), 50).await;
+        let body = futures_util::stream::unfold(0, |step| async move {
+            if step == 0 {
+                return Some((Ok::<_, std::io::Error>(vec![1u8; 1024]), 1));
+            }
+            futures_util::future::pending::<()>().await;
+            None
+        });
+        let mut request = api_request("/api/agents/agent-1/uploads?name=stalled.bin")
+            .method("POST")
+            .header(TOKEN_HEADER, TEST_TOKEN)
+            .body(axum::body::Body::from_stream(body))
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(
+            LOOPBACK_PEER.parse::<SocketAddr>().expect("peer"),
+        ));
+        let response = {
+            use tower::ServiceExt;
+            router(state.clone())
+                .oneshot(request)
+                .await
+                .expect("response")
+        };
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(UPLOAD_IDLE <= Duration::from_secs(60));
+        for folder in ["uploads", "blobs"] {
+            let left: Vec<_> = std::fs::read_dir(dir.path().join(folder).join("agent-1"))
+                .map(|d| d.flatten().map(|e| e.file_name()).collect())
+                .unwrap_or_default();
+            assert!(left.is_empty(), "{folder}: {left:?}");
+        }
     }
 
     /// Over the cap is refused, whether the client says so up front or not,
@@ -3482,7 +3624,7 @@ console.log("ok");
         };
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-        let folder = dir.path().join("agent-1");
+        let folder = dir.path().join("uploads").join("agent-1");
         let left: Vec<_> = std::fs::read_dir(&folder)
             .map(|d| d.flatten().map(|e| e.file_name()).collect())
             .unwrap_or_default();
@@ -3506,11 +3648,12 @@ console.log("ok");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    /// The agent can write in its own upload folder. A link it plants in
-    /// place of an upload must not turn the download route into a way to read
-    /// anything else; and a name that was never stored never reaches a path.
+    /// The agent can write in its own upload folder. Nothing it plants there
+    /// — a symlink or a hard link to someone else's file, or an edit — changes
+    /// what a download serves: that comes from the portal's private copy. And
+    /// a name that was never stored never reaches a path.
     #[tokio::test]
-    async fn a_download_refuses_symlinks_and_unstored_names() {
+    async fn a_download_never_serves_what_the_agent_planted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = upload_state(dir.path(), 50).await;
         let response = call(
@@ -3524,19 +3667,24 @@ console.log("ok");
 
         let secret = dir.path().join("secret.txt");
         std::fs::write(&secret, "do not serve").expect("write");
-        let planted = dir.path().join("agent-1").join("notes.txt");
-        std::fs::remove_file(&planted).expect("rm");
-        std::os::unix::fs::symlink(&secret, &planted).expect("symlink");
-
-        let response = call(
-            &state,
-            "GET",
-            "/api/agents/agent-1/uploads/notes.txt",
-            vec![],
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(!String::from_utf8_lossy(&body_of(response).await).contains("do not serve"));
+        let planted = dir.path().join("uploads").join("agent-1").join("notes.txt");
+        for plant in ["symlink", "hard link", "edit"] {
+            std::fs::remove_file(&planted).expect("rm");
+            match plant {
+                "symlink" => std::os::unix::fs::symlink(&secret, &planted).expect("symlink"),
+                "hard link" => std::fs::hard_link(&secret, &planted).expect("hard link"),
+                _ => std::fs::write(&planted, "do not serve").expect("edit"),
+            }
+            let response = call(
+                &state,
+                "GET",
+                "/api/agents/agent-1/uploads/notes.txt",
+                vec![],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{plant}");
+            assert_eq!(body_of(response).await, b"mine", "{plant}");
+        }
 
         for path in [
             "/api/agents/agent-1/uploads/..%2Fsecret.txt",
@@ -3547,7 +3695,10 @@ console.log("ok");
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
 
-        // Withdrawing removes the link, never what it points at.
+        // Withdrawing removes both copies — the agent's as an entry, never
+        // what it points at.
+        std::fs::remove_file(&planted).expect("rm");
+        std::os::unix::fs::symlink(&secret, &planted).expect("symlink");
         let response = call(
             &state,
             "DELETE",
@@ -3559,6 +3710,14 @@ console.log("ok");
         assert_eq!(
             std::fs::read_to_string(&secret).expect("read"),
             "do not serve"
+        );
+        assert!(std::fs::symlink_metadata(&planted).is_err());
+        assert!(
+            !dir.path()
+                .join("blobs")
+                .join("agent-1")
+                .join("notes.txt")
+                .exists()
         );
     }
 
@@ -3580,7 +3739,7 @@ console.log("ok");
             .collect();
         let source = format!(
             r#"
-import {{ awaitingConfirmation, composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, reconcilePending, restoreDraft, settleSend, uploadsUrl }} from "{module}";
+import {{ awaitingConfirmation, composerState, confirmSent, frameTooLarge, MAX_SOCKET_MESSAGE, humanSize, markSending, mergePending, pastedFiles, reconcilePending, restoreDraft, settleSend, uploadsUrl }} from "{module}";
 const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
 
 {sizes}
@@ -3681,12 +3840,21 @@ assert(restoreDraft("  ", "look at this") === "look at this", "blank counts as e
 assert(restoreDraft("new draft", "look at this") === "new draft", "typing since is never overwritten");
 assert(restoreDraft("", null) === "", "nothing remembered, nothing restored");
 
+// The composer refuses a frame the socket would close on, measured as sent.
+assert(MAX_SOCKET_MESSAGE === {max_socket}, "uploads.js must mirror ws::MAX_WS_MESSAGE");
+const frame = (text) => ({{ type: "send_message", agent_id: "a", text, attachments: [] }});
+assert(!frameTooLarge(frame("x".repeat(MAX_SOCKET_MESSAGE - 200))), "a long paste under the limit goes");
+assert(frameTooLarge(frame("x".repeat(MAX_SOCKET_MESSAGE))), "one over it is refused");
+assert(frameTooLarge(frame("é".repeat(MAX_SOCKET_MESSAGE / 2 + 1))), "measured in UTF-8 bytes");
+assert(frameTooLarge(frame("\n".repeat(MAX_SOCKET_MESSAGE / 2 + 1))), "and as escaped JSON");
+
 assert(uploadsUrl("a b") === "/api/agents/a%20b/uploads", uploadsUrl("a b"));
 assert(uploadsUrl("x", "r?é.png") === "/api/agents/x/uploads/r%3F%C3%A9.png", uploadsUrl("x", "r?é.png"));
 console.log("ok");
 "#,
             module = module.display(),
             sizes = sizes.join("\n"),
+            max_socket = super::super::ws::MAX_WS_MESSAGE,
         );
         std::fs::write(&driver, source).expect("write driver");
         let output = match std::process::Command::new("node").arg(&driver).output() {
@@ -3714,7 +3882,7 @@ console.log("ok");
             .to_string();
         assert!(
             js.contains(
-                "socket.send({ type: 'send_message', agent_id: state.agent.id, text, attachments })"
+                "const frame = { type: 'send_message', agent_id: state.agent.id, text, attachments };"
             ),
             "the message must carry the attachment names"
         );

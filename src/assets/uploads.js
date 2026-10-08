@@ -22,6 +22,17 @@ export function uploadsUrl(agentId, name) {
   return name === undefined ? base : `${base}/${encodeURIComponent(name)}`;
 }
 
+/// The largest message the server's socket accepts, in bytes. Mirrors
+/// `ws::MAX_WS_MESSAGE`; a test holds them together.
+export const MAX_SOCKET_MESSAGE = 2097152;
+
+/// Would this frame, as sent, be too big for the socket? Measured on the JSON
+/// actually sent, in UTF-8 bytes — escaping and non-ASCII both count. Too big
+/// would close the socket and lose the message, so the composer refuses it.
+export function frameTooLarge(frame) {
+  return new TextEncoder().encode(JSON.stringify(frame)).length > MAX_SOCKET_MESSAGE;
+}
+
 /// What Send should do, given the composer's state. `chips` is the list of
 /// attachments, each with a `status` of `uploading`, `done` or `failed`.
 ///

@@ -2,7 +2,7 @@
 import { announceAttention, releaseAttention, api, applyTextSize, el, needToken, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast, token, trackStatus, trackSnapshot } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 import { newKeys } from '/assets/attention.js';
-import { awaitingConfirmation, composerState, confirmSent, humanSize, markSending, mergePending, pastedFiles, restoreDraft, settleSend, uploadsUrl } from '/assets/uploads.js';
+import { awaitingConfirmation, composerState, frameTooLarge, confirmSent, humanSize, markSending, mergePending, pastedFiles, restoreDraft, settleSend, uploadsUrl } from '/assets/uploads.js';
 import { clampSideWidth, keyedSideWidth, loadSideWidth, saveSideWidth, sideWidthBounds } from '/assets/splitter.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
@@ -1020,7 +1020,14 @@ function send() {
     toast('Wait for the uploads to finish, then send.', 'warn');
     return;
   }
-  socket.send({ type: 'send_message', agent_id: state.agent.id, text, attachments });
+  const frame = { type: 'send_message', agent_id: state.agent.id, text, attachments };
+  // Over the socket's limit the server would close the connection and the
+  // message would be lost; refuse it here and keep the draft.
+  if (frameTooLarge(frame)) {
+    toast('This message is too long to send (2 MB limit). Attach it as a file instead — your text has been kept.', 'warn');
+    return;
+  }
+  socket.send(frame);
   // A send with attachments can be refused (a chip gone stale in another
   // tab); keep its text so the refusal can put it back.
   state.sentText = attachments.length ? text : null;

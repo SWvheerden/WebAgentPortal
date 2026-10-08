@@ -98,12 +98,21 @@ pub fn should_forward(msg: &ServerMsg, subscriptions: &HashSet<String>) -> bool 
 /// The credential is checked on the upgrade, and the client it identifies is
 /// carried for the life of the socket: every decision made over it is attributed
 /// to the device that opened it (§12).
+/// The largest frame or message a client may send. The library default is
+/// 64 MiB, far beyond anything the pages send: the biggest is a message typed
+/// or pasted into the composer, which refuses one over this size itself
+/// (`MAX_SOCKET_MESSAGE` in uploads.js, held to this by a test) and suggests
+/// attaching it as a file instead.
+pub const MAX_WS_MESSAGE: usize = 2 * 1024 * 1024;
+
 pub async fn handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Extension(initiator): Extension<Initiator>,
 ) -> Response {
-    ws.on_upgrade(move |socket| run(socket, state, initiator))
+    ws.max_message_size(MAX_WS_MESSAGE)
+        .max_frame_size(MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| run(socket, state, initiator))
 }
 
 async fn run(mut socket: WebSocket, state: AppState, initiator: Initiator) {
@@ -402,6 +411,16 @@ mod tests {
                 serde_json::to_value(&back).expect("value")
             );
         }
+    }
+
+    /// The socket refuses frames past a modest limit rather than the
+    /// library's 64 MiB, with room for any message the composer will send.
+    #[test]
+    fn the_socket_takes_a_bounded_message() {
+        assert_eq!(MAX_WS_MESSAGE, 2 * 1024 * 1024);
+        let source = include_str!("ws.rs");
+        assert!(source.contains(".max_message_size(MAX_WS_MESSAGE)"));
+        assert!(source.contains(".max_frame_size(MAX_WS_MESSAGE)"));
     }
 
     /// A page from before attachments sends none, and that is still a message.
