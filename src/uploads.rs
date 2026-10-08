@@ -104,12 +104,14 @@ fn fit(stem: &str, ext: &str, suffix: &str) -> String {
 }
 
 /// Create a new file in `dir` named `name`, or `name-2`, `name-3`… if that is
-/// taken. Never overwrites, and never follows a symlink someone left at the
-/// name: `create_new` fails on any existing entry, links included.
+/// taken, trying suffixes from `first` up (1 meaning the bare name). Never
+/// overwrites, and never follows a symlink someone left at the name:
+/// `create_new` fails on any existing entry, links included.
 ///
-/// Returns the open file and the name it got.
-pub fn create_unique(dir: &Path, name: &str) -> Result<(File, String)> {
-    for n in 1..=MAX_SUFFIX {
+/// Returns the open file, the name it got, and that name's suffix number, so
+/// a caller that finds the name taken elsewhere can carry on past it.
+pub fn create_unique(dir: &Path, name: &str, first: u32) -> Result<(File, String, u32)> {
+    for n in first.max(1)..=MAX_SUFFIX {
         let candidate = if n == 1 {
             name.to_string()
         } else {
@@ -120,7 +122,7 @@ pub fn create_unique(dir: &Path, name: &str) -> Result<(File, String)> {
             .create_new(true)
             .open(dir.join(&candidate))
         {
-            Ok(file) => return Ok((file, candidate)),
+            Ok(file) => return Ok((file, candidate, n)),
             Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
             Err(err) => {
                 return Err(err)
@@ -342,9 +344,12 @@ mod tests {
     #[test]
     fn collisions_get_a_numbered_name_and_nothing_is_overwritten() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (_, first) = create_unique(dir.path(), "report.pdf").expect("first");
-        let (_, second) = create_unique(dir.path(), "report.pdf").expect("second");
-        let (_, third) = create_unique(dir.path(), "report.pdf").expect("third");
+        let (_, first, _) = create_unique(dir.path(), "report.pdf", 1).expect("first");
+        let (_, second, _) = create_unique(dir.path(), "report.pdf", 1).expect("second");
+        let (_, third, n) = create_unique(dir.path(), "report.pdf", 1).expect("third");
+        assert_eq!(n, 3);
+        let (_, later, _) = create_unique(dir.path(), "report.pdf", 7).expect("later");
+        assert_eq!(later, "report-7.pdf", "starting past a name skips it");
         assert_eq!(
             (first.as_str(), second.as_str(), third.as_str()),
             ("report.pdf", "report-2.pdf", "report-3.pdf")
@@ -360,7 +365,7 @@ mod tests {
         std::fs::create_dir(&uploads).expect("mkdir");
         std::os::unix::fs::symlink(&target, uploads.join("notes.txt")).expect("symlink");
 
-        let (_, name) = create_unique(&uploads, "notes.txt").expect("create");
+        let (_, name, _) = create_unique(&uploads, "notes.txt", 1).expect("create");
         assert_eq!(
             name, "notes-2.txt",
             "the link's name is skipped, not followed"

@@ -1846,6 +1846,43 @@ impl Runner {
                 },
             }
         }
+        self.drop_unsent().await;
+    }
+
+    /// The child is gone; anything still queued for it never will be sent.
+    ///
+    /// Closing the channel first makes every later `command` fail, so a send
+    /// that loses this race is refused (and releases its own claim) rather
+    /// than queued into nothing. A send that was already queued had claimed
+    /// its uploads: they go back to pending, and an error notice tells the
+    /// page, which puts the chips back.
+    async fn drop_unsent(&mut self) {
+        self.cmd_rx.close();
+        let mut dropped = 0;
+        let mut names: Vec<String> = Vec::new();
+        while let Ok(cmd) = self.cmd_rx.try_recv() {
+            if let AgentCommand::Send { attachments, .. } = cmd {
+                dropped += 1;
+                names.extend(attachments.into_iter().map(|a| a.name));
+            }
+        }
+        if dropped == 0 {
+            return;
+        }
+        if !names.is_empty() {
+            let id = self.id.clone();
+            if let Err(err) = self.db.run(move |db| db.release_uploads(&id, &names)).await {
+                tracing::warn!(agent = %self.id, ?err, "could not release unsent uploads");
+            }
+        }
+        self.emit(ServerMsg::Notice {
+            agent_id: Some(self.id.clone()),
+            level: "error".to_string(),
+            text: format!(
+                "{dropped} message(s) were not delivered: the agent exited first. \
+                 Any attached files are back in the composer."
+            ),
+        });
     }
 
     fn emit(&self, msg: ServerMsg) {
@@ -4999,5 +5036,77 @@ mod tests {
         assert_eq!(totals, (0, 0));
         let report = sup.delete_preview("bystander").await.expect("preview");
         assert!(report.uploads.is_some());
+    }
+
+    /// A message queued for a runner whose child exits before it is handled
+    /// is never sent: its claimed uploads go back to pending, the page is
+    /// told, and a later send to the dead runner is refused.
+    ///
+    /// The exit and the send are both queued before the runner looks, and
+    /// `select!` picks between ready branches at random, so a trial may
+    /// deliver the message instead (also correct). Trials repeat until the
+    /// exit has won at least once.
+    #[tokio::test]
+    async fn a_send_still_queued_when_the_child_exits_releases_its_uploads() {
+        let mut dropped_seen = false;
+        for _ in 0..64 {
+            let mut harness = Harness::start();
+            harness
+                .db
+                .insert_upload("agent-1", "late.png", 5)
+                .expect("upload");
+            harness
+                .db
+                .claim_uploads("agent-1", &["late.png".to_string()])
+                .expect("claim");
+            let cmds = harness.cmds.take().expect("sender");
+            harness
+                .msgs
+                .send(ProcessMsg::Exited(ExitInfo {
+                    code: Some(1),
+                    signal: None,
+                    requested: false,
+                }))
+                .expect("exit");
+            cmds.send(AgentCommand::Send {
+                text: "too late".to_string(),
+                attachments: vec![Attachment {
+                    name: "late.png".to_string(),
+                    size: 5,
+                    path: "/u/agent-1/late.png".to_string(),
+                }],
+            })
+            .expect("queued");
+            harness.task.await.expect("runner finishes");
+
+            let pending = harness.db.list_uploads("agent-1", true).expect("list");
+            let events = harness.db.events_after("agent-1", 0, 500).expect("events");
+            if events.iter().any(|e| e.kind == "user") {
+                assert!(pending.is_empty(), "a delivered message keeps its claim");
+                continue;
+            }
+            assert_eq!(pending.len(), 1, "the claim is released");
+            let mut told = false;
+            while let Ok(msg) = harness.events.try_recv() {
+                if let ServerMsg::Notice {
+                    level,
+                    text,
+                    agent_id,
+                } = msg
+                {
+                    told |= level == "error"
+                        && agent_id.as_deref() == Some("agent-1")
+                        && text.contains("not delivered");
+                }
+            }
+            assert!(told, "the page is told, so it restores the chips");
+            assert!(
+                cmds.send(AgentCommand::Interrupt).is_err(),
+                "the channel is closed: a later send is refused, not lost"
+            );
+            dropped_seen = true;
+            break;
+        }
+        assert!(dropped_seen, "the exit never won a race in 64 trials");
     }
 }

@@ -1239,7 +1239,10 @@ a reload puts pending ones back (`?pending=1`).
 **Storage.** `~/.claude-web/uploads/<agent-id>/`, keyed by id, outside every repository and
 worktree, with a row per file in `uploads`. Names are cleaned to a basename of letters,
 digits, `.`, `_` and `-` (no leading dot or dash, at most 120 bytes, `upload` if nothing is
-left), and a clash becomes `report-2.pdf` rather than an overwrite. `upload_max_mb` (default
+left), and a clash becomes `report-2.pdf` rather than an overwrite. A name that has ever had a
+row is never handed out again, even if the agent has since moved its file away: the row is
+inserted with a plain `INSERT`, and on a conflict the file moves on to the next free name, so a
+sent message's chip and trailer can never come to name different content. `upload_max_mb` (default
 50) is enforced while the body streams; axum's 2 MB default is lifted on this one route only.
 There is no total quota yet.
 
@@ -1249,7 +1252,8 @@ permission prompts for it until it is restarted. `send_message` (socket or REST)
 `attachments: [name]`; the server claims them in one transaction — every name must be one of
 the agent's pending rows, all are marked sent or none are, so two tabs sending the same file or
 a withdraw racing a send cannot both win, and a client never supplies a path. A send that then
-fails to reach the agent hands them back to pending. The page keeps the chips as "sending"
+fails to reach the agent hands them back to pending — including one still queued when the
+agent's process exits, which the runner drains, releases and reports as an error notice. The page keeps the chips as "sending"
 until the agent's own user event confirms them, and on an error notice re-fetches what is still
 pending. The CLI receives
 

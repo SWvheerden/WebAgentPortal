@@ -999,9 +999,10 @@ async fn upload_file(
     let dir = state.sup.uploads_dir(&record.id);
     let wanted = uploads::clean_name(&q.name);
     let dir_for_create = dir.clone();
-    let (file, name) = tokio::task::spawn_blocking(move || {
+    let wanted_again = uploads::clean_name(&q.name);
+    let (file, mut name, mut suffix) = tokio::task::spawn_blocking(move || {
         uploads::ensure_dir(&dir_for_create)?;
-        uploads::create_unique(&dir_for_create, &wanted)
+        uploads::create_unique(&dir_for_create, &wanted, 1)
     })
     .await
     .map_err(ApiError::bad_request)?
@@ -1048,14 +1049,43 @@ async fn upload_file(
         return Err(err);
     }
 
-    let agent_id = record.id.clone();
-    let stored = name.clone();
-    let upload = state
-        .sup
-        .db()
-        .run(move |db| db.insert_upload(&agent_id, &stored, size))
-        .await;
-    let upload = upload.map_err(ApiError::from)?;
+    // The row is what makes the name ours. If one already holds it — an
+    // earlier upload whose file the agent moved away — the file moves on to
+    // the next free name and tries again; plain INSERT makes that race-free.
+    let upload = loop {
+        let agent_id = record.id.clone();
+        let stored = name.clone();
+        let inserted = state
+            .sup
+            .db()
+            .run(move |db| db.insert_upload(&agent_id, &stored, size))
+            .await?;
+        if let Some(upload) = inserted {
+            break upload;
+        }
+        let dir_for_move = dir.clone();
+        let wanted = wanted_again.clone();
+        let from = partial.path.clone();
+        let (next, next_suffix) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let (placeholder, next, n) =
+                uploads::create_unique(&dir_for_move, &wanted, suffix + 1)?;
+            drop(placeholder);
+            let to = dir_for_move.join(&next);
+            // Onto our own empty placeholder; a link planted there in the
+            // meantime is replaced, never followed.
+            if let Err(err) = std::fs::rename(&from, &to) {
+                std::fs::remove_file(&to).ok();
+                return Err(err.into());
+            }
+            Ok((next, n))
+        })
+        .await
+        .map_err(ApiError::bad_request)?
+        .map_err(ApiError::from)?;
+        partial.path = dir.join(&next);
+        name = next;
+        suffix = next_suffix;
+    };
     partial.keep = true;
     Ok(Json(upload_json(&state, &record.id, &upload)))
 }
@@ -3069,6 +3099,87 @@ console.log("ok");
             big.len().to_string().as_str()
         );
         assert_eq!(body_of(response).await, big);
+    }
+
+    /// The agent may move a sent file away, freeing its name on disk. A new
+    /// upload of the same name must not take over the old row: the sent
+    /// message's chip and trailer would then point at different content.
+    #[tokio::test]
+    async fn a_name_once_recorded_is_never_reused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = upload_state(dir.path(), 50).await;
+        let folder = dir.path().join("agent-1");
+        let upload = |body: &'static [u8]| {
+            let state = state.clone();
+            async move {
+                let response = call(
+                    &state,
+                    "POST",
+                    "/api/agents/agent-1/uploads?name=image.png",
+                    body.to_vec(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let json: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+                json["name"].as_str().expect("name").to_string()
+            }
+        };
+
+        assert_eq!(upload(b"old").await, "image.png");
+        state
+            .sup
+            .db()
+            .run(|db| db.claim_uploads("agent-1", &["image.png".to_string()]))
+            .await
+            .expect("send");
+        std::fs::remove_file(folder.join("image.png")).expect("the agent moves it");
+
+        assert_eq!(
+            upload(b"new").await,
+            "image-2.png",
+            "the old name stays taken"
+        );
+        let old = state
+            .sup
+            .db()
+            .run(|db| db.get_upload("agent-1", "image.png"))
+            .await
+            .expect("get")
+            .expect("old row");
+        assert!(old.sent_at.is_some(), "the sent row is untouched");
+        assert_eq!(old.size, 3);
+        assert!(
+            !folder.join("image.png").exists(),
+            "nothing was written under the old name"
+        );
+        let response = call(
+            &state,
+            "GET",
+            "/api/agents/agent-1/uploads/image.png",
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "the old chip never serves new content"
+        );
+
+        // A pending row whose file went, too: the next free name is used, and
+        // the move past a taken name leaves no stray placeholder behind.
+        std::fs::remove_file(folder.join("image-2.png")).expect("gone");
+        assert_eq!(upload(b"third").await, "image-3.png");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&folder)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        on_disk.sort();
+        assert_eq!(on_disk, vec!["image-3.png"]);
+        assert_eq!(
+            std::fs::read(folder.join("image-3.png")).expect("read"),
+            b"third"
+        );
     }
 
     /// A client that goes away mid-upload — the chip's ×, a dropped

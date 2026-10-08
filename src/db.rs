@@ -746,25 +746,26 @@ impl Db {
 
     /// Record a file that has just been written to the agent's upload folder.
     ///
-    /// Replaces a row of the same name: the file was created with
-    /// `create_new`, so a row still holding that name describes a file that
-    /// has since gone from disk.
-    pub fn insert_upload(&self, agent_id: &str, name: &str, size: u64) -> Result<Upload> {
+    /// `None` if a row already holds the name. That happens when the agent
+    /// moved or deleted an earlier upload's file, freeing the name on disk —
+    /// but the old row may be a sent message's attachment, and reusing its
+    /// name would point that message's chip and trailer at new content. A
+    /// name is never reused; the caller picks the next one.
+    pub fn insert_upload(&self, agent_id: &str, name: &str, size: u64) -> Result<Option<Upload>> {
         let upload = Upload {
             name: name.to_string(),
             size,
             created_at: now_ms(),
             sent_at: None,
         };
-        self.with_conn(|conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO uploads (agent_id, name, size, created_at, sent_at)
+        let inserted = self.with_conn(|conn| {
+            Ok(conn.execute(
+                "INSERT OR IGNORE INTO uploads (agent_id, name, size, created_at, sent_at)
                  VALUES (?1, ?2, ?3, ?4, NULL)",
                 params![agent_id, upload.name, upload.size as i64, upload.created_at],
-            )?;
-            Ok(())
+            )?)
         })?;
-        Ok(upload)
+        Ok((inserted > 0).then_some(upload))
     }
 
     /// An agent's uploads, oldest first; only the unsent ones if `pending`.
@@ -1297,6 +1298,25 @@ mod tests {
 
         db.claim_uploads("a", &["one.txt".to_string()])
             .expect("claim");
+        // The name is never handed out again, sent or not.
+        assert!(
+            db.insert_upload("a", "one.txt", 99)
+                .expect("insert")
+                .is_none()
+        );
+        assert!(
+            db.insert_upload("a", "two.png", 99)
+                .expect("insert")
+                .is_none()
+        );
+        assert!(
+            db.get_upload("a", "one.txt")
+                .expect("get")
+                .expect("row")
+                .sent_at
+                .is_some(),
+            "a refused insert leaves the sent row alone"
+        );
         let pending = db.list_uploads("a", true).expect("list");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "two.png");
