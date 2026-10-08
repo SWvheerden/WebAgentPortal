@@ -1,7 +1,8 @@
 // Agent detail: transcript, approvals, composer, slash commands.
-import { announceAttention, releaseAttention, api, applyTextSize, el, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast, trackStatus, trackSnapshot } from '/assets/common.js';
+import { announceAttention, releaseAttention, api, applyTextSize, el, needToken, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast, token, trackStatus, trackSnapshot } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
 import { newKeys } from '/assets/attention.js';
+import { composerState, humanSize, pastedFiles, uploadsUrl } from '/assets/uploads.js';
 import { clampSideWidth, keyedSideWidth, loadSideWidth, saveSideWidth, sideWidthBounds } from '/assets/splitter.js';
 
 const slug = decodeURIComponent(location.pathname.replace(/^\/agent\//, ''));
@@ -24,6 +25,10 @@ const state = {
   history: [],
   historyAt: null,
   historyEdits: new Map(),
+  /// Attachments in the composer: `{ label, name, size, loaded, status, xhr }`,
+  /// where `status` is `uploading`, `done` or `failed`. `name` is what the
+  /// server stored it as, once it has.
+  uploads: [],
 };
 
 // -- transcript -------------------------------------------------------------
@@ -76,10 +81,21 @@ function renderEvent(event) {
   switch (event.kind) {
     case 'user': {
       const text = textOf(p.message) || (typeof p.message === 'string' ? p.message : '');
-      if (!text) return null;
+      // The text as typed: the "Attached files:" trailer the agent was sent
+      // is not stored, the attachments are, and they render as chips.
+      const attachments = Array.isArray(p.attachments) ? p.attachments : [];
+      if (!text && !attachments.length) return null;
       return el('div', { class: 'ev user' }, [
         el('div', { class: 'who', text: 'you' }),
-        el('div', { class: 'body', text }),
+        text ? el('div', { class: 'body', text }) : null,
+        attachments.length
+          ? el('div', { class: 'attachments' }, attachments.map((a) => el('button', {
+            class: 'chip',
+            title: `Download ${a.name}`,
+            text: `📎 ${a.name} · ${humanSize(a.size || 0)}`,
+            onclick: () => download(a.name),
+          })))
+          : null,
       ]);
     }
     case 'assistant': {
@@ -602,11 +618,7 @@ function renderHeader() {
   $('btn-interrupt').disabled = !running;
   $('btn-stop').disabled = !running;
   $('btn-resume').disabled = running;
-  // Grey out Send rather than the box itself: a draft typed against an agent
-  // that has since exited stays typed, and Resume makes it sendable again.
-  const sendButton = $('send');
-  sendButton.disabled = !running;
-  sendButton.title = running ? '' : 'The agent is not running. Resume it to send.';
+  refreshSend();
   $('input').placeholder = running
     ? composerPlaceholder
     : 'The agent is not running — Resume it to send. Anything typed here is kept.';
@@ -743,6 +755,187 @@ function recall(step) {
 
 // -- composer ---------------------------------------------------------------
 
+function composer() {
+  return composerState({ running: isRunning(), text: $('input').value, chips: state.uploads });
+}
+
+/// Grey out Send rather than the box itself: a draft typed against an agent
+/// that has since exited stays typed, and Resume makes it sendable again. An
+/// upload still in flight greys it too, or the message would go without it.
+function refreshSend() {
+  const { blocked, reason } = composer();
+  const button = $('send');
+  button.disabled = blocked;
+  button.title = reason;
+}
+
+// -- attachments ------------------------------------------------------------
+//
+// Each file uploads on its own XHR the moment it is picked, dropped or pasted,
+// so several go in parallel and each chip shows its own progress (fetch has no
+// upload progress). Finished ones wait as pending on the server until a
+// message carries them, which is why a reload can put them back.
+
+function renderUploads() {
+  const host = $('uploads');
+  host.replaceChildren(...state.uploads.map((chip) => {
+    const label = chip.name || chip.label;
+    let detail = humanSize(chip.size);
+    if (chip.status === 'uploading') {
+      const pct = chip.size ? Math.floor((chip.loaded / chip.size) * 100) : 0;
+      detail = `${pct}%`;
+    } else if (chip.status === 'failed') {
+      detail = 'failed';
+    }
+    return el('span', { class: `chip ${chip.status}` }, [
+      el('span', { class: 'chip-name', text: `📎 ${label}` }),
+      el('span', { class: 'muted', text: detail }),
+      el('button', {
+        class: 'small',
+        text: '×',
+        title: chip.status === 'uploading' ? 'Cancel this upload' : 'Remove this attachment',
+        onclick: () => removeUpload(chip),
+      }),
+    ]);
+  }));
+  refreshSend();
+}
+
+function uploadFiles(files) {
+  if (!state.agent) return;
+  for (const file of files) {
+    const chip = { label: file.name || 'upload', name: null, size: file.size, loaded: 0, status: 'uploading', xhr: null };
+    const xhr = new XMLHttpRequest();
+    chip.xhr = xhr;
+    xhr.open('POST', `${uploadsUrl(state.agent.id)}?name=${encodeURIComponent(chip.label)}`);
+    xhr.setRequestHeader('x-claude-web-token', token);
+    xhr.setRequestHeader('content-type', 'application/octet-stream');
+    xhr.upload.onprogress = (event) => {
+      chip.loaded = event.loaded;
+      if (event.lengthComputable) chip.size = event.total;
+      renderUploads();
+    };
+    xhr.onload = () => {
+      chip.xhr = null;
+      let body = null;
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        body = null;
+      }
+      if (xhr.status >= 200 && xhr.status < 300 && body) {
+        chip.status = 'done';
+        chip.name = body.name;
+        chip.size = body.size;
+      } else {
+        if (xhr.status === 401) needToken(body && body.error);
+        chip.status = 'failed';
+        toast(`${chip.label}: ${(body && body.error) || `upload failed (${xhr.status})`}`, 'error');
+      }
+      renderUploads();
+    };
+    xhr.onerror = () => {
+      chip.xhr = null;
+      chip.status = 'failed';
+      toast(`${chip.label}: the upload did not reach the server`, 'error');
+      renderUploads();
+    };
+    xhr.onabort = () => {
+      chip.xhr = null;
+      state.uploads = state.uploads.filter((c) => c !== chip);
+      renderUploads();
+    };
+    state.uploads.push(chip);
+    xhr.send(file);
+  }
+  renderUploads();
+}
+
+/// × on a chip: cancel an upload in flight, or withdraw a finished one from
+/// the server so it is not left behind as pending.
+async function removeUpload(chip) {
+  if (chip.status === 'uploading' && chip.xhr) {
+    chip.xhr.abort();
+    return;
+  }
+  state.uploads = state.uploads.filter((c) => c !== chip);
+  renderUploads();
+  if (chip.status === 'done' && chip.name) {
+    await api(uploadsUrl(state.agent.id, chip.name), { method: 'DELETE' })
+      .catch((err) => toast(err.message, 'error'));
+  }
+}
+
+/// Put back what was attached but not yet sent, after a reload or on another
+/// device.
+async function restoreUploads() {
+  const data = await api(`${uploadsUrl(state.agent.id)}?pending=1`);
+  const known = new Set(state.uploads.map((c) => c.name));
+  for (const upload of data.uploads || []) {
+    if (known.has(upload.name)) continue;
+    state.uploads.push({ label: upload.name, name: upload.name, size: upload.size, loaded: upload.size, status: 'done', xhr: null });
+  }
+  renderUploads();
+}
+
+/// Downloads need the credential header, which a plain link cannot carry, so
+/// the file is fetched and handed to the browser as a blob.
+async function download(name) {
+  try {
+    const response = await fetch(uploadsUrl(state.agent.id, name), {
+      headers: { 'x-claude-web-token': token },
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error((body && body.error) || `${response.status} ${response.statusText}`);
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const link = el('a', { href: url, download: name });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (err) {
+    toast(`${name}: ${err.message}`, 'error');
+  }
+}
+
+function wireAttachments() {
+  const picker = $('file-input');
+  $('attach').onclick = () => picker.click();
+  picker.onchange = () => {
+    uploadFiles(Array.from(picker.files || []));
+    picker.value = '';
+  };
+
+  $('input').addEventListener('paste', (event) => {
+    const data = event.clipboardData;
+    if (!data) return;
+    const files = pastedFiles(data.types, data.files);
+    if (!files.length) return;
+    event.preventDefault();
+    uploadFiles(files);
+  });
+
+  // Drop anywhere on the conversation: the transcript is the big target.
+  const zone = document.querySelector('.conversation');
+  const carriesFiles = (event) => Array.from(event.dataTransfer?.types || []).includes('Files');
+  zone.addEventListener('dragover', (event) => {
+    if (!carriesFiles(event)) return;
+    event.preventDefault();
+    zone.classList.add('drop-target');
+  });
+  zone.addEventListener('dragleave', (event) => {
+    if (!zone.contains(event.relatedTarget)) zone.classList.remove('drop-target');
+  });
+  zone.addEventListener('drop', (event) => {
+    zone.classList.remove('drop-target');
+    if (!carriesFiles(event)) return;
+    event.preventDefault();
+    uploadFiles(Array.from(event.dataTransfer.files || []));
+  });
+}
+
 function renderQueued() {
   const host = $('queued');
   host.replaceChildren();
@@ -766,7 +959,9 @@ function renderQueued() {
 function send() {
   const input = $('input');
   const text = input.value.trim();
-  if (!text || !state.agent) return;
+  if (!state.agent) return;
+  const { empty, attachments } = composer();
+  if (empty) return;
   // Nothing is listening, so the send would come straight back as an error
   // notice — and the old code had already cleared the box by then, losing what
   // was typed. Bail before the clear: the draft survives until Resume.
@@ -774,14 +969,22 @@ function send() {
     toast('The agent is not running — resume it first. Your message has been kept.', 'warn');
     return;
   }
-  socket.send({ type: 'send_message', agent_id: state.agent.id, text });
-  rememberInput(text);
+  if (state.uploads.some((c) => c.status === 'uploading')) {
+    toast('Wait for the uploads to finish, then send.', 'warn');
+    return;
+  }
+  socket.send({ type: 'send_message', agent_id: state.agent.id, text, attachments });
+  if (text) rememberInput(text);
   // The CLI queues messages received during a turn (F6); show that.
   if (state.agent.status === 'working' || state.agent.status === 'awaiting_approval') {
-    state.queued.push({ text });
+    state.queued.push({ text: text || attachments.map((n) => `📎 ${n}`).join(' ') });
     renderQueued();
   }
   input.value = '';
+  // Sent ones are the server's record now; a failed chip is dropped with them,
+  // its error already shown.
+  state.uploads = state.uploads.filter((c) => c.status === 'uploading');
+  renderUploads();
   updateAutocomplete();
 }
 
@@ -943,6 +1146,8 @@ async function main() {
   $('btn-rename').onclick = rename;
   $('agent-mode').onchange = (event) => changeMode(event.target.value);
   $('send').onclick = send;
+  wireAttachments();
+  restoreUploads().catch((err) => toast(err.message, 'error'));
   $('load-earlier').onclick = () => loadEarlier().catch((e) => toast(e.message, 'error'));
   $('input').addEventListener('input', () => {
     updateAutocomplete();

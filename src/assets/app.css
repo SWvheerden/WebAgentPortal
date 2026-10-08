@@ -336,6 +336,16 @@ details.tool pre { color: var(--dim); }
 /* composer */
 .composer { display: flex; gap: 8px; margin-top: 10px; align-items: flex-start; position: relative; }
 .composer textarea { min-height: 58px; resize: vertical; }
+/* attachments: chips under the composer, and under a sent message */
+.uploads { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.uploads:empty { display: none; }
+.chip { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--line); border-radius: 3px; padding: 1px 6px; font-size: calc(11rem / 13); max-width: 100%; }
+.chip .chip-name { overflow-wrap: anywhere; }
+.chip.uploading { border-style: dashed; color: var(--dim); }
+.chip.failed { border-color: var(--err); color: var(--err); }
+.chip button { padding: 0 4px; }
+.ev .attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.conversation.drop-target { outline: 2px dashed var(--accent-2); outline-offset: 2px; }
 .queued { color: var(--dim); font-size: calc(11rem / 13); margin-top: 6px; }
 .queued .q { display: inline-flex; gap: 6px; align-items: center; border: 1px dashed var(--line); border-radius: 3px; padding: 1px 6px; margin-right: 6px; }
 .autocomplete {

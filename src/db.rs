@@ -76,6 +76,19 @@ CREATE TABLE IF NOT EXISTS notes (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- Files attached from the agent page. The bytes live in
+-- `~/.claude-web/uploads/<agent_id>/<name>`; this is what the server knows
+-- about them. `sent_at` is NULL while the file waits in the composer, and set
+-- once a message carrying it has gone to the agent.
+CREATE TABLE IF NOT EXISTS uploads (
+  agent_id   TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL,
+  size       INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  sent_at    INTEGER,
+  PRIMARY KEY (agent_id, name)
+);
 "#;
 
 /// Additive migrations applied after [`SCHEMA`].
@@ -182,6 +195,15 @@ pub struct Note {
     pub body: String,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// A row of the `uploads` table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Upload {
+    pub name: String,
+    pub size: u64,
+    pub created_at: i64,
+    pub sent_at: Option<i64>,
 }
 
 /// A row of the `events` table.
@@ -413,6 +435,7 @@ impl Db {
     pub fn delete_agent(&self, id: &str) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM events WHERE agent_id = ?1", params![id])?;
+            conn.execute("DELETE FROM uploads WHERE agent_id = ?1", params![id])?;
             conn.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
             Ok(())
         })
@@ -718,6 +741,102 @@ impl Db {
             Ok(changed > 0)
         })
     }
+
+    // -- uploads -------------------------------------------------------------
+
+    /// Record a file that has just been written to the agent's upload folder.
+    ///
+    /// Replaces a row of the same name: the file was created with
+    /// `create_new`, so a row still holding that name describes a file that
+    /// has since gone from disk.
+    pub fn insert_upload(&self, agent_id: &str, name: &str, size: u64) -> Result<Upload> {
+        let upload = Upload {
+            name: name.to_string(),
+            size,
+            created_at: now_ms(),
+            sent_at: None,
+        };
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO uploads (agent_id, name, size, created_at, sent_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL)",
+                params![agent_id, upload.name, upload.size as i64, upload.created_at],
+            )?;
+            Ok(())
+        })?;
+        Ok(upload)
+    }
+
+    /// An agent's uploads, oldest first; only the unsent ones if `pending`.
+    pub fn list_uploads(&self, agent_id: &str, pending: bool) -> Result<Vec<Upload>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name, size, created_at, sent_at FROM uploads
+                 WHERE agent_id = ?1 AND (?2 = 0 OR sent_at IS NULL)
+                 ORDER BY created_at, name",
+            )?;
+            let rows = stmt.query_map(params![agent_id, pending], row_to_upload)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    pub fn get_upload(&self, agent_id: &str, name: &str) -> Result<Option<Upload>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name, size, created_at, sent_at FROM uploads
+                 WHERE agent_id = ?1 AND name = ?2",
+            )?;
+            Ok(stmt
+                .query_row(params![agent_id, name], row_to_upload)
+                .optional()?)
+        })
+    }
+
+    /// Forget an upload that has not been sent. `false` if there was no such
+    /// pending row — a sent file is part of the transcript and stays.
+    pub fn delete_pending_upload(&self, agent_id: &str, name: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "DELETE FROM uploads WHERE agent_id = ?1 AND name = ?2 AND sent_at IS NULL",
+                params![agent_id, name],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    pub fn mark_uploads_sent(&self, agent_id: &str, names: &[String]) -> Result<()> {
+        let now = now_ms();
+        self.with_conn(|conn| {
+            for name in names {
+                conn.execute(
+                    "UPDATE uploads SET sent_at = ?3 WHERE agent_id = ?1 AND name = ?2",
+                    params![agent_id, name, now],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// How many files an agent has uploaded, and their total size.
+    pub fn upload_totals(&self, agent_id: &str) -> Result<(u64, u64)> {
+        self.with_conn(|conn| {
+            let (count, bytes): (i64, i64) = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM uploads WHERE agent_id = ?1",
+                params![agent_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok((count as u64, bytes as u64))
+        })
+    }
+}
+
+fn row_to_upload(row: &rusqlite::Row<'_>) -> rusqlite::Result<Upload> {
+    Ok(Upload {
+        name: row.get(0)?,
+        size: row.get::<_, i64>(1)? as u64,
+        created_at: row.get(2)?,
+        sent_at: row.get(3)?,
+    })
 }
 
 fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
@@ -1078,6 +1197,47 @@ mod tests {
         db.delete_agent("a").expect("delete");
         assert!(db.get_agent("a").expect("get").is_none());
         assert!(db.events_after("a", 0, 500).expect("query").is_empty());
+    }
+
+    #[test]
+    fn uploads_move_from_pending_to_sent_and_go_with_the_agent() {
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&sample_agent("a", "a")).expect("insert");
+        db.insert_agent(&sample_agent("b", "b")).expect("insert");
+        db.insert_upload("a", "one.txt", 10).expect("upload");
+        db.insert_upload("a", "two.png", 2048).expect("upload");
+        db.insert_upload("b", "other.txt", 5).expect("upload");
+
+        let pending = db.list_uploads("a", true).expect("list");
+        assert_eq!(pending.len(), 2);
+        assert_eq!(db.upload_totals("a").expect("totals"), (2, 2058));
+
+        db.mark_uploads_sent("a", &["one.txt".to_string()])
+            .expect("mark");
+        let pending = db.list_uploads("a", true).expect("list");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "two.png");
+        assert_eq!(db.list_uploads("a", false).expect("all").len(), 2);
+        assert!(
+            db.get_upload("a", "one.txt")
+                .expect("get")
+                .expect("row")
+                .sent_at
+                .is_some()
+        );
+
+        // A sent file is part of the transcript: it cannot be withdrawn.
+        assert!(!db.delete_pending_upload("a", "one.txt").expect("delete"));
+        assert!(db.delete_pending_upload("a", "two.png").expect("delete"));
+        assert!(db.get_upload("a", "two.png").expect("get").is_none());
+
+        db.delete_agent("a").expect("delete");
+        assert_eq!(db.upload_totals("a").expect("totals"), (0, 0));
+        assert_eq!(
+            db.upload_totals("b").expect("totals"),
+            (1, 5),
+            "another agent's uploads are untouched"
+        );
     }
 
     #[test]

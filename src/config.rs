@@ -17,6 +17,8 @@ pub const DEFAULT_TEXT_SIZE: u8 = 13;
 /// base, stop being readable; above 24 the panels no longer fit a laptop.
 pub const MIN_TEXT_SIZE: u8 = 10;
 pub const MAX_TEXT_SIZE: u8 = 24;
+/// The default cap on one attached file, in MiB.
+pub const DEFAULT_UPLOAD_MAX_MB: u64 = 50;
 
 /// User-editable server configuration, persisted as `config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,6 +64,9 @@ pub struct Config {
     /// [`MIN_TEXT_SIZE`]..=[`MAX_TEXT_SIZE`]. Every other size on the page is a
     /// fixed fraction of it, so the whole page scales together.
     pub text_size: u8,
+    /// The largest file the agent page may attach, in MiB. Enforced while the
+    /// upload streams, so a bigger one is cut off rather than buffered.
+    pub upload_max_mb: u64,
 }
 
 impl Default for Config {
@@ -81,6 +86,7 @@ impl Default for Config {
             auto_resume: true,
             remote_control: false,
             text_size: DEFAULT_TEXT_SIZE,
+            upload_max_mb: DEFAULT_UPLOAD_MAX_MB,
         }
     }
 }
@@ -160,6 +166,9 @@ impl Config {
                 "text_size must be between {MIN_TEXT_SIZE} and {MAX_TEXT_SIZE}, got {}",
                 self.text_size
             );
+        }
+        if self.upload_max_mb == 0 {
+            anyhow::bail!("upload_max_mb must be at least 1");
         }
         self.validate_bind(key_file)
     }
@@ -312,6 +321,12 @@ pub fn default_db_path() -> PathBuf {
     state_dir().join("agents.db")
 }
 
+/// `~/.claude-web/uploads` — one folder per agent, keyed by id, holding the
+/// files attached from the agent page. Outside every repository on purpose.
+pub fn uploads_dir() -> PathBuf {
+    state_dir().join("uploads")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +426,25 @@ pinned_cli_version = "2.1.241"
         // Not a number of pixels at all is a parse error, not a clamp.
         assert!(Config::from_toml_str("text_size = \"large\"\n").is_err());
         assert!(Config::from_toml_str("text_size = -1\n").is_err());
+    }
+
+    /// 50 MiB unless set, including for a config file written before the
+    /// option existed; zero would refuse every upload and is not a config.
+    #[test]
+    fn the_upload_cap_defaults_to_fifty_megabytes() {
+        assert_eq!(Config::default().upload_max_mb, DEFAULT_UPLOAD_MAX_MB);
+        assert_eq!(DEFAULT_UPLOAD_MAX_MB, 50);
+        assert_eq!(
+            Config::from_toml_str("port = 9000\n")
+                .expect("parse")
+                .upload_max_mb,
+            50
+        );
+        let big = Config::from_toml_str("upload_max_mb = 200\n").expect("parse");
+        assert_eq!(big.upload_max_mb, 200);
+        assert!(big.validate().is_ok());
+        let zero = Config::from_toml_str("upload_max_mb = 0\n").expect("parse");
+        assert!(zero.validate().is_err());
     }
 
     #[test]

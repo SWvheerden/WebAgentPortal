@@ -35,6 +35,10 @@ pub enum ClientMsg {
     SendMessage {
         agent_id: String,
         text: String,
+        /// Names of this agent's pending uploads to attach. Names only: the
+        /// server builds the paths.
+        #[serde(default)]
+        attachments: Vec<String>,
     },
     PermissionDecision {
         agent_id: String,
@@ -195,12 +199,14 @@ async fn handle_client(
             subscriptions.remove(&agent_id);
             None
         }
-        ClientMsg::SendMessage { agent_id, text } => {
-            match state.sup.send_message(&agent_id, &text).await {
-                Ok(()) => None,
-                Err(err) => Some(error_notice(&agent_id, err)),
-            }
-        }
+        ClientMsg::SendMessage {
+            agent_id,
+            text,
+            attachments,
+        } => match state.sup.send_message(&agent_id, &text, &attachments).await {
+            Ok(()) => None,
+            Err(err) => Some(error_notice(&agent_id, err)),
+        },
         ClientMsg::Interrupt { agent_id } => match state.sup.interrupt(&agent_id).await {
             Ok(()) => None,
             Err(err) => Some(error_notice(&agent_id, err)),
@@ -374,6 +380,7 @@ mod tests {
             ClientMsg::SendMessage {
                 agent_id: "a".into(),
                 text: "hello".into(),
+                attachments: vec!["shot.png".into()],
             },
             ClientMsg::PermissionDecision {
                 agent_id: "a".into(),
@@ -394,6 +401,18 @@ mod tests {
                 serde_json::to_value(&case).expect("value"),
                 serde_json::to_value(&back).expect("value")
             );
+        }
+    }
+
+    /// A page from before attachments sends none, and that is still a message.
+    #[test]
+    fn a_message_without_attachments_is_accepted() {
+        let msg: ClientMsg =
+            serde_json::from_str(r#"{"type":"send_message","agent_id":"a","text":"hi"}"#)
+                .expect("parse");
+        match msg {
+            ClientMsg::SendMessage { attachments, .. } => assert!(attachments.is_empty()),
+            other => panic!("unexpected: {other:?}"),
         }
     }
 

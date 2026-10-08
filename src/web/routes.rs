@@ -6,12 +6,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{ConnectInfo, Extension, Path as AxPath, Query, Request, State};
-use axum::http::{StatusCode, Uri, header};
+use axum::body::Body;
+use axum::extract::{
+    ConnectInfo, DefaultBodyLimit, Extension, Path as AxPath, Query, Request, State,
+};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -21,6 +25,7 @@ use crate::agent::supervisor::{DeleteError, ServerMsg, SpawnRequest, Supervisor}
 use crate::config::Config;
 use crate::remote::{Initiator, RemoteKey};
 use crate::repo::{clone, git, scan};
+use crate::uploads;
 
 /// Events handed to a fresh page load before it starts streaming (§7).
 pub const REPLAY_WINDOW: i64 = 500;
@@ -304,6 +309,13 @@ impl ApiError {
         }
     }
 
+    pub fn too_large(msg: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: json!({ "error": msg.to_string() }),
+        }
+    }
+
     pub fn conflict(body: Value) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -354,6 +366,18 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/agents/{id}/permission", post(post_permission))
         .route("/api/agents/{id}/delete_preview", get(delete_preview))
+        // The one route that takes a large body. axum's 2 MB default is lifted
+        // here only; `upload_file` enforces `upload_max_mb` as it streams.
+        .route(
+            "/api/agents/{id}/uploads",
+            get(list_uploads)
+                .post(upload_file)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/agents/{id}/uploads/{name}",
+            get(download_upload).delete(delete_upload),
+        )
         .route("/api/notes", get(list_notes).post(create_note))
         .route("/api/notes/{id}", patch(update_note).delete(delete_note))
         .route("/ws", get(super::ws::handler))
@@ -893,6 +917,9 @@ async fn get_events(
 #[derive(Debug, Deserialize)]
 struct MessageBody {
     text: String,
+    /// Names of pending uploads to attach (§7, "Attaching files").
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 async fn post_message(
@@ -901,8 +928,243 @@ async fn post_message(
     Json(body): Json<MessageBody>,
 ) -> ApiResult<Json<Value>> {
     let record = resolve(&state, &id).await?;
-    state.sup.send_message(&record.id, &body.text).await?;
+    state
+        .sup
+        .send_message(&record.id, &body.text, &body.attachments)
+        .await?;
     Ok(Json(json!({"ok": true})))
+}
+
+// -- uploads ----------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct UploadQuery {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListUploadsQuery {
+    #[serde(default)]
+    pending: Option<String>,
+}
+
+/// An upload as the page sees it, with the path the agent will be given.
+fn upload_json(state: &AppState, agent_id: &str, upload: &crate::db::Upload) -> Value {
+    json!({
+        "name": upload.name,
+        "size": upload.size,
+        "path": state.sup.uploads_dir(agent_id).join(&upload.name).to_string_lossy(),
+        "created_at": upload.created_at,
+        "sent_at": upload.sent_at,
+    })
+}
+
+/// A stored name, or a 404. Anything `clean_name` would change was never
+/// stored, so a name with a separator or a leading dot is refused before it
+/// gets near a path.
+fn stored_name(name: &str) -> ApiResult<&str> {
+    if uploads::clean_name(name) != name {
+        return Err(ApiError::not_found(format!("no such upload: {name}")));
+    }
+    Ok(name)
+}
+
+/// `POST /api/agents/{id}/uploads?name=<original>`: the raw body is the file.
+///
+/// Streamed to disk chunk by chunk and cut off at `upload_max_mb`; a refused
+/// or abandoned upload leaves nothing behind. Allowed whatever the agent's
+/// status — a stopped agent's attachments wait in the composer for Resume.
+async fn upload_file(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Query(q): Query<UploadQuery>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<Json<Value>> {
+    use tokio::io::AsyncWriteExt;
+
+    let record = resolve(&state, &id).await?;
+    let max_mb = state.sup.config().await.upload_max_mb;
+    let max_bytes = max_mb.saturating_mul(1024 * 1024);
+    let too_large = || ApiError::too_large(format!("files are limited to {max_mb} MB"));
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > max_bytes) {
+        return Err(too_large());
+    }
+
+    let dir = state.sup.uploads_dir(&record.id);
+    let wanted = uploads::clean_name(&q.name);
+    let dir_for_create = dir.clone();
+    let (file, name) = tokio::task::spawn_blocking(move || {
+        uploads::ensure_dir(&dir_for_create)?;
+        uploads::create_unique(&dir_for_create, &wanted)
+    })
+    .await
+    .map_err(ApiError::bad_request)?
+    .map_err(ApiError::from)?;
+    let path = dir.join(&name);
+
+    let mut file = tokio::fs::File::from_std(file);
+    let mut stream = body.into_data_stream();
+    let mut size: u64 = 0;
+    let mut failure: Option<ApiError> = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                failure = Some(ApiError::bad_request(format!(
+                    "the upload was cut off: {err}"
+                )));
+                break;
+            }
+        };
+        size += chunk.len() as u64;
+        if size > max_bytes {
+            failure = Some(too_large());
+            break;
+        }
+        if let Err(err) = file.write_all(&chunk).await {
+            failure = Some(ApiError::bad_request(format!("writing the upload: {err}")));
+            break;
+        }
+    }
+    if failure.is_none()
+        && let Err(err) = file.flush().await
+    {
+        failure = Some(ApiError::bad_request(format!("writing the upload: {err}")));
+    }
+    drop(file);
+    if let Some(err) = failure {
+        tokio::fs::remove_file(&path).await.ok();
+        return Err(err);
+    }
+
+    let agent_id = record.id.clone();
+    let stored = name.clone();
+    let upload = state
+        .sup
+        .db()
+        .run(move |db| db.insert_upload(&agent_id, &stored, size))
+        .await;
+    let upload = match upload {
+        Ok(upload) => upload,
+        Err(err) => {
+            tokio::fs::remove_file(&path).await.ok();
+            return Err(ApiError::from(err));
+        }
+    };
+    Ok(Json(upload_json(&state, &record.id, &upload)))
+}
+
+/// `GET /api/agents/{id}/uploads[?pending=1]`. With `pending`, only what is
+/// still waiting in the composer — what a reload puts back as chips.
+async fn list_uploads(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Query(q): Query<ListUploadsQuery>,
+) -> ApiResult<Json<Value>> {
+    let record = resolve(&state, &id).await?;
+    let pending = q
+        .pending
+        .as_deref()
+        .is_some_and(|v| !matches!(v, "" | "0" | "false"));
+    let agent_id = record.id.clone();
+    let rows = state
+        .sup
+        .db()
+        .run(move |db| db.list_uploads(&agent_id, pending))
+        .await?;
+    let list: Vec<Value> = rows
+        .iter()
+        .map(|u| upload_json(&state, &record.id, u))
+        .collect();
+    Ok(Json(json!({ "uploads": list })))
+}
+
+/// `GET /api/agents/{id}/uploads/{name}`: always a download, never rendered.
+///
+/// The agent can write in its upload folder, so the entry is refused unless
+/// it is still a plain file — a symlink planted in place of an upload would
+/// otherwise hand out whatever it points at.
+async fn download_upload(
+    State(state): State<AppState>,
+    AxPath((id, name)): AxPath<(String, String)>,
+) -> ApiResult<Response> {
+    let record = resolve(&state, &id).await?;
+    let name = stored_name(&name)?.to_string();
+    let agent_id = record.id.clone();
+    let key = name.clone();
+    if state
+        .sup
+        .db()
+        .run(move |db| db.get_upload(&agent_id, &key))
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::not_found(format!("no such upload: {name}")));
+    }
+    let dir = state.sup.uploads_dir(&record.id);
+    let key = name.clone();
+    let data = tokio::task::spawn_blocking(move || uploads::read_plain_file(&dir, &key))
+        .await
+        .map_err(ApiError::bad_request)?
+        .map_err(|err| ApiError::not_found(format!("{name} cannot be downloaded: {err:#}")))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                uploads::content_disposition(&name),
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; sandbox".to_string(),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        data,
+    )
+        .into_response())
+}
+
+/// `DELETE /api/agents/{id}/uploads/{name}`: withdraw a pending upload. A
+/// sent one is part of the transcript and is refused.
+async fn delete_upload(
+    State(state): State<AppState>,
+    AxPath((id, name)): AxPath<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let record = resolve(&state, &id).await?;
+    let name = stored_name(&name)?.to_string();
+    let agent_id = record.id.clone();
+    let key = name.clone();
+    let removed = state
+        .sup
+        .db()
+        .run(move |db| {
+            let row = db.get_upload(&agent_id, &key)?;
+            if row.as_ref().is_some_and(|r| r.sent_at.is_some()) {
+                return Ok(None);
+            }
+            Ok(Some(db.delete_pending_upload(&agent_id, &key)?))
+        })
+        .await?;
+    match removed {
+        None => Err(ApiError::conflict(
+            json!({ "error": format!("{name} has already been sent") }),
+        )),
+        Some(false) => Err(ApiError::not_found(format!("no such upload: {name}"))),
+        Some(true) => {
+            // `remove_file` takes a link away rather than what it points at.
+            let path = state.sup.uploads_dir(&record.id).join(&name);
+            tokio::fs::remove_file(&path).await.ok();
+            Ok(Json(json!({"ok": true})))
+        }
+    }
 }
 
 async fn interrupt_agent(
@@ -1134,6 +1396,7 @@ mod tests {
             "favicon-done.svg",
             "attention.js",
             "splitter.js",
+            "uploads.js",
         ] {
             assert!(
                 Assets::get(name).is_some(),
@@ -2112,7 +2375,7 @@ console.log("ok");
 
     /// Every route that carries data or changes state, enumerated: one added
     /// later that forgets the check is exactly what this catches.
-    const GUARDED_ROUTES: [(&str, &str); 16] = [
+    const GUARDED_ROUTES: [(&str, &str); 20] = [
         ("GET", "/api/health"),
         ("GET", "/api/repos"),
         ("GET", "/api/agents"),
@@ -2128,6 +2391,10 @@ console.log("ok");
         ("POST", "/api/notes"),
         ("PATCH", "/api/notes/x"),
         ("DELETE", "/api/notes/x"),
+        ("GET", "/api/agents/x/uploads"),
+        ("POST", "/api/agents/x/uploads?name=a.txt"),
+        ("GET", "/api/agents/x/uploads/a.txt"),
+        ("DELETE", "/api/agents/x/uploads/a.txt"),
         ("GET", "/ws"),
     ];
 
@@ -2484,6 +2751,424 @@ console.log("ok");
             body["input_history"],
             json!(["run the tests", "now fix the failure"])
         );
+    }
+
+    // -- uploads ------------------------------------------------------------
+
+    /// A state whose upload folders live in `dir`, with one stopped agent.
+    async fn upload_state(dir: &std::path::Path, upload_max_mb: u64) -> AppState {
+        let db = crate::db::Db::open_in_memory().expect("db");
+        let config = Arc::new(tokio::sync::RwLock::new(Config {
+            upload_max_mb,
+            ..Config::default()
+        }));
+        let state = AppState {
+            sup: Supervisor::with_uploads_root(db, config, dir.to_path_buf()),
+            ..test_state().await
+        };
+        state
+            .sup
+            .db()
+            .run(|db| {
+                db.insert_agent(&crate::db::AgentRecord {
+                    id: "agent-1".to_string(),
+                    name: "Look at files".to_string(),
+                    slug: "look_at_files".to_string(),
+                    repo_path: "/repos/thing".to_string(),
+                    work_path: "/repos/thing".to_string(),
+                    is_git: false,
+                    branch: None,
+                    base_ref: None,
+                    uses_worktree: false,
+                    branch_is_new: false,
+                    is_root: false,
+                    permission_mode: PermissionMode::Ask,
+                    model: None,
+                    effort: None,
+                    max_budget_usd: None,
+                    add_dirs: Vec::new(),
+                    status: crate::agent::state::Status::Stopped,
+                    status_detail: None,
+                    exit_code: None,
+                    last_stderr: None,
+                    cost_usd: 0.0,
+                    created_at: 1,
+                    last_active_at: 1,
+                })
+            })
+            .await
+            .expect("seed");
+        state
+    }
+
+    /// One authenticated request through the real router.
+    async fn call(state: &AppState, method: &str, path: &str, body: Vec<u8>) -> Response {
+        use tower::ServiceExt;
+        let mut request = api_request(path)
+            .method(method)
+            .header(TOKEN_HEADER, TEST_TOKEN)
+            .body(axum::body::Body::from(body))
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(
+            LOOPBACK_PEER.parse::<SocketAddr>().expect("peer"),
+        ));
+        router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("response")
+    }
+
+    async fn body_of(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body")
+            .to_vec()
+    }
+
+    /// Upload, list, download and withdraw, end to end — including a body
+    /// over axum's 2 MB default, which only this route may take.
+    #[tokio::test]
+    async fn an_upload_round_trips_through_the_api() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = upload_state(dir.path(), 50).await;
+        let big = vec![7u8; 3 * 1024 * 1024];
+
+        // A stopped agent still takes uploads: they wait for Resume.
+        let response = call(
+            &state,
+            "POST",
+            "/api/agents/look_at_files/uploads?name=..%2Fmy%20shot.png",
+            big.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let uploaded: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+        assert_eq!(uploaded["name"], json!("my-shot.png"));
+        assert_eq!(uploaded["size"], json!(big.len()));
+        let on_disk = dir.path().join("agent-1").join("my-shot.png");
+        assert_eq!(uploaded["path"], json!(on_disk.to_string_lossy()));
+        assert_eq!(std::fs::read(&on_disk).expect("read"), big);
+
+        // The same name again is numbered, not overwritten.
+        let response = call(
+            &state,
+            "POST",
+            "/api/agents/agent-1/uploads?name=my%20shot.png",
+            b"second".to_vec(),
+        )
+        .await;
+        let second: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+        assert_eq!(second["name"], json!("my-shot-2.png"));
+
+        let response = call(
+            &state,
+            "GET",
+            "/api/agents/agent-1/uploads?pending=1",
+            vec![],
+        )
+        .await;
+        let listed: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+        let names: Vec<&str> = listed["uploads"]
+            .as_array()
+            .expect("list")
+            .iter()
+            .map(|u| u["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(names, vec!["my-shot.png", "my-shot-2.png"]);
+
+        let response = call(
+            &state,
+            "GET",
+            "/api/agents/agent-1/uploads/my-shot-2.png",
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers().clone();
+        assert_eq!(
+            headers
+                .get(header::CONTENT_DISPOSITION)
+                .expect("disposition"),
+            "attachment; filename=\"my-shot-2.png\"; filename*=UTF-8''my-shot-2.png"
+        );
+        assert_eq!(
+            headers
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .expect("nosniff"),
+            "nosniff"
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).expect("type"),
+            "application/octet-stream"
+        );
+        assert_eq!(body_of(response).await, b"second");
+
+        let response = call(
+            &state,
+            "DELETE",
+            "/api/agents/agent-1/uploads/my-shot-2.png",
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!dir.path().join("agent-1").join("my-shot-2.png").exists());
+        let response = call(
+            &state,
+            "GET",
+            "/api/agents/agent-1/uploads/my-shot-2.png",
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // A sent upload is part of the transcript and cannot be withdrawn.
+        state
+            .sup
+            .db()
+            .run(|db| db.mark_uploads_sent("agent-1", &["my-shot.png".to_string()]))
+            .await
+            .expect("mark");
+        let response = call(
+            &state,
+            "DELETE",
+            "/api/agents/agent-1/uploads/my-shot.png",
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(on_disk.exists());
+        let response = call(
+            &state,
+            "GET",
+            "/api/agents/agent-1/uploads?pending=1",
+            vec![],
+        )
+        .await;
+        let listed: Value = serde_json::from_slice(&body_of(response).await).expect("json");
+        assert_eq!(listed["uploads"], json!([]));
+        // Sent files still download from the transcript.
+        let response = call(
+            &state,
+            "GET",
+            "/api/agents/agent-1/uploads/my-shot.png",
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Over the cap is refused, whether the client says so up front or not,
+    /// and leaves nothing on disk or in the table.
+    #[tokio::test]
+    async fn an_upload_over_the_cap_is_refused_and_leaves_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = upload_state(dir.path(), 1).await;
+        let response = call(
+            &state,
+            "POST",
+            "/api/agents/agent-1/uploads?name=big.bin",
+            vec![0u8; 1024 * 1024 + 1],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // A streamed body carries no length, so the cap is enforced as it
+        // arrives.
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+            vec![Ok(vec![0u8; 700 * 1024]), Ok(vec![0u8; 700 * 1024])];
+        let body = axum::body::Body::from_stream(futures_util::stream::iter(chunks));
+        let mut request = api_request("/api/agents/agent-1/uploads?name=streamed.bin")
+            .method("POST")
+            .header(TOKEN_HEADER, TEST_TOKEN)
+            .body(body)
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(
+            LOOPBACK_PEER.parse::<SocketAddr>().expect("peer"),
+        ));
+        let response = {
+            use tower::ServiceExt;
+            router(state.clone())
+                .oneshot(request)
+                .await
+                .expect("response")
+        };
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let folder = dir.path().join("agent-1");
+        let left: Vec<_> = std::fs::read_dir(&folder)
+            .map(|d| d.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "partial files must be removed: {left:?}");
+        let totals = state
+            .sup
+            .db()
+            .run(|db| db.upload_totals("agent-1"))
+            .await
+            .expect("totals");
+        assert_eq!(totals, (0, 0));
+
+        // Under it is fine.
+        let response = call(
+            &state,
+            "POST",
+            "/api/agents/agent-1/uploads?name=ok.bin",
+            vec![0u8; 1024],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The agent can write in its own upload folder. A link it plants in
+    /// place of an upload must not turn the download route into a way to read
+    /// anything else; and a name that was never stored never reaches a path.
+    #[tokio::test]
+    async fn a_download_refuses_symlinks_and_unstored_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = upload_state(dir.path(), 50).await;
+        let response = call(
+            &state,
+            "POST",
+            "/api/agents/agent-1/uploads?name=notes.txt",
+            b"mine".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "do not serve").expect("write");
+        let planted = dir.path().join("agent-1").join("notes.txt");
+        std::fs::remove_file(&planted).expect("rm");
+        std::os::unix::fs::symlink(&secret, &planted).expect("symlink");
+
+        let response = call(
+            &state,
+            "GET",
+            "/api/agents/agent-1/uploads/notes.txt",
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!String::from_utf8_lossy(&body_of(response).await).contains("do not serve"));
+
+        for path in [
+            "/api/agents/agent-1/uploads/..%2Fsecret.txt",
+            "/api/agents/agent-1/uploads/.hidden",
+            "/api/agents/agent-1/uploads/never-uploaded.txt",
+        ] {
+            let response = call(&state, "GET", path, vec![]).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+
+        // Withdrawing removes the link, never what it points at.
+        let response = call(
+            &state,
+            "DELETE",
+            "/api/agents/agent-1/uploads/notes.txt",
+            vec![],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(&secret).expect("read"),
+            "do not serve"
+        );
+    }
+
+    /// Drive the real `uploads.js` — the composer's attachment decisions — and
+    /// hold its size formatting to the Rust one the trailer uses.
+    #[test]
+    fn the_composer_waits_for_uploads_and_sends_names_only() {
+        let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/assets/uploads.js");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = dir.path().join("uploads.mjs");
+        let sizes: Vec<String> = [0u64, 1023, 1024, 1536, 5 * 1024 * 1024, 3 << 30]
+            .iter()
+            .map(|&n| {
+                format!(
+                    "assert(humanSize({n}) === {:?}, \"humanSize({n}): \" + humanSize({n}));",
+                    crate::uploads::human_size(n)
+                )
+            })
+            .collect();
+        let source = format!(
+            r#"
+import {{ composerState, humanSize, pastedFiles, uploadsUrl }} from "{module}";
+const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
+
+{sizes}
+
+const chip = (status, name) => ({{ status, name }});
+
+// An upload in flight holds Send back; finished ones go as names.
+let s = composerState({{ running: true, text: "hi", chips: [chip("done", "a.png"), chip("uploading", null)] }});
+assert(s.blocked && s.reason.includes("uploads"), "an upload in flight blocks Send");
+s = composerState({{ running: true, text: "", chips: [chip("done", "a.png"), chip("failed", null)] }});
+assert(!s.blocked, "finished uploads do not block");
+assert(JSON.stringify(s.attachments) === '["a.png"]', "only finished uploads are attached: " + s.attachments);
+assert(!s.empty, "attachments alone are something to send");
+s = composerState({{ running: true, text: "  ", chips: [] }});
+assert(s.empty, "blank text and no files is nothing");
+
+// A stopped agent keeps its chips, and Send stays grey as it always did.
+s = composerState({{ running: false, text: "hi", chips: [chip("done", "a.png")] }});
+assert(s.blocked && s.reason.includes("Resume"), "a stopped agent cannot be sent to");
+
+// Pastes: a screenshot or a copied file uploads; rich text does not.
+const png = {{ name: "image.png" }};
+assert(pastedFiles(["Files"], [png]).length === 1, "a screenshot uploads");
+assert(pastedFiles(["text/plain", "Files"], [png]).length === 1, "a copied file uploads");
+assert(pastedFiles(["text/plain", "text/html", "Files"], [png]).length === 0, "rich text pastes as text");
+assert(pastedFiles(["text/plain"], []).length === 0, "plain text pastes as text");
+
+assert(uploadsUrl("a b") === "/api/agents/a%20b/uploads", uploadsUrl("a b"));
+assert(uploadsUrl("x", "r?é.png") === "/api/agents/x/uploads/r%3F%C3%A9.png", uploadsUrl("x", "r?é.png"));
+console.log("ok");
+"#,
+            module = module.display(),
+            sizes = sizes.join("\n"),
+        );
+        std::fs::write(&driver, source).expect("write driver");
+        let output = match std::process::Command::new("node").arg(&driver).output() {
+            Ok(output) => output,
+            // No node installed: nothing in the build depends on it.
+            Err(_) => return,
+        };
+        assert!(
+            output.status.success(),
+            "uploads driver failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The page attaches by name over the socket, and renders a sent
+    /// message's attachments rather than the trailer the agent read.
+    #[test]
+    fn the_agent_page_sends_attachment_names_and_renders_chips() {
+        let js = std::str::from_utf8(&Assets::get("agent.js").expect("agent.js").data)
+            .expect("utf-8")
+            .to_string();
+        let html = std::str::from_utf8(&Assets::get("agent.html").expect("agent.html").data)
+            .expect("utf-8")
+            .to_string();
+        assert!(
+            js.contains(
+                "socket.send({ type: 'send_message', agent_id: state.agent.id, text, attachments })"
+            ),
+            "the message must carry the attachment names"
+        );
+        assert!(js.contains("p.attachments"), "sent attachments must render");
+        assert!(
+            js.contains("xhr.upload.onprogress"),
+            "uploads show progress"
+        );
+        for id in [
+            "id=\"attach\"",
+            "id=\"file-input\" type=\"file\" multiple",
+            "id=\"uploads\"",
+        ] {
+            assert!(html.contains(id), "agent.html is missing {id}");
+        }
     }
 
     /// "Open the link claude-web printed when it started" is useless advice on

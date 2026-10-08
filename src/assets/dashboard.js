@@ -323,6 +323,7 @@ async function remove(agent) {
       const lost = [
         ...report.uncommitted.map((l) => `  uncommitted: ${l}`),
         ...report.unpushed.map((l) => `  unpushed: ${l}`),
+        ...(report.uploads ? [`  ${report.uploads}`] : []),
       ].join('\n');
       if (!confirm(`${err.body.error}\n\nThis would be lost:\n${lost}\n\nDelete anyway?`)) return;
       try {

@@ -10,6 +10,7 @@ mod config;
 mod db;
 mod remote;
 mod repo;
+mod uploads;
 mod web;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

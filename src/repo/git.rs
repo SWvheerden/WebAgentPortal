@@ -833,6 +833,11 @@ pub struct SafetyReport {
     /// Why the check could not be completed. A git failure lands here and
     /// forces `safe = false`: the check fails closed, never open.
     pub error: Option<String>,
+    /// Informational: the uploaded files the delete will remove, e.g. "3
+    /// uploaded files (1.2 MB) will be deleted". Never affects `safe` — the
+    /// files are copies the operator still has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploads: Option<String>,
 }
 
 impl SafetyReport {
@@ -844,6 +849,7 @@ impl SafetyReport {
             branch_empty_or_merged: false,
             safe: false,
             error: Some(err.to_string()),
+            uploads: None,
         }
     }
 
@@ -922,6 +928,7 @@ pub fn safety_report(
         branch_empty_or_merged,
         safe,
         error: None,
+        uploads: None,
     })
 }
 
@@ -1027,6 +1034,7 @@ mod tests {
             branch_empty_or_merged: false,
             safe: false,
             error: None,
+            uploads: None,
         };
         assert_eq!(
             dirty.blocker().as_deref(),

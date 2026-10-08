@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::db::{AgentRecord, Db, now_ms};
 use crate::remote::Initiator;
 use crate::repo::git;
+use crate::uploads::{self, Attachment};
 
 use super::process::{self, Action, ChildHandle, ExitInfo, ProcessMsg, SpawnConfig, Sweep};
 use super::protocol::{
@@ -180,7 +181,13 @@ pub struct DeleteRefusal {
 
 #[derive(Debug)]
 enum AgentCommand {
-    Send(String),
+    /// A message to type at the agent, with the files attached to it. The
+    /// attachments have already been checked against the agent's pending
+    /// uploads; the runner only formats them.
+    Send {
+        text: String,
+        attachments: Vec<Attachment>,
+    },
     Decide {
         request_id: String,
         decision: PermissionDecision,
@@ -219,10 +226,28 @@ pub struct Supervisor {
     /// never across an await, and because starting the watcher is not async.
     auto_resume: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     bus: broadcast::Sender<ServerMsg>,
+    /// Where each agent's upload folder lives: `<uploads_root>/<agent-id>`.
+    uploads_root: PathBuf,
 }
 
 impl Supervisor {
     pub fn new(db: Db, config: Arc<RwLock<Config>>) -> Arc<Self> {
+        // Tests never write into the real home: they share one scratch root,
+        // which is safe because every agent's folder is keyed by a fresh id.
+        let uploads_root = if cfg!(test) {
+            std::env::temp_dir().join("claude-web-test-uploads")
+        } else {
+            crate::config::uploads_dir()
+        };
+        Self::with_uploads_root(db, config, uploads_root)
+    }
+
+    /// [`Supervisor::new`], keeping upload folders under `uploads_root`.
+    pub fn with_uploads_root(
+        db: Db,
+        config: Arc<RwLock<Config>>,
+        uploads_root: PathBuf,
+    ) -> Arc<Self> {
         let (bus, _) = broadcast::channel(2048);
         Arc::new(Self {
             db,
@@ -233,11 +258,18 @@ impl Supervisor {
             rate_limit: Arc::new(RwLock::new(None)),
             auto_resume: std::sync::Mutex::new(None),
             bus,
+            uploads_root,
         })
     }
 
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// One agent's upload folder. Keyed by id, not slug: the id never changes
+    /// and is never reused.
+    pub fn uploads_dir(&self, agent_id: &str) -> PathBuf {
+        self.uploads_root.join(agent_id)
     }
 
     /// The last rate-limit snapshot and when it was taken, for a freshly
@@ -483,7 +515,7 @@ impl Supervisor {
         )
         .await;
 
-        if let Err(err) = self.send_message(id, resume::RESUME_PROMPT).await {
+        if let Err(err) = self.send_message(id, resume::RESUME_PROMPT, &[]).await {
             tracing::error!(agent = %id, ?err, "the auto-resume prompt was not delivered");
             self.log_system(
                 id,
@@ -863,10 +895,31 @@ impl Supervisor {
     ) -> Result<()> {
         let cfg = self.config().await;
         let work_path = PathBuf::from(&record.work_path);
+        // The agent reads its attachments from here, so the folder exists and
+        // is handed over on every launch and resume — even before anything has
+        // been uploaded, so a file attached later needs no relaunch. A folder
+        // that cannot be made costs the agent its attachments, not its launch.
+        let uploads = self.uploads_dir(&record.id);
+        let uploads_for_check = uploads.clone();
+        let made = match tokio::task::spawn_blocking(move || {
+            uploads::ensure_dir(&uploads_for_check)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => Err(anyhow!(err)),
+        };
+        let uploads = match made {
+            Ok(()) => Some(uploads),
+            Err(err) => {
+                tracing::warn!(agent = %record.slug, ?err, "no upload folder for this launch");
+                None
+            }
+        };
         let spawn_config = SpawnConfig {
             claude_bin: cfg.claude_bin.clone(),
             cwd: work_path,
-            args: launch_args(record, &cfg, resume),
+            args: launch_args(record, &cfg, resume, uploads.as_deref()),
         };
 
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
@@ -976,7 +1029,7 @@ impl Supervisor {
         if let Some(text) = first
             && !text.trim().is_empty()
         {
-            runner.send_user_message(&text).await;
+            runner.send_user_message(&text, &[]).await;
         }
 
         let runners = self.runners_ref();
@@ -999,8 +1052,53 @@ impl Supervisor {
 
     // -- verbs --------------------------------------------------------------
 
-    pub async fn send_message(&self, id: &str, text: &str) -> Result<()> {
-        self.command(id, AgentCommand::Send(text.to_string())).await
+    /// Type `text` at the agent, with the named uploads attached.
+    ///
+    /// Each name must be one of this agent's pending uploads; the client
+    /// names files and never supplies a path. Once the message is handed to
+    /// the runner the files are marked sent, which takes them out of the
+    /// composer for good.
+    pub async fn send_message(&self, id: &str, text: &str, attachments: &[String]) -> Result<()> {
+        let mut names: Vec<String> = Vec::new();
+        for name in attachments {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        let mut files = Vec::with_capacity(names.len());
+        let dir = self.uploads_dir(id);
+        for name in &names {
+            let agent_id = id.to_string();
+            let key = name.clone();
+            let row = self
+                .db
+                .run(move |db| db.get_upload(&agent_id, &key))
+                .await?;
+            match row {
+                Some(row) if row.sent_at.is_none() => files.push(Attachment {
+                    path: dir.join(&row.name).to_string_lossy().to_string(),
+                    name: row.name,
+                    size: row.size,
+                }),
+                Some(_) => bail!("{name} has already been sent"),
+                None => bail!("{name} is not one of this agent's uploads"),
+            }
+        }
+        self.command(
+            id,
+            AgentCommand::Send {
+                text: text.to_string(),
+                attachments: files,
+            },
+        )
+        .await?;
+        if !names.is_empty() {
+            let agent_id = id.to_string();
+            self.db
+                .run(move |db| db.mark_uploads_sent(&agent_id, &names))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Answer a prompt the agent is waiting on.
@@ -1167,7 +1265,27 @@ impl Supervisor {
     /// Inspect what a delete would cost, without changing anything.
     pub async fn delete_preview(&self, id: &str) -> Result<git::SafetyReport> {
         let record = self.require_agent(id).await?;
-        Ok(safety_for(&record).await)
+        let mut report = safety_for(&record).await;
+        report.uploads = self.uploads_note(id).await;
+        Ok(report)
+    }
+
+    /// "N uploaded files (X MB) will be deleted", or nothing if there are none.
+    async fn uploads_note(&self, id: &str) -> Option<String> {
+        let agent_id = id.to_string();
+        let (count, bytes) = self
+            .db
+            .run(move |db| db.upload_totals(&agent_id))
+            .await
+            .ok()?;
+        if count == 0 {
+            return None;
+        }
+        let noun = if count == 1 { "file" } else { "files" };
+        Some(format!(
+            "{count} uploaded {noun} ({}) will be deleted",
+            uploads::human_size(bytes)
+        ))
     }
 
     /// Remove an agent, its events and (when safe) its worktree.
@@ -1189,7 +1307,8 @@ impl Supervisor {
             self.await_stop(id, Self::teardown_deadline()).await;
         }
 
-        let report = safety_for(&record).await;
+        let mut report = safety_for(&record).await;
+        report.uploads = self.uploads_note(id).await;
         if !report.safe && !force {
             let message = report
                 .blocker()
@@ -1265,6 +1384,24 @@ impl Supervisor {
             .run(move |db| db.delete_agent(&agent_id))
             .await
             .map_err(|e| DeleteError::Other(format!("{e:#}")))?;
+        // The uploads go with the agent, whatever kind it was. The rows went
+        // with `delete_agent`; a folder that will not go is reported, not
+        // fatal — the agent itself is already gone.
+        let dir = self.uploads_dir(&record.id);
+        let wiped = match tokio::task::spawn_blocking(move || uploads::wipe_dir(&dir)).await {
+            Ok(result) => result,
+            Err(err) => Err(anyhow!(err)),
+        };
+        if let Err(err) = wiped {
+            tracing::warn!(?err, "could not remove the agent's uploads");
+            self.broadcast(ServerMsg::Notice {
+                agent_id: None,
+                level: "warn".to_string(),
+                text: format!(
+                    "The agent was deleted, but its uploads could not be removed: {err:#}"
+                ),
+            });
+        }
         self.broadcast(ServerMsg::AgentRemoved {
             agent_id: record.id.clone(),
         });
@@ -2111,7 +2248,9 @@ impl Runner {
 
     async fn on_command(&mut self, cmd: AgentCommand) {
         match cmd {
-            AgentCommand::Send(text) => self.send_user_message(&text).await,
+            AgentCommand::Send { text, attachments } => {
+                self.send_user_message(&text, &attachments).await
+            }
             AgentCommand::Decide {
                 request_id,
                 decision,
@@ -2152,17 +2291,24 @@ impl Runner {
         false
     }
 
-    async fn send_user_message(&mut self, text: &str) {
-        self.recently_sent.push_back(text.to_string());
+    /// Send a message to the CLI and record it.
+    ///
+    /// The CLI gets the text with the attachment trailer; the event log gets
+    /// what was typed plus the attachments as data, so the transcript shows
+    /// the message as written with download chips under it. The echo check
+    /// compares against what the CLI actually received.
+    async fn send_user_message(&mut self, text: &str, attachments: &[Attachment]) {
+        let sent = uploads::with_trailer(text, attachments);
+        self.recently_sent.push_back(sent.clone());
         if self.recently_sent.len() > 32 {
             self.recently_sent.pop_front();
         }
-        self.write(protocol::user_message(text));
-        self.persist(
-            EventKind::User,
-            json!({"type": "user", "message": {"role": "user", "content": text}}),
-        )
-        .await;
+        self.write(protocol::user_message(&sent));
+        let mut payload = json!({"type": "user", "message": {"role": "user", "content": text}});
+        if !attachments.is_empty() {
+            payload["attachments"] = json!(attachments);
+        }
+        self.persist(EventKind::User, payload).await;
         self.set_status(Transition::TurnStarted).await;
     }
 
@@ -2347,7 +2493,18 @@ impl Runner {
 /// Split out of [`Supervisor::launch`] so the config-to-command-line wiring can
 /// be asserted without spawning anything — the process itself is [`process`]'s
 /// business, and the argv's shape is [`LaunchArgs::to_argv`]'s.
-fn launch_args(record: &AgentRecord, cfg: &Config, resume: bool) -> LaunchArgs {
+fn launch_args(
+    record: &AgentRecord,
+    cfg: &Config,
+    resume: bool,
+    uploads: Option<&Path>,
+) -> LaunchArgs {
+    let mut add_dirs = record.add_dirs.clone();
+    // Not stored on the record: it is derived from the id, and storing it
+    // would hand a stale path to a resume after the state folder moved.
+    if let Some(dir) = uploads {
+        add_dirs.push(dir.to_string_lossy().to_string());
+    }
     LaunchArgs {
         session_id: record.id.clone(),
         resume,
@@ -2355,7 +2512,7 @@ fn launch_args(record: &AgentRecord, cfg: &Config, resume: bool) -> LaunchArgs {
         model: record.model.clone(),
         effort: record.effort.clone(),
         max_budget_usd: record.max_budget_usd,
-        add_dirs: record.add_dirs.clone(),
+        add_dirs,
         // Read from the config at launch rather than stored on the agent: the
         // toggle is a property of this machine's deployment, so an agent
         // resumed after it is turned off comes back without it — and one
@@ -2690,7 +2847,7 @@ mod tests {
         };
 
         assert!(
-            !launch_args(&record, &off, false)
+            !launch_args(&record, &off, false, None)
                 .to_argv()
                 .iter()
                 .any(|a| a == "--remote-control"),
@@ -2698,7 +2855,7 @@ mod tests {
         );
 
         for resume in [false, true] {
-            let argv = launch_args(&record, &on, resume).to_argv();
+            let argv = launch_args(&record, &on, resume, None).to_argv();
             assert!(
                 argv.windows(2)
                     .any(|w| w == ["--remote-control", record.slug.as_str()]),
@@ -2799,7 +2956,7 @@ mod tests {
     /// What the watcher typed, or `None` if it stayed quiet.
     fn typed(rx: &mut mpsc::UnboundedReceiver<AgentCommand>) -> Option<String> {
         match rx.try_recv() {
-            Ok(AgentCommand::Send(text)) => Some(text),
+            Ok(AgentCommand::Send { text, .. }) => Some(text),
             Ok(other) => panic!("unexpected command: {other:?}"),
             Err(_) => None,
         }
@@ -4612,5 +4769,230 @@ mod tests {
         );
 
         sup.shutdown().await;
+    }
+
+    // -- attachments ----------------------------------------------------------
+
+    /// The CLI reads the trailer; the log keeps the text as typed plus the
+    /// attachments as data; and the CLI's echo of the full text is still
+    /// recognised as ours.
+    #[tokio::test]
+    async fn an_attachment_reaches_the_cli_as_a_trailer_and_the_log_as_data() {
+        let mut harness = Harness::start();
+        let files = vec![Attachment {
+            name: "shot.png".to_string(),
+            size: 2048,
+            path: "/u/agent-1/shot.png".to_string(),
+        }];
+        let sent = "look at this\n\nAttached files:\n- /u/agent-1/shot.png (2.0 KB)";
+        harness
+            .cmds
+            .as_ref()
+            .expect("sender")
+            .send(AgentCommand::Send {
+                text: "look at this".to_string(),
+                attachments: files.clone(),
+            })
+            .expect("send");
+        while harness.next_status().await.0 != Status::Working {}
+
+        let written = harness._stdin.try_recv().expect("a line to the CLI");
+        assert_eq!(written, protocol::user_message(sent));
+
+        // The CLI repeats the message back; that must not log it twice.
+        harness.action(Action::Persist {
+            kind: EventKind::User,
+            payload: protocol::user_message(sent),
+        });
+        let db = harness.finish().await;
+        let users: Vec<_> = db
+            .events_after("agent-1", 0, 500)
+            .expect("events")
+            .into_iter()
+            .filter(|e| e.kind == "user")
+            .collect();
+        assert_eq!(users.len(), 1, "the echo is dropped: {users:?}");
+        assert_eq!(
+            users[0].payload["message"]["content"],
+            json!("look at this")
+        );
+        assert_eq!(users[0].payload["attachments"], json!(files));
+        // The composer's recall list offers what was typed, not the trailer.
+        assert_eq!(
+            db.recent_user_inputs("agent-1").expect("history"),
+            vec!["look at this".to_string()]
+        );
+    }
+
+    /// Only this agent's pending uploads can be attached, by name; the path
+    /// is the server's, and a sent file cannot be sent again.
+    #[tokio::test]
+    async fn only_pending_uploads_can_be_attached_and_sending_marks_them() {
+        let (sup, mut rx) = one_agent(Status::Idle).await;
+        sup.db()
+            .run(|db| {
+                db.insert_upload("agent-limited", "a.txt", 10)?;
+                db.insert_upload("agent-limited", "b.txt", 2048)
+            })
+            .await
+            .expect("seed");
+
+        let err = sup
+            .send_message("agent-limited", "hi", &["nope.txt".to_string()])
+            .await
+            .expect_err("an unknown name is refused");
+        assert!(format!("{err:#}").contains("nope.txt"), "{err:#}");
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing is typed for a refused send"
+        );
+
+        sup.send_message(
+            "agent-limited",
+            "hi",
+            &[
+                "a.txt".to_string(),
+                "b.txt".to_string(),
+                "a.txt".to_string(),
+            ],
+        )
+        .await
+        .expect("send");
+        let Ok(AgentCommand::Send { text, attachments }) = rx.try_recv() else {
+            panic!("expected a send");
+        };
+        assert_eq!(text, "hi");
+        let dir = sup.uploads_dir("agent-limited");
+        assert_eq!(
+            attachments,
+            vec![
+                Attachment {
+                    name: "a.txt".to_string(),
+                    size: 10,
+                    path: dir.join("a.txt").to_string_lossy().to_string(),
+                },
+                Attachment {
+                    name: "b.txt".to_string(),
+                    size: 2048,
+                    path: dir.join("b.txt").to_string_lossy().to_string(),
+                },
+            ],
+            "duplicates collapse and paths are built server-side"
+        );
+        let pending = sup
+            .db()
+            .run(|db| db.list_uploads("agent-limited", true))
+            .await
+            .expect("list");
+        assert!(pending.is_empty(), "both are marked sent");
+
+        let err = sup
+            .send_message("agent-limited", "again", &["a.txt".to_string()])
+            .await
+            .expect_err("a sent file is not pending");
+        assert!(format!("{err:#}").contains("already been sent"), "{err:#}");
+    }
+
+    /// A send to a stopped agent fails, and the uploads stay pending for the
+    /// send after Resume.
+    #[tokio::test]
+    async fn a_failed_send_leaves_the_uploads_pending() {
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&agent_record("stopped", &std::env::temp_dir()))
+            .expect("insert");
+        db.insert_upload("stopped", "a.txt", 1).expect("upload");
+        let sup = Supervisor::new(db, Arc::new(RwLock::new(Config::default())));
+        assert!(
+            sup.send_message("stopped", "hi", &["a.txt".to_string()])
+                .await
+                .is_err()
+        );
+        let pending = sup
+            .db()
+            .run(|db| db.list_uploads("stopped", true))
+            .await
+            .expect("list");
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// The upload folder is handed over on every launch and resume, after
+    /// any extra directories the spawn asked for.
+    #[test]
+    fn the_upload_folder_is_an_extra_directory_on_every_launch() {
+        let mut record = agent_record("with-uploads", Path::new("/work"));
+        record.add_dirs = vec!["/extra".to_string()];
+        let dir = PathBuf::from("/state/uploads/with-uploads");
+        for resume in [false, true] {
+            let args = launch_args(&record, &Config::default(), resume, Some(&dir));
+            assert_eq!(
+                args.add_dirs,
+                vec![
+                    "/extra".to_string(),
+                    "/state/uploads/with-uploads".to_string()
+                ]
+            );
+        }
+        // Not stored: a resume derives it again from the id.
+        assert_eq!(record.add_dirs, vec!["/extra".to_string()]);
+        assert_eq!(
+            launch_args(&record, &Config::default(), false, None).add_dirs,
+            vec!["/extra".to_string()]
+        );
+    }
+
+    /// Delete takes the upload folder and its rows with it — for a folder
+    /// agent here, the kind with no worktree to remove — and the preview says
+    /// so up front without calling the delete unsafe.
+    #[tokio::test]
+    async fn deleting_an_agent_wipes_its_uploads() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let work = tempfile::tempdir().expect("tempdir");
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&agent_record("doomed", work.path()))
+            .expect("insert");
+        db.insert_agent(&agent_record("bystander", work.path()))
+            .expect("insert");
+        let sup = Supervisor::with_uploads_root(
+            db,
+            Arc::new(RwLock::new(Config::default())),
+            state.path().to_path_buf(),
+        );
+        let doomed = sup.uploads_dir("doomed");
+        let bystander = sup.uploads_dir("bystander");
+        for dir in [&doomed, &bystander] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+            std::fs::write(dir.join("a.txt"), vec![b'x'; 1536]).expect("write");
+        }
+        // Something the agent planted, pointing out of its folder.
+        let outside = work.path().join("precious.txt");
+        std::fs::write(&outside, "keep").expect("write");
+        std::os::unix::fs::symlink(&outside, doomed.join("link")).expect("symlink");
+        sup.db()
+            .run(|db| {
+                db.insert_upload("doomed", "a.txt", 1536)?;
+                db.insert_upload("bystander", "a.txt", 1536)
+            })
+            .await
+            .expect("seed");
+
+        let report = sup.delete_preview("doomed").await.expect("preview");
+        assert!(report.safe, "uploads never make a delete unsafe");
+        assert_eq!(
+            report.uploads.as_deref(),
+            Some("1 uploaded file (1.5 KB) will be deleted")
+        );
+
+        sup.delete("doomed", false, false).await.expect("delete");
+        assert!(!doomed.exists(), "the folder is gone");
+        assert_eq!(std::fs::read_to_string(&outside).expect("read"), "keep");
+        assert!(bystander.join("a.txt").exists(), "other agents keep theirs");
+        let totals = sup
+            .db()
+            .run(|db| db.upload_totals("doomed"))
+            .await
+            .expect("totals");
+        assert_eq!(totals, (0, 0));
+        let report = sup.delete_preview("bystander").await.expect("preview");
+        assert!(report.uploads.is_some());
     }
 }

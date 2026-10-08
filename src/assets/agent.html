@@ -60,8 +60,13 @@
       <div class="composer">
         <div class="autocomplete hidden" id="autocomplete"></div>
         <textarea id="input" placeholder="Message the agent — Enter to send, Shift+Enter for a newline, ↑ for an earlier message. Type / for commands."></textarea>
+        <!-- Attach files: the button, a drop anywhere on the conversation, or a
+             paste. They upload at once and are sent with the next message. -->
+        <button id="attach" title="Attach files — or drop them here, or paste a screenshot" aria-label="Attach files">📎</button>
+        <input id="file-input" type="file" multiple class="hidden">
         <button id="send" class="primary" disabled>Send</button>
       </div>
+      <div class="uploads" id="uploads"></div>
       <div class="queued" id="queued"></div>
       <p class="small muted">
         Trivially safe tool calls are auto-approved by the CLI and never appear as approvals —

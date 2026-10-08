@@ -159,6 +159,17 @@ CREATE TABLE notes (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- Files attached from the agent page; the bytes are in
+-- ~/.claude-web/uploads/<agent_id>/<name>. See "Attaching files".
+CREATE TABLE uploads (
+  agent_id   TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL,                -- cleaned, unique within the folder
+  size       INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  sent_at    INTEGER,                      -- NULL while pending in the composer
+  PRIMARY KEY (agent_id, name)
+);
 ```
 
 **Implementation note — additive migrations.** The shipped schema carries one
@@ -340,6 +351,7 @@ claude -p
   --session-id <uuid>            # first launch
   [--resume <uuid>]              # subsequent launches, replaces --session-id
   [--model X] [--effort X] [--max-budget-usd X] [--add-dir ...]
+  --add-dir ~/.claude-web/uploads/<id>   # every launch and resume (§7, "Attaching files")
   [--remote-control <slug>]      # only when remote_control = true (§9)
 cwd = work_path
 ```
@@ -922,6 +934,10 @@ POST /api/agents                spawn
 POST /api/agents/:id/{interrupt|stop|resume|rename}
 DEL  /api/agents/:id            with ?force=
 GET  /api/agents/:id/events?after=<seq>
+POST /api/agents/:id/uploads?name=  raw body is the file; returns {name, size, path}
+GET  /api/agents/:id/uploads?pending=1   uploads not yet sent (restores composer chips)
+GET  /api/agents/:id/uploads/:name       download, always as an attachment
+DEL  /api/agents/:id/uploads/:name       withdraw a pending upload
 GET  /api/rate_limit            last usage snapshot (null until one arrives)
 GET  /api/config, PUT /api/config
 WS   /ws                        multiplexed, {agent_id, ...}-tagged envelope
@@ -1210,6 +1226,47 @@ typed against an agent that exited while it was being written is kept, and Resum
 sendable. Only the button is disabled, never the textarea — the point is to keep typing
 possible, not to block it.
 
+### Attaching files
+The composer takes files from the 📎 button, a drop anywhere on the conversation, or a paste
+(a screenshot, or a file copied in a file manager; rich text with `text/html` still pastes as
+text). Each uploads at once on its own XHR — `fetch` has no upload progress — as a raw body to
+`POST /api/agents/:id/uploads?name=`, so it works from a phone over the tailnet like everything
+else. Chips show progress and an × that aborts or withdraws. Send stays grey until every
+upload has finished; a stopped agent still takes uploads, which wait as pending for Resume, and
+a reload puts pending ones back (`?pending=1`).
+
+**Storage.** `~/.claude-web/uploads/<agent-id>/`, keyed by id, outside every repository and
+worktree, with a row per file in `uploads`. Names are cleaned to a basename of letters,
+digits, `.`, `_` and `-` (no leading dot or dash, at most 120 bytes, `upload` if nothing is
+left), and a clash becomes `report-2.pdf` rather than an overwrite. `upload_max_mb` (default
+50) is enforced while the body streams; axum's 2 MB default is lifted on this one route only.
+There is no total quota yet.
+
+**Delivery.** The agent is launched and resumed with `--add-dir` on its folder, which is created
+first, so it can read what it is given; an agent already running when this shipped may see
+permission prompts for it until it is restarted. `send_message` (socket or REST) carries
+`attachments: [name]`; the server checks each against the agent's pending rows — a client
+never supplies a path — marks them sent, and the CLI receives
+
+```
+<text>
+
+Attached files:
+- /home/me/.claude-web/uploads/<id>/report.pdf (1.2 MB)
+```
+
+What the agent does with them is up to it. The `user` event stores the text as typed plus
+`attachments: [{name, size, path}]`, so the transcript shows the message without the trailer
+and a download chip per file; the echo check compares against the full text the CLI was sent.
+
+**The folder is the agent's to write in**, so nothing trusts it: uploads are created with
+`create_new`, which fails rather than follow a planted symlink; downloads are refused unless the
+entry is still a plain file (checked with `symlink_metadata`, then the opened inode compared),
+are always `Content-Disposition: attachment` with `nosniff`, and need the credential header
+like every other `/api` route (the page fetches them as a blob). Delete removes the folder and
+its rows for every kind of agent without following links, and the delete report carries an
+informational "N uploaded files (X MB) will be deleted" that never makes a delete unsafe.
+
 ---
 
 ## 8. Notes
@@ -1368,6 +1425,7 @@ pinned_cli_version = "2.1.241"   # warn on mismatch
 auto_resume     = true           # resume agents the token limit stopped (§4)
 remote_control  = false          # launch every agent with --remote-control (§9)
 text_size       = 13             # base UI text size in px, 10–24; every size scales with it
+upload_max_mb   = 50             # largest file the agent page may attach (§7)
 ```
 
 ### The two defaults reach the spawn form

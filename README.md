@@ -36,6 +36,15 @@ reach every endpoint that constrains them — but it cannot be hidden from a
 determined process running as the same user; see DESIGN §7 for what it does and
 does not achieve.
 
+## Attaching files
+
+The agent page takes files from the 📎 button, drag-and-drop or a pasted
+screenshot. They are stored in `~/.claude-web/uploads/<agent-id>/` (outside the
+repository), the agent is launched with `--add-dir` on that folder, and the
+message it receives lists each file's absolute path. `upload_max_mb` in
+`config.toml` caps one file (default 50). Deleting the agent deletes its
+uploads. See DESIGN §7, "Attaching files".
+
 ## Reaching it from a phone
 
 Set `bind` in `config.toml` to a private or tailnet address and run
