@@ -1000,7 +1000,29 @@ async function main() {
     agent_id: state.agent.id,
     after_seq: after === undefined ? state.transcript.replayFrom || null : after,
   });
-  socket.onopen = () => subscribe();
+  // A turn that ended while the socket was down came in no `status`, so after
+  // a reconnect (not the first connect) ask for the agent again, as the
+  // dashboard does. A live `status` that lands while this is in flight is
+  // newer than the answer, so the answer is dropped.
+  let connected = false;
+  const recheckStatus = async () => {
+    const before = state.agent.status;
+    const fresh = (await api(`/api/agents/${state.agent.id}`)).agent;
+    if (state.agent.status !== before) return;
+    trackStatus(state.agent.id, before, fresh.status);
+    Object.assign(state.agent, {
+      status: fresh.status,
+      status_detail: fresh.status_detail,
+      cost_usd: fresh.cost_usd,
+      last_stderr: fresh.last_stderr,
+    });
+    renderHeader();
+  };
+  socket.onopen = () => {
+    subscribe();
+    if (connected) recheckStatus().catch((err) => toast(err.message, 'error'));
+    connected = true;
+  };
   subscribe();
 
   socket

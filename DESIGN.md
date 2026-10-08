@@ -1058,13 +1058,18 @@ terminal, nothing is waiting on the human, and a flash with no answering action 
 never stop.
 
 A **finished turn** gets a softer version of the same. When a `status` message takes an agent
-from `working` (or `awaiting_approval`) to `idle` (`trackStatus`), the tab plays its own chime
-— three falling triangle-wave notes, so it never sounds like a request — and, while the
-operator is away, blinks between the plain turtle and `favicon-done.svg`, a green tile. Looking
-at the tab clears it; the agent starting again takes it back off the list. Orange takes
-precedence: while anything awaits approval the tab shows only the approval alert. The chime is
-claimed across tabs like a request's, keyed `done:agent_id`, and released when the agent next
-leaves `idle`, so its next finished turn chimes too.
+from `working` to `idle` (`trackStatus`) and it stays idle for 1.5 s, the tab plays its own
+chime — three falling triangle-wave notes, so it never sounds like a request — and, while the
+operator is away, blinks between the plain turtle and `favicon-done.svg`, a green tile. The
+settle time is there because queued prompts and held subagent turns pass through idle on their
+way back to working; those must not chime. A turn that ends while a request is pending was cut
+off, not finished, and does not count. Looking at the tab clears the green; the agent leaving
+idle, or being removed, takes it off the list. Orange takes precedence: while anything awaits
+approval the tab shows only the approval alert. The chime is claimed across tabs like a
+request's, keyed `done:agent_id`, and released only when an announced agent leaves idle, so one
+finished turn never chimes twice. A finish missed while the socket was down is caught on
+reconnect: the dashboard diffs the snapshot's statuses, the agent page re-fetches its agent.
+The logic is `DoneTracker` in `attention.js`, tested with the rest.
 
 **Agent cards hold their place.** They are ordered by `created_at`, which never changes: a
 card stays where it was first put for as long as it exists, and a new agent is appended

@@ -30,17 +30,96 @@ export function tabLook({ attention, done = 0, watching, loud, baseTitle }) {
     : { title: `(${done} done) ${baseTitle}`, icon: ICON };
 }
 
-/// Did this status change end a turn? Working (or waiting on a request that
-/// the turn then ended without) and now idle: the agent has done what it was
-/// asked and is waiting for the next prompt.
+/// Did this status change end a turn? Working and now idle: the agent has done
+/// what it was asked and is waiting for the next prompt. A turn that ends while
+/// a request is pending was interrupted or cancelled, not finished.
 export function finishedTurn(previous, next) {
-  return next === 'idle' && (previous === 'working' || previous === 'awaiting_approval');
+  return previous === 'working' && next === 'idle';
 }
 
 /// The chime claim for an agent's finished turn. Released when the agent starts
 /// again, so its next finished turn chimes too.
 export function doneKey(agentId) {
   return `done:${agentId}`;
+}
+
+/// How long an agent must stay idle before its turn counts as done. Queued
+/// prompts and held subagent turns pass through idle for a moment on their way
+/// back to working; those must not chime.
+export const DONE_SETTLE_MS = 1500;
+
+/// Which agents have finished a turn the operator has not yet seen. A finished
+/// turn waits `settle` ms; if the agent leaves idle first, it never counts.
+/// Once it does, `announce` fires (the chime) and the agent stays in `done`
+/// until the operator looks (`seen`), it leaves idle, or it is forgotten. The
+/// chime's claim is released only when an announced agent leaves idle, so a
+/// tab can never chime twice for one finished turn. The timer functions are
+/// injected so a test can fire them by hand.
+export class DoneTracker {
+  constructor({
+    announce,
+    release,
+    onChange = () => {},
+    settle = DONE_SETTLE_MS,
+    // Wrapped for the same reason as Flasher's.
+    start = (fn, ms) => setTimeout(fn, ms),
+    cancel = (id) => clearTimeout(id),
+  }) {
+    this.announce = announce;
+    this.release = release;
+    this.onChange = onChange;
+    this.settle = settle;
+    this.start = start;
+    this.cancel = cancel;
+    /// Announced and not yet seen: what the tab blinks green for.
+    this.done = new Set();
+    /// Announced, so holding a chime claim until the agent leaves idle.
+    this.announced = new Set();
+    /// agentId -> settle timer.
+    this.settling = new Map();
+  }
+
+  /// An agent's status changed from `previous` to `next`.
+  status(agentId, previous, next) {
+    if (previous === next) return;
+    this.stopSettling(agentId);
+    if (finishedTurn(previous, next)) {
+      const timer = this.start(() => {
+        this.settling.delete(agentId);
+        this.announced.add(agentId);
+        this.done.add(agentId);
+        this.announce(agentId);
+        this.onChange();
+      }, this.settle);
+      this.settling.set(agentId, timer);
+    } else if (next !== 'idle') {
+      this.leave(agentId);
+    }
+  }
+
+  /// The operator looked at the tab: the green is spent. Claims stay held, so
+  /// the same finished turn cannot chime again. No `onChange`: the caller is
+  /// already repainting.
+  seen() {
+    this.done.clear();
+  }
+
+  /// The agent is gone: drop everything about it.
+  forget(agentId) {
+    this.stopSettling(agentId);
+    this.leave(agentId);
+  }
+
+  stopSettling(agentId) {
+    if (!this.settling.has(agentId)) return;
+    this.cancel(this.settling.get(agentId));
+    this.settling.delete(agentId);
+  }
+
+  leave(agentId) {
+    if (this.announced.delete(agentId)) this.release(agentId);
+    if (this.done.delete(agentId)) this.onChange();
+  }
 }
 
 /// The blink: a phase that flips on a timer while wanted. The timer functions

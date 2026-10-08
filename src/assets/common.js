@@ -1,6 +1,6 @@
 // Shared helpers: API calls, the multiplexed socket, small DOM utilities.
 // No build step, no dependencies — plain ES modules (§7).
-import { Chimer, ChimeClaims, Flasher, attentionKey, doneKey, finishedTurn, tabLook } from '/assets/attention.js';
+import { Chimer, ChimeClaims, DoneTracker, Flasher, attentionKey, doneKey, tabLook } from '/assets/attention.js';
 
 // The credential this page presents. There are two of them, and which one a
 // page holds depends on how it was opened (§7, §12).
@@ -246,8 +246,19 @@ const FLASH_MS = 1200;
 
 let baseTitle = document.title;
 let attention = 0;
-/// Agents that finished a turn since the operator last looked at this tab.
-const doneAgents = new Set();
+
+/// Agents that finished a turn the operator has not seen. Its callbacks only
+/// run from timers and events, by when the chimer below exists.
+const doneTracker = new DoneTracker({
+  announce: (agentId) => {
+    doneChimer.announce(doneKey(agentId));
+    scheduleFlash();
+    flasher.jolt();
+    paintTab();
+  },
+  release: (agentId) => doneChimer.claims.release(doneKey(agentId)),
+  onChange: () => scheduleFlash(),
+});
 
 /// Is the operator actually looking at this tab? A visible tab in an unfocused
 /// window does not count — that is the case this whole feature exists for.
@@ -263,7 +274,7 @@ function setIcon(href) {
 function paintTab() {
   const look = tabLook({
     attention,
-    done: doneAgents.size,
+    done: doneTracker.done.size,
     watching: watching(),
     loud: flasher.loud,
     baseTitle,
@@ -276,8 +287,8 @@ const flasher = new Flasher({ every: FLASH_MS, onTick: paintTab });
 
 function scheduleFlash() {
   // Looking at the tab is seeing the finished agents, so the green is spent.
-  if (watching()) doneAgents.clear();
-  flasher.want((attention > 0 || doneAgents.size > 0) && !watching());
+  if (watching()) doneTracker.seen();
+  flasher.want((attention > 0 || doneTracker.done.size > 0) && !watching());
   paintTab();
 }
 
@@ -398,21 +409,16 @@ export function releaseAttention(agentId, requestId) {
   chimer.claims.release(attentionKey(agentId, requestId));
 }
 
-/// An agent's status changed. A finished turn chimes (once across tabs) and
-/// blinks the tab green until the operator looks; the agent starting again, or
-/// stopping, takes it back off the list and frees its claim for the next turn.
+/// An agent's status changed. A finished turn that stays finished chimes (once
+/// across tabs) and blinks the tab green until the operator looks; see
+/// `DoneTracker`.
 export function trackStatus(agentId, previous, next) {
-  if (previous === next) return;
-  if (finishedTurn(previous, next)) {
-    doneChimer.announce(doneKey(agentId));
-    doneAgents.add(agentId);
-    scheduleFlash();
-    flasher.jolt();
-    paintTab();
-  } else if (next !== 'idle') {
-    doneChimer.claims.release(doneKey(agentId));
-    if (doneAgents.delete(agentId)) scheduleFlash();
-  }
+  doneTracker.status(agentId, previous, next);
+}
+
+/// An agent was removed: it can no longer be done, nor about to be.
+export function forgetAgent(agentId) {
+  doneTracker.forget(agentId);
 }
 
 // One socket, one reconnect path, one schema. Handlers are keyed by the

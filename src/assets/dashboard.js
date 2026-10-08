@@ -1,6 +1,6 @@
 // Dashboard: the agent registry, account usage, notes, the spawn form, cloning
 // and settings.
-import { announceAttention, releaseAttention, api, applyTextSize, DEFAULT_TEXT_SIZE, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast, trackStatus } from '/assets/common.js';
+import { announceAttention, releaseAttention, api, applyTextSize, DEFAULT_TEXT_SIZE, el, slugify, statusEl, fmtCost, fmtAgo, setAttention, Socket, stashSpawnWarning, toast, trackStatus, forgetAgent } from '/assets/common.js';
 import { PendingRequests, Resync, withDeadline } from '/assets/attention.js';
 
 const state = {
@@ -958,6 +958,7 @@ async function main() {
     }))
     .on('agent_removed', live((msg) => {
       state.agents.delete(msg.agent_id);
+      forgetAgent(msg.agent_id);
       renderAgents();
     }))
     .on('permission_request', live((msg) => {

@@ -1153,7 +1153,7 @@ mod tests {
         let driver = dir.path().join("attention.mjs");
         let source = format!(
             r#"
-import {{ Chimer, ChimeClaims, Flasher, PendingRequests, Resync, withDeadline, attentionKey, doneKey, finishedTurn, newKeys, tabLook, ICON, ICON_ALERT, ICON_FLASH, ICON_DONE_FLASH, CHIME_CLAIM_MS, CHIME_STORAGE_KEY }} from "{module}";
+import {{ Chimer, ChimeClaims, DoneTracker, DONE_SETTLE_MS, Flasher, PendingRequests, Resync, withDeadline, attentionKey, doneKey, finishedTurn, newKeys, tabLook, ICON, ICON_ALERT, ICON_FLASH, ICON_DONE_FLASH, CHIME_CLAIM_MS, CHIME_STORAGE_KEY }} from "{module}";
 
 const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
 
@@ -1300,11 +1300,85 @@ const tab = (shared, state) => {{
 // Which status changes count as a finished turn.
 {{
   assert(finishedTurn("working", "idle"), "working to idle is a finished turn");
-  assert(finishedTurn("awaiting_approval", "idle"), "a turn that ends while waiting is finished too");
+  assert(!finishedTurn("awaiting_approval", "idle"), "a turn cut off mid-request was not finished");
   assert(!finishedTurn("starting", "idle"), "starting up is not finishing a turn");
   assert(!finishedTurn("idle", "idle"), "no change is no news");
   assert(!finishedTurn("working", "stopped") && !finishedTurn("working", "failed"), "stopping or failing is not done");
   assert(!finishedTurn("idle", "working"), "starting a turn is not finishing one");
+}}
+
+// The done tracker, on hand-fired timers: a finished turn must settle before
+// it counts, and claims are released only when an announced agent moves on.
+const tracker = () => {{
+  const t = {{ timers: new Map(), next: 1, announced: [], released: [], changes: 0, delays: [] }};
+  t.done = new DoneTracker({{
+    announce: (id) => t.announced.push(id),
+    release: (id) => t.released.push(id),
+    onChange: () => {{ t.changes += 1; }},
+    start: (fn, ms) => {{ t.delays.push(ms); const id = t.next++; t.timers.set(id, fn); return id; }},
+    cancel: (id) => t.timers.delete(id),
+  }});
+  t.fire = () => {{ const due = [...t.timers.values()]; t.timers.clear(); for (const fn of due) fn(); }};
+  return t;
+}};
+
+// Settle, then done.
+{{
+  const t = tracker();
+  t.done.status("a", "working", "idle");
+  assert(t.announced.length === 0 && !t.done.done.has("a"), "nothing is announced before it settles");
+  assert(t.delays[0] === DONE_SETTLE_MS && DONE_SETTLE_MS >= 1000, "it waits the settle time");
+  t.fire();
+  assert(JSON.stringify(t.announced) === '["a"]' && t.done.done.has("a"), "after settling it is done and chimes");
+}}
+
+// A brief idle between queued prompts never counts.
+{{
+  const t = tracker();
+  t.done.status("a", "working", "idle");
+  t.done.status("a", "idle", "working");
+  t.fire();
+  assert(t.announced.length === 0 && t.done.done.size === 0, "idle then working inside the window: no chime, no green");
+  assert(t.released.length === 0, "and nothing to release");
+}}
+
+// The claim is released only once an announced agent really starts again.
+{{
+  const t = tracker();
+  t.done.status("a", "working", "idle");
+  t.fire();
+  t.done.seen();
+  assert(t.done.done.size === 0, "watching clears the green");
+  assert(t.released.length === 0, "but keeps the claim, so the same turn cannot chime twice");
+  t.done.status("a", "idle", "working");
+  assert(JSON.stringify(t.released) === '["a"]', "starting again releases it");
+  t.done.status("a", "working", "awaiting_approval");
+  assert(t.released.length === 1, "released once, not on every later change");
+  t.done.status("a", "awaiting_approval", "idle");
+  t.fire();
+  assert(t.announced.length === 1, "a turn cut off mid-request does not chime");
+}}
+
+// Stopping takes it off the list and frees the claim.
+{{
+  const t = tracker();
+  t.done.status("a", "working", "idle");
+  t.fire();
+  t.done.status("a", "idle", "stopped");
+  assert(t.done.done.size === 0 && t.released.length === 1, "a stopped agent is no longer done");
+}}
+
+// A removed agent is forgotten, settling or done.
+{{
+  const t = tracker();
+  t.done.status("a", "working", "idle");
+  t.done.forget("a");
+  t.fire();
+  assert(t.announced.length === 0, "forgetting cancels the settle");
+  t.done.status("b", "working", "idle");
+  t.fire();
+  t.done.forget("b");
+  assert(!t.done.done.has("b") && JSON.stringify(t.released) === '["b"]', "forgetting a done agent clears it and frees its claim");
 }}
 
 // The done chime has its own claim: one tab plays it per finished turn, it
@@ -1329,9 +1403,17 @@ const tab = (shared, state) => {{
 const board = () => {{
   const b = {{ status: new Map(), chimes: [] }};
   b.pending = new PendingRequests((agent, id) => b.chimes.push(agent + ":" + id));
+  b.settle = [];
+  b.done = new DoneTracker({{
+    announce: (id) => b.chimes.push("done:" + id),
+    release: () => {{}},
+    start: (fn) => {{ b.settle.push(fn); return b.settle.length; }},
+    cancel: () => {{}},
+  }});
   b.resync = new Resync();
   b.live = (apply) => b.resync.route(apply);
   b.load = (agents, announce = true) => {{
+    if (announce) for (const a of agents) if (b.status.has(a.id)) b.done.status(a.id, b.status.get(a.id), a.status);
     b.status = new Map(agents.map((a) => [a.id, a.status]));
     b.pending.snapshot(agents, {{ announce }});
   }};
@@ -1383,6 +1465,20 @@ const agentA = (status, ids) => ({{ id: "a", status, pending_permissions: ids.ma
   const gen = b.resync.begin();
   b.resync.finish(gen, () => b.load([agentA("awaiting_approval", ["r1", "r2"])]));
   assert(JSON.stringify(b.chimes) === '["a:r2"]', "only the unseen request chimes: " + b.chimes);
+}}
+
+// A turn that ended while the socket was down shows only in the reconnect
+// snapshot: it still settles and chimes as done, once.
+{{
+  const b = board();
+  b.load([agentA("working", [])], false);
+  const gen = b.resync.begin();
+  b.resync.finish(gen, () => b.load([agentA("idle", [])]));
+  b.settle.splice(0).forEach((fn) => fn());
+  assert(JSON.stringify(b.chimes) === '["done:a"]', "the missed finish chimes: " + b.chimes);
+  const again = b.resync.begin();
+  b.resync.finish(again, () => b.load([agentA("idle", [])]));
+  assert(b.settle.length === 0 && b.chimes.length === 1, "a later reconnect does not chime it again");
 }}
 
 // Overlapping reloads: the older result is discarded, and what was held before
