@@ -1297,7 +1297,8 @@ the agent's pending rows, all are marked sent or none are, so two tabs sending t
 a withdraw racing a send cannot both win, and a client never supplies a path. Each claimed file's
 agent copy is then checked: a plain file with one link, the recorded size and hash. One that
 was edited, removed, or replaced by a symlink or hard link is rewritten from the private copy
-(a fresh temporary file renamed over the name, which replaces a link without following it)
+(a fresh temporary file, made in the private folder so a launch's sweep of the agent's folder
+can never catch it, renamed over the name, which replaces a link without following it)
 before the message goes, so the trailer only ever names the bytes the operator uploaded; if the
 private copy cannot vouch for it the send is refused and the claim released. A send that then
 fails to reach the agent hands them back to pending — including one still queued when the
@@ -1338,7 +1339,8 @@ read-only folder the agent left (a Go module cache is 0555) does not stop it: on
 failure every real folder in the tree is made `u+rwx`, links untouched, and the removal retried; and the
 delete report carries an informational note that never makes a delete unsafe — "3 uploaded
 files (2.0 MB) and 2 other files the agent saved there (1.0 MB) will be deleted", counting what
-the agent left in its folder too. The dashboard fetches `delete_preview` so every delete
+the agent left in its folder too — the whole tree, without following links, stopping after
+10,000 entries and saying "at least" when it does. The dashboard fetches `delete_preview` so every delete
 confirmation says it, not only a forced one. The socket refuses messages over 2 MiB (the
 library default is 64 MiB); the composer measures the frame it is about to send and refuses one
 over that itself, keeping the draft and suggesting an attachment instead.

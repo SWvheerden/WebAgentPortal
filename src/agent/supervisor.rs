@@ -1391,10 +1391,13 @@ impl Supervisor {
         let bytes: u64 = rows.iter().map(|r| r.size).sum();
         let names: HashSet<String> = rows.into_iter().map(|r| r.name).collect();
         let dir = self.uploads_dir(id);
-        let (others, other_bytes) =
-            tokio::task::spawn_blocking(move || uploads::other_files(&dir, &names))
-                .await
-                .unwrap_or((0, 0));
+        let others = tokio::task::spawn_blocking(move || uploads::other_files(&dir, &names))
+            .await
+            .unwrap_or_default();
+        // A walk that hit its cap gives lower bounds, and says so.
+        let at_least = if others.capped { "at least " } else { "" };
+        let other_bytes = others.bytes;
+        let others = others.count;
         let files = |n: u64| if n == 1 { "file" } else { "files" };
         let uploaded = format!(
             "{count} uploaded {} ({})",
@@ -1402,7 +1405,7 @@ impl Supervisor {
             uploads::human_size(bytes)
         );
         let saved = format!(
-            "{others} other {} the agent saved there ({})",
+            "{at_least}{others} other {} the agent saved there ({at_least}{})",
             files(others),
             uploads::human_size(other_bytes)
         );
@@ -1410,7 +1413,8 @@ impl Supervisor {
             (0, 0) => None,
             (_, 0) => Some(format!("{uploaded} will be deleted")),
             (0, _) => Some(format!(
-                "{others} {} the agent saved in its upload folder ({}) will be deleted",
+                "{at_least}{others} {} the agent saved in its upload folder ({at_least}{}) \
+                 will be deleted",
                 files(others),
                 uploads::human_size(other_bytes)
             )),

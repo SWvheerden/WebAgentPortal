@@ -321,12 +321,8 @@ pub fn agent_copy_matches(agent_dir: &Path, name: &str, size: u64, sha256: &str)
     sha256_hex(file.take(size)).is_ok_and(|hash| hash == sha256)
 }
 
-/// Write the agent's copy of an upload from the private one.
-///
-/// The private copy must still be the recorded size and hash. The new copy is
-/// written to a fresh temporary name (`create_new`, 0600) and renamed over
-/// `name`, which replaces whatever entry is there — a link included — without
-/// following it.
+/// Write the agent's copy of an upload from the private one: [`stage_copy`]
+/// then [`place_copy`].
 pub fn restore_copy(
     blob_dir: &Path,
     agent_dir: &Path,
@@ -334,18 +330,29 @@ pub fn restore_copy(
     size: u64,
     sha256: &str,
 ) -> Result<()> {
+    let staged = stage_copy(blob_dir, name, size, sha256)?;
+    place_copy(&staged, agent_dir, name)
+}
+
+/// Copy the private copy of `name` to a fresh temporary file, checking it is
+/// still the recorded size and hash on the way. Returns the temporary path.
+///
+/// The temporary file is made in the *private* folder, never the agent's: the
+/// agent's folder is swept of dot-entries before every launch, and a resume
+/// while an upload is finishing would otherwise delete the portal's own temp
+/// from under it. The two folders sit side by side under `~/.claude-web`, so
+/// the rename that follows stays on one filesystem.
+pub fn stage_copy(
+    blob_dir: &Path,
+    name: &str,
+    size: u64,
+    sha256: &str,
+) -> Result<std::path::PathBuf> {
     let blob = open_hardened(blob_dir, name, false)?;
     if blob.metadata()?.len() != size {
         bail!("the stored copy of {name} is not the size that was uploaded");
     }
-    let agent_meta = std::fs::symlink_metadata(agent_dir)?;
-    if !agent_meta.file_type().is_dir() {
-        bail!("the upload folder is not a plain directory");
-    }
-    let temp = agent_dir.join(format!(
-        ".claude-web-restore-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let temp = blob_dir.join(format!(".restore-{}", uuid::Uuid::new_v4().simple()));
     let mut out = create_private(&temp).with_context(|| format!("creating {}", temp.display()))?;
     let written = (|| -> Result<()> {
         let mut hasher = Sha256::new();
@@ -365,13 +372,38 @@ pub fn restore_copy(
             bail!("the stored copy of {name} does not match what was uploaded");
         }
         out.flush()?;
-        std::fs::rename(&temp, agent_dir.join(name))?;
         Ok(())
     })();
-    if written.is_err() {
+    if let Err(err) = written {
         std::fs::remove_file(&temp).ok();
+        return Err(err);
     }
-    written
+    Ok(temp)
+}
+
+/// Move a staged copy into the agent's folder as `name`. The rename replaces
+/// whatever entry is there — a link included — without following it. The
+/// staged file is removed if it cannot be placed.
+pub fn place_copy(staged: &Path, agent_dir: &Path, name: &str) -> Result<()> {
+    let placed = (|| -> Result<()> {
+        let agent_meta = std::fs::symlink_metadata(agent_dir)?;
+        if !agent_meta.file_type().is_dir() {
+            bail!("the upload folder is not a plain directory");
+        }
+        match std::fs::rename(staged, agent_dir.join(name)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.raw_os_error() == Some(libc::EXDEV) => bail!(
+                "{} and {} are on different filesystems; uploads need them on one",
+                staged.display(),
+                agent_dir.display()
+            ),
+            Err(err) => Err(err).with_context(|| format!("placing {name}")),
+        }
+    })();
+    if placed.is_err() {
+        std::fs::remove_file(staged).ok();
+    }
+    placed
 }
 
 /// What [`sweep_dot_entries`] did: the dot-entries it removed, and any it
@@ -418,28 +450,61 @@ pub fn sweep_dot_entries(dir: &Path) -> Result<Sweep> {
     Ok(sweep)
 }
 
+/// How many entries [`other_files`] looks at before it stops counting.
+const OTHER_FILES_CAP: usize = 10_000;
+
+/// What the agent saved in its upload folder itself, for the delete note.
+#[derive(Debug, Default, PartialEq)]
+pub struct OtherFiles {
+    /// Everything that is not a folder: files, links, anything else.
+    pub count: u64,
+    /// The size of the regular files among them.
+    pub bytes: u64,
+    /// The walk stopped at its cap, so both are lower bounds.
+    pub capped: bool,
+}
+
 /// Files in an agent's upload folder that are not uploads — what the agent
-/// saved there itself — as a count and a total size. `uploads` are the names
-/// that have rows.
-pub fn other_files(dir: &Path, uploads: &HashSet<String>) -> (u64, u64) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (0, 0);
-    };
-    let mut count = 0;
-    let mut bytes = 0;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if uploads.contains(&name) {
+/// saved there itself. `uploads` are the names that have rows; they are only
+/// excluded at the top level, where uploads live.
+///
+/// The whole tree is walked, without following links (each entry is looked at
+/// with `symlink_metadata`), and stops after [`OTHER_FILES_CAP`] entries.
+pub fn other_files(dir: &Path, uploads: &HashSet<String>) -> OtherFiles {
+    other_files_capped(dir, uploads, OTHER_FILES_CAP)
+}
+
+fn other_files_capped(dir: &Path, uploads: &HashSet<String>, cap: usize) -> OtherFiles {
+    let mut found = OtherFiles::default();
+    let mut seen = 0;
+    let mut folders = vec![(dir.to_path_buf(), true)];
+    while let Some((folder, top)) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
             continue;
-        }
-        count += 1;
-        if let Ok(meta) = std::fs::symlink_metadata(entry.path())
-            && meta.file_type().is_file()
-        {
-            bytes += meta.len();
+        };
+        for entry in entries.flatten() {
+            if top && uploads.contains(&entry.file_name().to_string_lossy().to_string()) {
+                continue;
+            }
+            if seen == cap {
+                found.capped = true;
+                return found;
+            }
+            seen += 1;
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.file_type().is_dir() {
+                folders.push((entry.path(), false));
+                continue;
+            }
+            found.count += 1;
+            if meta.file_type().is_file() {
+                found.bytes += meta.len();
+            }
         }
     }
-    (count, bytes)
+    found
 }
 
 /// Remove an agent's whole upload folder (or any one entry). A missing one is
@@ -906,6 +971,79 @@ mod tests {
         assert!(restore_copy(&blobs, &agent, "a.txt", size, &sha).is_err());
     }
 
+    /// The portal's temporary copy lives in the private folder, so a launch
+    /// sweeping the agent's folder in the middle of a restore cannot touch it.
+    #[test]
+    fn a_sweep_between_staging_and_placing_does_not_touch_the_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blobs = dir.path().join("blobs");
+        let agent = dir.path().join("uploads");
+        ensure_dir(&blobs).expect("blobs");
+        ensure_dir(&agent).expect("agent");
+        std::fs::write(blobs.join("a.txt"), "bytes").expect("write");
+        let sha = sha256_hex(&b"bytes"[..]).expect("hash");
+
+        let staged = stage_copy(&blobs, "a.txt", 5, &sha).expect("stage");
+        assert_eq!(
+            staged.parent(),
+            Some(blobs.as_path()),
+            "staged in the private folder"
+        );
+        let swept = sweep_dot_entries(&agent).expect("sweep");
+        assert!(
+            swept.removed.is_empty() && swept.remaining.is_empty(),
+            "{swept:?}"
+        );
+        place_copy(&staged, &agent, "a.txt").expect("place");
+        assert_eq!(
+            std::fs::read_to_string(agent.join("a.txt")).expect("read"),
+            "bytes"
+        );
+        let left: Vec<_> = std::fs::read_dir(&blobs)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "no temporary file left: {left:?}");
+
+        // One that cannot be placed is not left behind either.
+        let staged = stage_copy(&blobs, "a.txt", 5, &sha).expect("stage");
+        assert!(place_copy(&staged, &dir.path().join("missing"), "a.txt").is_err());
+        assert!(!staged.exists());
+    }
+
+    /// The delete note counts everything the agent saved, however deep, without
+    /// following links; the walk is bounded.
+    #[test]
+    fn other_files_walks_the_tree_without_following_links() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).expect("mkdir");
+        std::fs::write(outside.join("big"), vec![0u8; 4096]).expect("write");
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(agent.join("build").join("deep")).expect("mkdir");
+        std::fs::write(agent.join("upload.png"), vec![0u8; 100]).expect("write");
+        std::fs::write(agent.join("notes.md"), vec![0u8; 10]).expect("write");
+        std::fs::write(agent.join("build").join("a.o"), vec![0u8; 20]).expect("write");
+        std::fs::write(agent.join("build").join("deep").join("b.o"), vec![0u8; 30]).expect("write");
+        // A row's name deeper down is not an upload: only the top level is.
+        std::fs::write(agent.join("build").join("upload.png"), vec![0u8; 40]).expect("write");
+        std::os::unix::fs::symlink(&outside, agent.join("linked")).expect("symlink");
+
+        let known: HashSet<String> = ["upload.png".to_string()].into();
+        assert_eq!(
+            other_files(&agent, &known),
+            OtherFiles {
+                count: 5,
+                bytes: 100,
+                capped: false
+            },
+            "four files and a link; the link's target is not counted"
+        );
+        let capped = other_files_capped(&agent, &known, 3);
+        assert!(capped.capped && capped.count <= 3, "{capped:?}");
+    }
+
     #[test]
     fn the_sweep_removes_dot_entries_and_nothing_else() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -935,7 +1073,14 @@ mod tests {
         );
 
         let known: HashSet<String> = ["report.pdf".to_string()].into();
-        assert_eq!(other_files(&agent, &known), (1, 15));
+        assert_eq!(
+            other_files(&agent, &known),
+            OtherFiles {
+                count: 1,
+                bytes: 15,
+                capped: false
+            }
+        );
     }
 
     #[test]
