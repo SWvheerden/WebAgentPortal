@@ -788,6 +788,8 @@ pub struct LaunchArgs {
     pub effort: Option<String>,
     pub max_budget_usd: Option<f64>,
     pub add_dirs: Vec<String>,
+    /// Permission rules allowed without asking, one `--allowedTools` each.
+    pub allowed_tools: Vec<String>,
     /// The name to offer this session under, when `remote_control` is on (§9).
     /// `None` leaves the flag off entirely.
     pub remote_control: Option<String>,
@@ -827,6 +829,12 @@ impl LaunchArgs {
         for dir in &self.add_dirs {
             args.push("--add-dir".into());
             args.push(dir.clone());
+        }
+        // One flag per rule: the CLI splits a value on spaces and commas, and
+        // a rule must reach it whole.
+        for rule in &self.allowed_tools {
+            args.push("--allowedTools".into());
+            args.push(rule.clone());
         }
         // Always with a name. `--remote-control` takes an *optional* value, so
         // a bare one is a flag whose argument is whatever follows it — safe
@@ -1283,6 +1291,7 @@ mod tests {
             effort: None,
             max_budget_usd: None,
             add_dirs: vec![],
+            allowed_tools: vec![],
             remote_control: None,
         };
         let argv = base.to_argv();
@@ -1321,6 +1330,7 @@ mod tests {
             effort: Some("high".into()),
             max_budget_usd: Some(2.5),
             add_dirs: vec!["/a".into(), "/b".into()],
+            allowed_tools: vec![],
             remote_control: None,
         };
         let argv = args.to_argv();
@@ -1345,6 +1355,7 @@ mod tests {
             effort: None,
             max_budget_usd: None,
             add_dirs: vec!["/a".into()],
+            allowed_tools: vec![],
             remote_control: Some("fix_the_parser".into()),
         };
         let argv = args.to_argv();

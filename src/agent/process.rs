@@ -2957,6 +2957,7 @@ mod tests {
                 effort: None,
                 max_budget_usd: None,
                 add_dirs: Vec::new(),
+                allowed_tools: Vec::new(),
                 remote_control: None,
             },
         };
