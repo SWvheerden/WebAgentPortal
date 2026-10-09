@@ -1366,7 +1366,13 @@ derived from the agent's; one that cannot even be opened gets a single
 `fchmodat(AT_SYMLINK_NOFOLLOW)` from its parent, which Linux refuses, failing closed. The walk is
 bounded: 128 levels (each holds one open descriptor, well under macOS's default limit of 256)
 and 200,000 entries for a removal; past either it fails closed — the folder is left and the
-delete reports that it could not be removed. It uses `rustix`, so there is no `unsafe`.
+delete reports that it could not be removed. The entry budget bounds the work, not just the
+result: a folder is read only up to what the walk has left to spend, plus one, so a folder of
+millions of entries is never enumerated or held in memory to find out it is too big. Listings
+are sorted, so a walk always visits the same entries in the same order. The agent's folder
+itself is opened, unlocked and finally removed relative to the portal's `uploads/` (or
+`blobs/`) above it, with the same unlock-and-retry as any folder inside — so an agent that sets
+its own folder to mode 000 does not keep it (on macOS; on Linux, as above, it fails closed). It uses `rustix`, so there is no `unsafe`.
 
 The delete report carries an informational note that never makes a delete unsafe — "3 uploaded
 files (2.0 MB) and 2 other files the agent saved there (1.0 MB) will be deleted" — counting, with

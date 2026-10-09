@@ -16,7 +16,7 @@
 //! in folders of mode 0700; and the wipe never follows a link.
 
 use std::collections::HashSet;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
@@ -472,16 +472,46 @@ fn open_dir_at<P: rustix::path::Arg, Fd: AsFd>(parent: Fd, name: P) -> rustix::i
 }
 
 /// The names in an open folder, without `.` and `..`.
-fn list_dir(fd: &OwnedFd) -> rustix::io::Result<Vec<CString>> {
+///
+/// Reads at most `limit + 1` names: a folder holding more than the walk has
+/// left to spend is not read to the end — or held in memory — just to find
+/// that out. The caller sees `limit + 1` names and fails closed. What is read
+/// is sorted, so a walk visits entries in the same order every time.
+fn list_dir(fd: &OwnedFd, limit: usize) -> rustix::io::Result<Vec<CString>> {
     let mut names = Vec::new();
     for entry in rustix::fs::Dir::read_from(fd)? {
         let entry = entry?;
         let name = entry.file_name();
         if name != c"." && name != c".." {
             names.push(name.to_owned());
+            if names.len() > limit {
+                break;
+            }
         }
     }
+    names.sort();
     Ok(names)
+}
+
+/// Open the folder `name` inside `parent` to remove it. If it cannot be
+/// opened at all (mode 000, say), it gets one `fchmodat(AT_SYMLINK_NOFOLLOW)`
+/// to 0700 from its parent and one more try — never a path, never a link
+/// followed. Linux refuses that call, so there such a folder stays shut and
+/// the caller fails closed.
+fn open_dir_to_remove<Fd: AsFd>(parent: Fd, name: &CStr) -> rustix::io::Result<OwnedFd> {
+    let parent = parent.as_fd();
+    match open_dir_at(parent, name) {
+        Err(Errno::ACCESS) => {
+            rustix::fs::chmodat(
+                parent,
+                name,
+                Mode::from_raw_mode(0o700),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )?;
+            open_dir_at(parent, name)
+        }
+        other => other,
+    }
 }
 
 /// Walk a tree the agent can write to, counting it or removing it.
@@ -512,7 +542,14 @@ fn walk_tree(
         complete: true,
         ..Walked::default()
     };
-    let entries = match list_dir(&top) {
+    let too_many = format!("more than {max_entries} entries");
+    // The names passed over at the top are read too, so they get room.
+    let top_limit = max_entries.saturating_add(skip_top.len());
+    let entries: Vec<CString> = match list_dir(&top, top_limit) {
+        Ok(entries) if entries.len() > top_limit => {
+            walked.fail(too_many);
+            return walked;
+        }
         Ok(entries) => entries
             .into_iter()
             .filter(|n| !skip_top.contains(n.to_string_lossy().as_ref()))
@@ -522,6 +559,10 @@ fn walk_tree(
             return walked;
         }
     };
+    if entries.len() > max_entries {
+        walked.fail(too_many);
+        return walked;
+    }
     let mut stack = vec![Frame {
         fd: top,
         entries,
@@ -569,15 +610,9 @@ fn walk_tree(
                 walked.fail(format!("folders nested more than {WALK_MAX_DEPTH} deep"));
                 return walked;
             }
-            let opened = match open_dir_at(parent, &name) {
-                Err(Errno::ACCESS) if mode == WalkMode::Remove => rustix::fs::chmodat(
-                    parent,
-                    &name,
-                    Mode::from_raw_mode(0o700),
-                    AtFlags::SYMLINK_NOFOLLOW,
-                )
-                .and_then(|()| open_dir_at(parent, &name)),
-                other => other,
+            let opened = match mode {
+                WalkMode::Remove => open_dir_to_remove(parent, &name),
+                WalkMode::Count => open_dir_at(parent, &name),
             };
             let fd = match opened {
                 Ok(fd) => fd,
@@ -610,7 +645,14 @@ fn walk_tree(
                 ));
                 return walked;
             }
-            let entries = match list_dir(&fd) {
+            // What is left of the budget, counting what is already queued.
+            let queued: usize = stack.iter().map(|f| f.entries.len()).sum();
+            let limit = max_entries.saturating_sub(seen).saturating_sub(queued);
+            let entries = match list_dir(&fd, limit) {
+                Ok(entries) if entries.len() > limit => {
+                    walked.fail(too_many);
+                    return walked;
+                }
                 Ok(entries) => entries,
                 Err(err) => {
                     walked.fail(format!("could not list {}: {err}", name.to_string_lossy()));
@@ -673,25 +715,43 @@ fn other_files_limited(dir: &Path, uploads: &HashSet<String>, cap: usize) -> Wal
 /// read-only folders the agent left (a Go module cache is 0555), and failing
 /// closed — leaving the folder, with an error — if it is deeper or bigger
 /// than the walk will go.
+///
+/// Everything happens relative to the folder `dir` sits in (`uploads/` or
+/// `blobs/`, which the portal owns): the entry is inspected, opened (with the
+/// same unlock-and-retry as any folder inside it, so an agent that made its
+/// own folder mode 000 does not keep it) and finally removed with `unlinkat`
+/// there, never by path.
 pub fn wipe_dir(dir: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(dir) {
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        bail!("{} is not a folder that can be removed", dir.display());
+    };
+    let name = CString::new(name.as_encoded_bytes())
+        .with_context(|| format!("{} has a NUL in its name", dir.display()))?;
+    let parent_fd = match open_dir_at(rustix::fs::CWD, parent) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("opening {}", parent.display())),
+    };
+    let stat = match rustix::fs::statat(&parent_fd, &name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(()),
         Err(err) => return Err(err).with_context(|| format!("inspecting {}", dir.display())),
-        Ok(meta) if !meta.file_type().is_dir() => {
-            return std::fs::remove_file(dir)
-                .with_context(|| format!("removing {}", dir.display()));
-        }
-        Ok(_) => {}
+    };
+    if FileType::from_raw_mode(stat.st_mode as _) != FileType::Directory {
+        // A link (or a file) where the folder should be: removed as itself.
+        return rustix::fs::unlinkat(&parent_fd, &name, AtFlags::empty())
+            .with_context(|| format!("removing {}", dir.display()));
     }
-    let top =
-        open_dir_at(rustix::fs::CWD, dir).with_context(|| format!("opening {}", dir.display()))?;
+    let top = open_dir_to_remove(&parent_fd, &name)
+        .with_context(|| format!("opening {}", dir.display()))?;
     rustix::fs::fchmod(&top, Mode::from_raw_mode(0o700))
         .with_context(|| format!("unlocking {}", dir.display()))?;
     let walked = walk_tree(top, &HashSet::new(), WalkMode::Remove, WIPE_MAX_ENTRIES);
     if let Some(problem) = walked.problem {
         bail!("could not remove {}: {problem}", dir.display());
     }
-    std::fs::remove_dir(dir).with_context(|| format!("removing {}", dir.display()))
+    rustix::fs::unlinkat(&parent_fd, &name, AtFlags::REMOVEDIR)
+        .with_context(|| format!("removing {}", dir.display()))
 }
 
 /// The permission rule that lets the agent read its upload folder without
@@ -1326,7 +1386,7 @@ mod tests {
         while open_dir_at(&top, "d/d").is_ok() {
             rustix::fs::renameat(&top, "d/d", &top, "t").expect("lift");
             if let Ok(d) = open_dir_at(&top, "d") {
-                for name in list_dir(&d).expect("list") {
+                for name in list_dir(&d, usize::MAX).expect("list") {
                     rustix::fs::unlinkat(&d, &name, AtFlags::empty()).ok();
                 }
             }
@@ -1416,6 +1476,83 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &linked).expect("symlink");
         wipe_dir(&linked).expect("wipe");
         assert!(std::fs::symlink_metadata(&linked).is_err() && outside.exists());
+    }
+
+    /// A folder holding more than the walk has left to spend is not read to
+    /// the end: the listing stops one past the budget and the walk fails
+    /// closed — counting reports a partial result, removing removes nothing.
+    #[test]
+    fn a_folder_bigger_than_the_budget_is_not_read_to_the_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = dir.path().join("agent");
+        std::fs::create_dir(&agent).expect("mkdir");
+        for i in 0..50 {
+            std::fs::write(agent.join(format!("f{i:02}")), "x").expect("write");
+        }
+        let fd = open_dir_at(rustix::fs::CWD, &agent).expect("open");
+        assert_eq!(
+            list_dir(&fd, 3).expect("list").len(),
+            4,
+            "budget + 1, then it stops"
+        );
+        assert_eq!(list_dir(&fd, 100).expect("list").len(), 50);
+
+        let counted = other_files_limited(&agent, &HashSet::new(), 3);
+        assert!(!counted.complete, "{counted:?}");
+        assert_eq!(counted.problem.as_deref(), Some("more than 3 entries"));
+
+        // Removing with the same budget fails closed before touching anything.
+        let top = open_dir_at(rustix::fs::CWD, &agent).expect("open");
+        let removed = walk_tree(top, &HashSet::new(), WalkMode::Remove, 3);
+        assert_eq!(removed.problem.as_deref(), Some("more than 3 entries"));
+        assert!(!removed.complete);
+        assert_eq!(
+            std::fs::read_dir(&agent).expect("dir").count(),
+            50,
+            "nothing removed"
+        );
+
+        // The budget counts the whole tree: entries deeper down use it too.
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(nested.join("sub")).expect("mkdir");
+        for i in 0..5 {
+            std::fs::write(nested.join("sub").join(format!("g{i}")), "x").expect("write");
+        }
+        let top = open_dir_at(rustix::fs::CWD, &nested).expect("open");
+        let removed = walk_tree(top, &HashSet::new(), WalkMode::Remove, 4);
+        assert_eq!(removed.problem.as_deref(), Some("more than 4 entries"));
+        assert!(nested.join("sub").exists(), "the folder is left");
+        let top = open_dir_at(rustix::fs::CWD, &nested).expect("open");
+        assert!(walk_tree(top, &HashSet::new(), WalkMode::Remove, 6).complete);
+    }
+
+    /// An agent that makes its own folder mode 000 does not keep it: the top
+    /// is unlocked from the portal's folder above it, like any folder inside.
+    /// Linux cannot change a mode without following links, so there the
+    /// delete fails closed instead.
+    #[test]
+    fn a_top_folder_shut_to_everyone_is_still_wiped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = dir.path().join("uploads").join("agent");
+        std::fs::create_dir_all(agent.join("sub")).expect("mkdir");
+        std::fs::write(agent.join("a.txt"), "a").expect("write");
+        std::fs::write(agent.join("sub").join("b.txt"), "b").expect("write");
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let wiped = wipe_dir(&agent);
+        if cfg!(target_os = "macos") {
+            wiped.expect("wiped");
+            assert!(std::fs::symlink_metadata(&agent).is_err(), "gone");
+        } else {
+            assert!(
+                wiped.is_err(),
+                "fails closed where the mode cannot be changed safely"
+            );
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).ok();
+        }
+        // Nothing there, or the parent missing, is not an error.
+        wipe_dir(&agent).expect("already gone");
+        wipe_dir(&dir.path().join("no-parent").join("agent")).expect("no parent");
     }
 
     /// Totals cannot overflow, however much a tree claims to hold.

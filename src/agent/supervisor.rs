@@ -5422,4 +5422,56 @@ mod tests {
             "and so is the agent's folder"
         );
     }
+
+    /// The delete note never states a count it does not have: a walk that
+    /// stopped part-way says "at least", and one that could count nothing
+    /// says so instead of "0".
+    #[tokio::test]
+    async fn the_delete_note_says_when_it_could_not_count_everything() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let work = tempfile::tempdir().expect("tempdir");
+        let db = Db::open_in_memory().expect("db");
+        db.insert_agent(&agent_record("partial", work.path()))
+            .expect("insert");
+        db.insert_agent(&agent_record("unknown", work.path()))
+            .expect("insert");
+        let sup = Supervisor::with_files_root(
+            db,
+            Arc::new(RwLock::new(Config::default())),
+            root.path().to_path_buf(),
+        );
+        // Entries are visited in reverse name order, so the two files are
+        // counted before the folder that cannot be read stops the walk.
+        let partial = sup.uploads_dir("partial");
+        std::fs::create_dir_all(partial.join("0-locked")).expect("mkdir");
+        std::fs::write(partial.join("a1.txt"), vec![0u8; 1024]).expect("write");
+        std::fs::write(partial.join("a2.txt"), vec![0u8; 1024]).expect("write");
+        let unknown = sup.uploads_dir("unknown");
+        std::fs::create_dir_all(unknown.join("locked")).expect("mkdir");
+        for locked in [partial.join("0-locked"), unknown.join("locked")] {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+        }
+
+        let report = sup.delete_preview("partial").await.expect("preview");
+        assert_eq!(
+            report.uploads.as_deref(),
+            Some(
+                "at least 2 files the agent saved in its upload folder (at least 2.0 KB) will be deleted"
+            )
+        );
+        seed_upload(&sup, "unknown", "up.txt", b"x");
+        let report = sup.delete_preview("unknown").await.expect("preview");
+        assert_eq!(
+            report.uploads.as_deref(),
+            Some(
+                "1 uploaded file (1 B) and other files the agent saved there (they could not be \
+                 counted) will be deleted"
+            )
+        );
+        for locked in [partial.join("0-locked"), unknown.join("locked")] {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).ok();
+        }
+    }
 }
