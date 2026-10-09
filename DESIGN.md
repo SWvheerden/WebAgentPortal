@@ -1341,7 +1341,8 @@ read-only to it), or copy into the repository to change them. What the agent doe
 `attachments: [{name, size, path}]`, so the transcript shows the message without the trailer
 and a download chip per file; the echo check compares against the full text the CLI was sent.
 
-**The agent's folder is the agent's to write in**, so nothing trusts it. Downloads never read it:
+**The agent can still write to its folder** — with Bash, or a write the operator approves — so
+nothing trusts it. Downloads never read it:
 they are served from the private copy, which must still be the recorded size and is streamed up
 to that size, so a symlink, hard link or edit the agent leaves in its folder changes nothing a
 chip hands out. Every open of upload content, in either folder, uses `O_NOFOLLOW | O_NONBLOCK`
@@ -1385,6 +1386,22 @@ library default is 64 MiB); the composer measures the frame it is about to send 
 over that itself, keeping the draft and suggesting an attachment instead.
 A numbered name (`Screenshot-1-2.png`) is always one that cleans to itself, since that is how
 the routes recognise a stored name.
+
+**Known limitations and follow-ups.**
+
+- *Linux: an agent can make its upload folder undeletable.* Unlocking a folder the walker
+  cannot open uses `fchmodat(…, AT_SYMLINK_NOFOLLOW)`, which Linux does not support. So on
+  Linux an agent that runs `chmod 000` on its uploads folder (or any folder inside it) makes
+  that folder undeletable by the portal: deleting the agent fails closed with a warning, the
+  agent's record and the private copies are gone, and the files in that folder remain on
+  disk. This is accepted for now. Possible follow-ups: open the folder with `O_PATH` and change
+  its mode through `/proc/self/fd/<n>`, which never follows a link; and retry failed wipes at
+  startup.
+- `~/.claude-web` itself keeps whatever mode it was created with; only `uploads/`, `blobs/`
+  and the per-agent folders are tightened to 0700.
+- There is no total disk quota: `upload_max_mb` caps one file, not an agent or the machine.
+- The read rule was verified on CLI 2.1.286, not the pinned 2.1.241; re-check it whenever the
+  pin moves.
 
 ---
 

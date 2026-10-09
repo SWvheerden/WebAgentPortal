@@ -226,8 +226,9 @@ pub struct Supervisor {
     /// never across an await, and because starting the watcher is not async.
     auto_resume: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     bus: broadcast::Sender<ServerMsg>,
-    /// Holds `uploads/<agent-id>/` (the agent's copies, handed over with
-    /// `--add-dir`) and `blobs/<agent-id>/` (the portal's private copies).
+    /// Holds `uploads/<agent-id>/` (the agent's copies, which it may read
+    /// through a `Read(//…/**)` allow rule) and `blobs/<agent-id>/` (the
+    /// portal's private copies, which it is never given).
     files_root: PathBuf,
 }
 

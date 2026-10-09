@@ -1,11 +1,15 @@
 //! Files the operator attaches to a message (§7, "Attaching files").
 //!
 //! Each agent gets one folder, `~/.claude-web/uploads/<agent-id>/`, outside
-//! every repository and worktree. The agent is launched with `--add-dir` on it
-//! and is handed absolute paths in the message; what it does with the files is
-//! its own business. Deleting the agent wipes the folder and the private copies.
+//! every repository and worktree. The agent is launched with a permission rule
+//! that lets it *read* the folder ([`read_rule`]) — not `--add-dir`, so nothing
+//! in it is loaded as configuration and the file tools cannot write there
+//! without approval — and is handed absolute paths in the message; what it does
+//! with the files is its own business. Deleting the agent wipes the folder and
+//! the private copies.
 //!
-//! The folder is writable by the agent, so nothing here trusts what is in it.
+//! The agent can still write to the folder (with Bash, or an approved write),
+//! so nothing here trusts what is in it.
 //! The portal keeps its own copy of every upload in
 //! `~/.claude-web/blobs/<agent-id>/`, outside anything the agent is given:
 //! downloads are served from there and never from the agent's folder, and the
@@ -343,10 +347,10 @@ pub fn restore_copy(
 /// still the recorded size and hash on the way. Returns the temporary path.
 ///
 /// The temporary file is made in the *private* folder, never the agent's: the
-/// agent's folder is swept of dot-entries before every launch, and a resume
-/// while an upload is finishing would otherwise delete the portal's own temp
-/// from under it. The two folders sit side by side under `~/.claude-web`, so
-/// the rename that follows stays on one filesystem.
+/// agent can write in its own folder, and the portal's half-written copy is
+/// none of its business — it could otherwise be removed, replaced or read
+/// before it is complete. The two folders sit side by side under
+/// `~/.claude-web`, so the rename that follows stays on one filesystem.
 pub fn stage_copy(
     blob_dir: &Path,
     name: &str,
