@@ -170,7 +170,17 @@ impl Config {
         if self.upload_max_mb == 0 {
             anyhow::bail!("upload_max_mb must be at least 1");
         }
+        self.validate_roots_against(&state_dir())?;
         self.validate_bind(key_file)
+    }
+
+    /// No repo root may overlap the portal's own state folder (§6, "The
+    /// state folder is off limits").
+    pub fn validate_roots_against(&self, state: &Path) -> Result<()> {
+        for root in self.roots() {
+            refuse_overlap("repo root", &root, state)?;
+        }
+        Ok(())
     }
 
     /// The deployment shape of §12, enforced rather than documented.
@@ -263,6 +273,53 @@ pub fn confine_to_roots(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
         "{} is outside the configured repo roots",
         resolved.display()
     )
+}
+
+/// Refuse a path that equals, contains, or sits inside the portal's state
+/// folder (`~/.claude-web`: the database, the device key, every upload).
+///
+/// Every path an agent works in or is given — a repo root, its working
+/// directory, an extra `--add-dir` — is held to this. An agent pointed at the
+/// state folder, or at a folder containing it, could read the device key or
+/// rewrite the database and uploads behind the portal's back. Both sides are
+/// resolved, so a symlinked spelling is caught — a path that does not exist
+/// yet through its nearest ancestor that does.
+pub fn refuse_overlap(what: &str, path: &Path, state: &Path) -> Result<()> {
+    let path = resolve_lenient(path);
+    let state = resolve_lenient(state);
+    if path == state || path.starts_with(&state) || state.starts_with(&path) {
+        anyhow::bail!(
+            "{what} {} overlaps claude-web's own state folder {}; agents may not work in, \
+             above or inside it. Choose a folder outside it.",
+            path.display(),
+            state.display()
+        );
+    }
+    Ok(())
+}
+
+/// `path` with its nearest existing ancestor canonicalised and the rest
+/// appended as written: `/var/x/not-yet` on macOS becomes
+/// `/private/var/x/not-yet`, so it compares equal to what a canonicalised
+/// neighbour looks like.
+fn resolve_lenient(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(mut resolved) = std::fs::canonicalize(existing) {
+            for name in rest.iter().rev() {
+                resolved.push(name);
+            }
+            return resolved;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// Is `path` one of the configured roots *itself*, rather than a repository
@@ -439,6 +496,64 @@ pinned_cli_version = "2.1.241"
         assert!(big.validate().is_ok());
         let zero = Config::from_toml_str("upload_max_mb = 0\n").expect("parse");
         assert!(zero.validate().is_err());
+    }
+
+    #[test]
+    fn a_path_overlapping_the_state_folder_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("home").join(".claude-web");
+        let code = dir.path().join("home").join("Code");
+        std::fs::create_dir_all(&state).expect("mkdir");
+        std::fs::create_dir_all(&code).expect("mkdir");
+        for (path, why) in [
+            (state.clone(), "the folder itself"),
+            (
+                state.join("uploads").join("x"),
+                "inside it, even before it exists",
+            ),
+            (dir.path().join("home"), "a folder containing it"),
+        ] {
+            let err = refuse_overlap("repo root", &path, &state).expect_err(why);
+            assert!(
+                format!("{err:#}").contains("overlaps claude-web's own state folder"),
+                "{why}"
+            );
+        }
+        assert!(refuse_overlap("repo root", &code, &state).is_ok());
+        assert!(
+            refuse_overlap(
+                "repo root",
+                &dir.path().join("home").join(".claude-web-old"),
+                &state
+            )
+            .is_ok(),
+            "a sibling whose name starts the same is not inside it"
+        );
+        // A symlinked spelling is caught too.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&state, &link).expect("symlink");
+        assert!(refuse_overlap("repo root", &link, &state).is_err());
+
+        // Config validation holds every root to it.
+        let cfg = Config {
+            repo_roots: vec![
+                code.to_string_lossy().to_string(),
+                dir.path().join("home").to_string_lossy().to_string(),
+            ],
+            ..Config::default()
+        };
+        assert!(cfg.validate_roots_against(&state).is_err());
+        let cfg = Config {
+            repo_roots: vec![code.to_string_lossy().to_string()],
+            ..Config::default()
+        };
+        assert!(cfg.validate_roots_against(&state).is_ok());
+        // And `validate` uses the real state folder: `~` as a root is refused.
+        let home_root = Config {
+            repo_roots: vec!["~".to_string()],
+            ..Config::default()
+        };
+        assert!(home_root.validate().is_err());
     }
 
     #[test]

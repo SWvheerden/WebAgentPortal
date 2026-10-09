@@ -1241,8 +1241,8 @@ async fn list_uploads(
 /// Served from the portal's private copy, never from the agent's folder: the
 /// agent can write there, and a link or a hard link it left in place of an
 /// upload would otherwise hand out whatever it points at. The private copy is
-/// opened hardened and must still be the recorded size; it is streamed up to
-/// that size.
+/// opened hardened and must still be the recorded size and SHA-256; the same
+/// open file is streamed, up to that size.
 async fn download_upload(
     State(state): State<AppState>,
     AxPath((id, name)): AxPath<(String, String)>,
@@ -1262,11 +1262,22 @@ async fn download_upload(
     let dir = state.sup.blobs_dir(&record.id);
     let key = name.clone();
     let size = row.size;
+    let sha256 = row.sha256.clone();
+    // The private copy must still be exactly what was uploaded: the recorded
+    // size, and the recorded SHA-256 of the bytes this descriptor holds. The
+    // same open file is then rewound and streamed, so what was checked is what
+    // is sent.
     let file = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
-        let file = uploads::open_hardened(&dir, &key, false)?;
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = uploads::open_hardened(&dir, &key, false)?;
         if file.metadata()?.len() != size {
             anyhow::bail!("the stored copy is not the size that was uploaded");
         }
+        let hash = uploads::sha256_hex((&mut file).take(size))?;
+        if hash != sha256 {
+            anyhow::bail!("the stored copy does not match what was uploaded");
+        }
+        file.seek(SeekFrom::Start(0))?;
         Ok(file)
     })
     .await
@@ -3298,6 +3309,19 @@ console.log("ok");
             big.len().to_string().as_str()
         );
         assert_eq!(body_of(response).await, big);
+
+        // A private copy with the same length but different bytes is refused.
+        let mut tampered = big.clone();
+        tampered[12345] ^= 0xff;
+        std::fs::write(
+            dir.path().join("blobs").join("agent-1").join("big.bin"),
+            &tampered,
+        )
+        .expect("tamper");
+        let response = call(&state, "GET", "/api/agents/agent-1/uploads/big.bin", vec![]).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = String::from_utf8_lossy(&body_of(response).await).to_string();
+        assert!(body.contains("does not match what was uploaded"), "{body}");
 
         // A private copy that is no longer the recorded size is refused.
         std::fs::write(

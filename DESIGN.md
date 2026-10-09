@@ -817,6 +817,24 @@ remove worktree, offer to delete the branch. **Uncommitted changes or unpushed c
 refuse**, show exactly what would be lost, require an explicit "delete anyway".
 The branch survives Delete by default.
 
+A forced delete that `git worktree remove --force` refuses (a locked folder, or a tree deep
+enough that git reports "File name too long") falls back to removing the checkout itself, with
+the same hardened walker as upload folders (§7, "One walker") — never `remove_dir_all`, whose
+recursion an agent-built tree ~30,000 folders deep overflows, aborting the whole server before
+the agent's record is deleted, and again on every retry. `git worktree prune` runs whatever the
+walk did. If the walk fails closed, the delete still goes ahead and the notice names the path
+left on disk. A clone that fails is cleaned up the same way, and its error names anything left.
+
+### The state folder is off limits
+No agent may work in, above or inside the portal's own state folder (`~/.claude-web`: the
+database, the device key, every upload). A configured repo root that equals, contains or sits
+inside it fails config validation — so `~` as a root is refused — and a spawn is refused for a
+repository or extra directory that does. Every launch and resume checks the agent's
+repository, working directory and extra directories again, so an agent made before the check, or
+a root edited since, gets a clear refusal rather than running. Paths are compared resolved (a
+symlinked spelling is caught; one that does not exist yet through its nearest existing
+ancestor).
+
 ---
 
 ## 7. Web interface
@@ -1343,8 +1361,8 @@ and a download chip per file; the echo check compares against the full text the 
 
 **The agent can still write to its folder** — with Bash, or a write the operator approves — so
 nothing trusts it. Downloads never read it:
-they are served from the private copy, which must still be the recorded size and is streamed up
-to that size, so a symlink, hard link or edit the agent leaves in its folder changes nothing a
+they are served from the private copy, which must still be the recorded size and SHA-256 —
+the open file is hashed, rewound and that same file streamed, up to the recorded size — so a symlink, hard link or edit the agent leaves in its folder changes nothing a
 chip hands out. Every open of upload content, in either folder, uses `O_NOFOLLOW | O_NONBLOCK`
 (a symlink fails, a planted FIFO cannot stall the open) and then requires the opened file to be
 a regular file — with a single link, for the agent's copies. Files are created with
@@ -1354,8 +1372,16 @@ other `/api` route (the page fetches them as a blob). Withdrawing removes both c
 removes both folders and the rows for every kind of agent — the private copies first, which the
 agent cannot have made hard to remove, and both always attempted.
 
-**One walker for trees the agent controls.** Removing the agent's folder and counting what is in
-it go through `uploads::walk_tree`, and nothing else touches that tree by path. It is iterative,
+**One walker for trees the agent controls.** Removing the agent's upload folder, counting what is
+in it, removing a worktree git would not, and cleaning up a failed clone all go through
+`tree::walk_tree` (`tree::remove_tree` for removal); no non-test code calls `remove_dir_all` on
+such a tree, and nothing touches one by path. The entry budget is per use: 200,000 for an upload
+folder, 10,000 for counting, 20,000,000 for a checkout (a build folder or `node_modules` is large,
+and the disk bounds it anyway); the depth bound is the same everywhere. A walk stays on one
+filesystem: a folder whose device differs from the top's — something mounted inside the tree —
+is never entered or emptied, and the walk fails closed there. One walk runs at a time, process
+wide, under a lock held for its whole length, so concurrent deletes cannot add up open
+descriptors. It is iterative,
 on a heap stack, so no tree can exhaust the thread's stack (`std::fs::remove_dir_all` recursed,
 and an agent can build a tree 10,000 folders deep in a second). Every folder is opened relative
 to the folder it was found in with `openat(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`, so a folder
@@ -1365,7 +1391,8 @@ with `unlinkat(AT_REMOVEDIR)` once empty. Read-only folders (`chmod -w`, a Go mo
 unlocked with `fchmod` on the open descriptor, to a fixed 0700 — never by path, never to a mode
 derived from the agent's; one that cannot even be opened gets a single
 `fchmodat(AT_SYMLINK_NOFOLLOW)` from its parent, which Linux refuses, failing closed. The walk is
-bounded: 128 levels (each holds one open descriptor, well under macOS's default limit of 256)
+bounded: 128 levels (one open descriptor per level, about 131 at most with the top, the parent
+and the listing — and only one walk at a time — inside macOS's default soft limit of 256)
 and 200,000 entries for a removal; past either it fails closed — the folder is left and the
 delete reports that it could not be removed. The entry budget bounds the work, not just the
 result: a folder is read only up to what the walk has left to spend, plus one, so a folder of
@@ -1394,7 +1421,7 @@ the routes recognise a stored name.
   Linux an agent that runs `chmod 000` on its uploads folder (or any folder inside it) makes
   that folder undeletable by the portal: deleting the agent fails closed with a warning, the
   agent's record and the private copies are gone, and the files in that folder remain on
-  disk. This is accepted for now. Possible follow-ups: open the folder with `O_PATH` and change
+  disk. The same holds for a worktree the forced-delete fallback has to remove. This is accepted for now. Possible follow-ups: open the folder with `O_PATH` and change
   its mode through `/proc/self/fd/<n>`, which never follows a link; and retry failed wipes at
   startup.
 - `~/.claude-web` itself keeps whatever mode it was created with; only `uploads/`, `blobs/`
@@ -1402,6 +1429,10 @@ the routes recognise a stored name.
 - There is no total disk quota: `upload_max_mb` caps one file, not an agent or the machine.
 - The read rule was verified on CLI 2.1.286, not the pinned 2.1.241; re-check it whenever the
   pin moves.
+- A tree deeper than 128 folders, bigger than its entry budget, or with something mounted inside
+  it is left on disk (fails closed) and named in the notice; nothing retries it later.
+- The mount rule is tested by telling the walker its tree is on another device, not with a real
+  mount, which a test cannot make without privileges.
 
 ---
 

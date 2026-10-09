@@ -762,13 +762,29 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
         // The checkout may already be gone; drop the registration either way,
         // but keep git's own words on why it refused.
         let original = format!("{err:#}");
-        // The checkout directory may already be gone — that is not a failure,
-        // and it must not stop us pruning the stale registration git is still
-        // holding.
-        std::fs::remove_dir_all(path).ok();
-        git(repo, &["worktree", "prune"])
-            .with_context(|| format!("git refused to remove the worktree ({original}), and"))?;
-        return Ok(());
+        // The agent wrote this tree, so it goes through the hardened walker:
+        // `remove_dir_all` recurses, and a tree deep enough to make git give
+        // up ("File name too long") would overflow it and abort the server.
+        // A checkout already gone is not a failure. Whatever happens, the
+        // stale registration is pruned — and anything left behind is named.
+        let removed = crate::tree::remove_tree(path, crate::tree::CHECKOUT_MAX_ENTRIES);
+        let pruned = git(repo, &["worktree", "prune"]);
+        return match (removed, pruned) {
+            (Ok(()), Ok(_)) => Ok(()),
+            (Ok(()), Err(err)) => Err(err)
+                .with_context(|| format!("git refused to remove the worktree ({original}), and")),
+            (Err(left), pruned) => {
+                let prune_note = match pruned {
+                    Ok(_) => String::new(),
+                    Err(err) => format!("; pruning its registration also failed: {err:#}"),
+                };
+                Err(anyhow::anyhow!(
+                    "git refused to remove the worktree ({original}), and the files at {} were \
+                     left in place: {left:#}{prune_note}",
+                    path.display()
+                ))
+            }
+        };
     }
     result
         .map(|_| ())
@@ -1105,6 +1121,47 @@ mod tests {
 
         remove_worktree(&repo.path, &wt, false).expect("remove worktree");
         assert!(!wt.exists());
+    }
+
+    /// git gives up on a tree the agent made too deep or locked, and the
+    /// forced delete falls back to removing it itself. That fallback must not
+    /// crash the server — `remove_dir_all` recursed, and overflowed on a deep
+    /// enough tree — must say what it left, and must still prune.
+    #[test]
+    fn a_forced_removal_of_a_worktree_too_deep_to_walk_fails_closed_and_prunes() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(repo) = init_repo() else { return };
+        let root = repo
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let wt = worktree_path(&root, "repo", "deep");
+        add_worktree(&repo.path, &wt, "sw_deep", Some("main")).expect("add worktree");
+        // A second worktree whose folder has vanished: only a prune drops its
+        // registration, so seeing it gone proves the prune ran.
+        let stale = worktree_path(&root, "repo", "stale");
+        add_worktree(&repo.path, &stale, "sw_stale", Some("main")).expect("add worktree");
+        std::fs::remove_dir_all(&stale).expect("remove stale checkout");
+
+        // Deeper than the walk goes, behind a folder git cannot get into.
+        let locked = wt.join("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        crate::tree::testing::deep_tree(&locked, crate::tree::WALK_MAX_DEPTH + 20);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let err = remove_worktree(&repo.path, &wt, true).expect_err("left in place");
+        let text = format!("{err:#}");
+        assert!(text.contains("were left in place"), "{text}");
+        assert!(
+            text.contains(&wt.display().to_string()),
+            "the leftover is named: {text}"
+        );
+        let listed = git(&repo.path, &["worktree", "list", "--porcelain"]).expect("list");
+        assert!(!listed.contains("stale"), "the prune still ran: {listed}");
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+        crate::tree::testing::flatten_away(&locked);
     }
 
     #[test]

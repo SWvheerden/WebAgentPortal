@@ -10,6 +10,7 @@ mod config;
 mod db;
 mod remote;
 mod repo;
+mod tree;
 mod uploads;
 mod web;
 

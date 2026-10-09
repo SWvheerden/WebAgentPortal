@@ -733,6 +733,7 @@ impl Supervisor {
             .map(|d| crate::config::expand_tilde(d))
             .collect();
         let roots_for_check = roots.clone();
+        let state_for_check = self.files_root.clone();
         let (repo_path, add_dirs, target) = tokio::task::spawn_blocking(move || -> Result<_> {
             let repo = crate::config::confine_to_roots(&requested, &roots_for_check)
                 .context("the repository")?;
@@ -747,14 +748,13 @@ impl Supervisor {
             } else {
                 SpawnTarget::Repo
             };
+            crate::config::refuse_overlap("the repository", &repo, &state_for_check)?;
             let mut dirs = Vec::with_capacity(extra.len());
             for dir in extra {
-                dirs.push(
-                    crate::config::confine_to_roots(&dir, &roots_for_check)
-                        .with_context(|| format!("extra directory {}", dir.display()))?
-                        .to_string_lossy()
-                        .to_string(),
-                );
+                let dir = crate::config::confine_to_roots(&dir, &roots_for_check)
+                    .with_context(|| format!("extra directory {}", dir.display()))?;
+                crate::config::refuse_overlap("extra directory", &dir, &state_for_check)?;
+                dirs.push(dir.to_string_lossy().to_string());
             }
             Ok((repo, dirs, target))
         })
@@ -903,6 +903,29 @@ impl Supervisor {
         resume: bool,
         first: Option<String>,
     ) -> Result<()> {
+        // An agent made before this check, or a root edited since, may name a
+        // folder overlapping the portal's state folder: it is refused here, on
+        // every launch and resume, rather than run.
+        let state = self.files_root.clone();
+        let mut paths = vec![
+            ("its repository", record.repo_path.clone()),
+            ("its working directory", record.work_path.clone()),
+        ];
+        paths.extend(
+            record
+                .add_dirs
+                .iter()
+                .map(|d| ("an extra directory", d.clone())),
+        );
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            for (what, path) in paths {
+                crate::config::refuse_overlap(what, Path::new(&path), &state)?;
+            }
+            Ok(())
+        })
+        .await
+        .context("path check panicked")??;
+
         let cfg = self.config().await;
         let work_path = PathBuf::from(&record.work_path);
         // The agent reads its attachments from its upload folder. It is not
@@ -5474,5 +5497,60 @@ mod tests {
         for locked in [partial.join("0-locked"), unknown.join("locked")] {
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).ok();
         }
+    }
+
+    /// No agent works in, above or inside the portal's own state folder:
+    /// refused at spawn for the repository and for extra directories, and on
+    /// every resume for an agent made before the check.
+    #[tokio::test]
+    async fn the_state_folder_is_off_limits_to_agents() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = root.path().join("state");
+        let inside = state.join("inside");
+        let repo = root.path().join("repo");
+        for dir in [&inside, &repo] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        let cfg = Config {
+            repo_roots: vec![root.path().to_string_lossy().to_string()],
+            claude_bin: "claude-web-no-such-binary".to_string(),
+            ..Config::default()
+        };
+        let db = Db::open_in_memory().expect("db");
+        let sup = Supervisor::with_files_root(db, Arc::new(RwLock::new(cfg)), state.clone());
+
+        // The root itself contains the state folder.
+        let err = sup
+            .spawn_agent(spawn_req(root.path()))
+            .await
+            .expect_err("a repository containing it");
+        assert!(format!("{err:#}").contains("own state folder"), "{err:#}");
+        // An extra directory inside it.
+        let mut req = spawn_req(&repo);
+        req.no_branch = true;
+        req.add_dirs = vec![inside.to_string_lossy().to_string()];
+        let err = sup
+            .spawn_agent(req)
+            .await
+            .expect_err("an extra directory inside it");
+        assert!(format!("{err:#}").contains("own state folder"), "{err:#}");
+        let agents = sup.db().run(|db| db.list_agents()).await.expect("list");
+        assert!(
+            agents.is_empty(),
+            "nothing was recorded for a refused spawn"
+        );
+
+        // An agent from before the check is refused on resume, not run.
+        let mut old = agent_record("old", &inside);
+        old.add_dirs = vec![repo.to_string_lossy().to_string()];
+        sup.db().insert_agent(&old).expect("insert");
+        let err = sup.resume("old").await.expect_err("refused");
+        assert!(format!("{err:#}").contains("own state folder"), "{err:#}");
+        assert!(!sup.is_running("old").await);
+        let mut extra = agent_record("extra", &repo);
+        extra.add_dirs = vec![state.to_string_lossy().to_string()];
+        sup.db().insert_agent(&extra).expect("insert");
+        let err = sup.resume("extra").await.expect_err("refused");
+        assert!(format!("{err:#}").contains("an extra directory"), "{err:#}");
     }
 }

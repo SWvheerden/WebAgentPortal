@@ -159,12 +159,30 @@ pub async fn clone(
 
     let status = child.wait().await.context("waiting for git clone")?;
     if !status.success() {
-        // Do not leave a half-written directory behind.
-        tokio::fs::remove_dir_all(&dest).await.ok();
+        // Do not leave a half-written directory behind. Its contents came
+        // from the remote, so it goes through the hardened walker rather than
+        // `remove_dir_all`, which a deep enough tree would overflow; if that
+        // fails closed, the leftover is named in the error.
+        let leftover_dest = dest.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            crate::tree::remove_tree(&leftover_dest, crate::tree::CHECKOUT_MAX_ENTRIES)
+        })
+        .await;
+        let leftover = match cleanup {
+            Ok(Ok(())) => String::new(),
+            Ok(Err(err)) => format!(
+                "\n\nThe partial clone at {} was left: {err:#}",
+                dest.display()
+            ),
+            Err(err) => format!(
+                "\n\nThe partial clone at {} was left: {err}",
+                dest.display()
+            ),
+        };
         let hint = hint_for_failure(&collected)
             .map(|h| format!("\n\n{h}"))
             .unwrap_or_default();
-        bail!("git clone failed: {}{hint}", collected.trim());
+        bail!("git clone failed: {}{hint}{leftover}", collected.trim());
     }
 
     Ok(CloneOutcome {
