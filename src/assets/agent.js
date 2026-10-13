@@ -18,6 +18,11 @@ const state = {
   /// did not: a request that landed between the load and the subscribe, or
   /// while the socket was down, came in no `permission_request`.
   pendingSeeded: false,
+  /// Prompts answered from this page whose `permission_resolved` has not come
+  /// back yet, request id → when the answer was sent. The card goes at once;
+  /// this is what tells the gap before the server's status catches up apart
+  /// from a prompt the page never received.
+  answered: new Map(),
   partial: null,
   queued: [],
   acIndex: 0,
@@ -531,19 +536,40 @@ function fromLine(request) {
 }
 
 /// The line under an empty queue. It only says "Nothing waiting" when the
-/// header agrees: a header that says the agent is awaiting approval with no
-/// prompt here means this page missed it, so it says that and fetches the
-/// queue again rather than contradicting the header.
+/// header agrees. A header still saying the agent is awaiting approval is
+/// either the gap between an answer sent from here and the server's status
+/// catching up — said as such — or this page having missed a prompt, which
+/// `checkApprovalMismatch` goes and fetches.
 function renderWaitingNote() {
   const note = $('approvals-empty');
   const awaiting = !!state.agent && state.agent.status === 'awaiting_approval';
-  if (awaiting && state.pending.size === 0) {
-    note.textContent = 'The agent is waiting on an approval this page has not received yet — fetching it…';
-    refetchPending();
-  } else {
+  if (!awaiting || state.pending.size > 0) {
     note.textContent = 'Nothing waiting.';
+  } else if (answeredRecently()) {
+    note.textContent = 'Answer sent — waiting for the agent to take it.';
+  } else {
+    note.textContent = 'The agent is waiting on an approval this page has not received yet — fetching it…';
   }
 }
+
+/// How long an answer sent from this page is assumed to be on its way. Its
+/// `permission_resolved` normally lands well inside this; a refused one never
+/// lands at all, and must not hold the check off for good.
+const ANSWER_IN_FLIGHT_MS = 10000;
+
+/// Whether an answer sent from this page is still waiting for the server to
+/// confirm it.
+function answeredRecently() {
+  const now = Date.now();
+  for (const [id, sentAt] of state.answered) {
+    if (now - sentAt > ANSWER_IN_FLIGHT_MS) state.answered.delete(id);
+  }
+  return state.answered.size > 0;
+}
+
+/// Live news about the queue or the status. A queue fetched while any arrived
+/// is older than what the page already shows, and is dropped.
+let approvalNews = 0;
 
 /// One re-read of the queue at a time, and not more than one every few
 /// seconds: a status arrives per tool call, and a disagreement the server
@@ -551,17 +577,45 @@ function renderWaitingNote() {
 let refetchingPending = false;
 let lastPendingRefetch = 0;
 const PENDING_REFETCH_GAP_MS = 5000;
+let mismatchRetry = null;
 
-/// Fetch the pending prompts afresh, for when the header and the queue
-/// disagree (a live update lost while the browser fell behind, say). The
-/// answer replaces the queue, as a replay's does.
+/// Called once the server's own status has spoken: if it says the agent is
+/// awaiting approval and this page holds no prompt — and no answer from here
+/// is still on its way, which would explain it — the page missed one (a live
+/// update lost while the browser fell behind, say), so fetch the queue.
+function checkApprovalMismatch() {
+  if (!state.agent || state.agent.status !== 'awaiting_approval') return;
+  if (state.pending.size > 0 || answeredRecently()) return;
+  refetchPending();
+}
+
+/// Fetch the pending prompts afresh. The answer replaces the queue, as a
+/// replay's does, unless live news arrived while it was in flight.
 async function refetchPending() {
   if (refetchingPending || !state.agent) return;
-  if (Date.now() - lastPendingRefetch < PENDING_REFETCH_GAP_MS) return;
+  const wait = PENDING_REFETCH_GAP_MS - (Date.now() - lastPendingRefetch);
+  if (wait > 0) {
+    // Too soon after the last one: look again once the gap is up, rather
+    // than leave the mismatch standing until the next status.
+    if (!mismatchRetry) {
+      mismatchRetry = setTimeout(() => {
+        mismatchRetry = null;
+        checkApprovalMismatch();
+      }, wait);
+    }
+    return;
+  }
   refetchingPending = true;
   lastPendingRefetch = Date.now();
+  const seen = approvalNews;
+  let discarded = false;
   try {
     const fresh = (await api(`/api/agents/${state.agent.id}`)).agent;
+    if (approvalNews !== seen) {
+      // Something live landed meanwhile and is newer than this answer.
+      discarded = true;
+      return;
+    }
     const previous = state.pending;
     state.pending = new Map((fresh.pending_permissions || []).map((r) => [r.request_id, r]));
     for (const id of newKeys(previous, state.pending.keys())) announceAttention(state.agent.id, id);
@@ -583,6 +637,8 @@ async function refetchPending() {
   } finally {
     refetchingPending = false;
   }
+  // Look again — after the gap — in case the mismatch outlived that news.
+  if (discarded) checkApprovalMismatch();
 }
 
 // -- subagents --------------------------------------------------------------
@@ -645,6 +701,7 @@ function decide(requestId, behavior, updatedInput) {
     updated_input: updatedInput || null,
   });
   state.pending.delete(requestId);
+  state.answered.set(requestId, Date.now());
   renderApprovals();
   return Promise.resolve();
 }
@@ -1343,6 +1400,7 @@ async function main() {
   renderHeader();
   renderSpawnWarning();
   renderApprovals();
+  checkApprovalMismatch();
 
   $('btn-interrupt').onclick = () => socket.send({ type: 'interrupt', agent_id: state.agent.id });
   $('btn-stop').onclick = () => api(`/api/agents/${state.agent.id}/stop`, { method: 'POST', body: '{}' }).catch((e) => toast(e.message, 'error'));
@@ -1447,6 +1505,7 @@ async function main() {
       subagents: fresh.subagents || [],
     });
     renderHeader();
+    checkApprovalMismatch();
   };
   socket.onopen = () => {
     subscribe();
@@ -1460,6 +1519,7 @@ async function main() {
       if (msg.agent_id !== state.agent.id) return;
       state.transcript.seed(msg.after);
       appendEvents(msg.events);
+      approvalNews += 1;
       const previous = state.pending;
       state.pending = new Map((msg.pending_permissions || []).map((r) => [r.request_id, r]));
       renderApprovals();
@@ -1495,6 +1555,7 @@ async function main() {
     .on('status', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
       liveStatuses += 1;
+      approvalNews += 1;
       trackStatus(msg.agent_id, state.agent.status, msg.status);
       Object.assign(state.agent, {
         status: msg.status,
@@ -1504,9 +1565,11 @@ async function main() {
         subagents: msg.subagents || [],
       });
       renderHeader();
+      checkApprovalMismatch();
     })
     .on('permission_request', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
+      approvalNews += 1;
       const fresh = !state.pending.has(msg.request.request_id);
       state.pending.set(msg.request.request_id, msg.request);
       renderApprovals();
@@ -1514,7 +1577,9 @@ async function main() {
     })
     .on('permission_resolved', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
+      approvalNews += 1;
       state.pending.delete(msg.request_id);
+      state.answered.delete(msg.request_id);
       releaseAttention(msg.agent_id, msg.request_id);
       renderApprovals();
     })

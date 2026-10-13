@@ -228,7 +228,10 @@ where it already was is not published.
 status through `Status::with_approvals` against the prompts it holds, so the header can
 never disagree with the "Waiting on you" queue: answering the first of two prompts keeps
 the agent awaiting the second, a turn that ends under a subagent's prompt does not read
-as `Idle`, and a prompt the CLI withdraws stops being waited on. The CLI withdraws one
+as `Idle`, and a prompt the CLI withdraws stops being waited on. The transitions drive a
+base status that is never `AwaitingApproval`, so clearing the last prompt returns to what
+lies beneath it — `Idle` after a turn that ended under the prompt, `RateLimited` after a
+limit. The CLI withdraws one
 with `control_cancel_request` when its tool call is aborted or something else (a hook,
 the auto-mode classifier, a Remote Control client) answers first; the runner records
 that as a `withdrawn` decision and tells every page to drop the card. A prompt raised
@@ -238,6 +241,8 @@ says whose it is.
 The agent page's rail also lists **every subagent the running process has started** —
 synchronous and backgrounded, finished ones kept with how they ended (bounded at 32) —
 with what each is doing. The dispatcher builds the list from the task lifecycle lines;
+a synchronous subagent, which has no completion line, ends with its `Agent` tool result,
+and any still running when the turn ends is closed then;
 it rides every live `status` message as `subagents` and the agent data as the same
 field, so a reload mid-run shows it. It goes with the process.
 

@@ -1039,6 +1039,7 @@ impl Supervisor {
             cmd_rx,
             cmd_closed: false,
             status: Status::Starting,
+            base_status: Status::Starting,
             status_detail: None,
             cost_usd: record.cost_usd,
             pending: HashMap::new(),
@@ -1904,7 +1905,14 @@ struct Runner {
     /// returns `None` immediately and forever, so it must stop being polled or
     /// the select loop spins.
     cmd_closed: bool,
+    /// The status as published: [`Runner::base_status`] corrected by whether
+    /// a prompt is outstanding.
     status: Status,
+    /// The status the transitions alone have produced, never
+    /// `AwaitingApproval`. Kept apart so that clearing the last prompt returns
+    /// to what lies beneath it — `Idle` after a turn that ended under the
+    /// prompt, `RateLimited` after a limit — rather than to a guess.
+    base_status: Status,
     /// The live sub-label naming the current tool (§4). Held here so an
     /// unrelated status transition does not wipe it.
     status_detail: Option<String>,
@@ -2043,13 +2051,23 @@ impl Runner {
     }
 
     async fn set_status(&mut self, transition: Transition) {
-        let Some(next) = self.status.apply(transition) else {
-            tracing::debug!(agent = %self.id, ?transition, status = %self.status, "ignored transition");
+        let Some(applied) = self.base_status.apply(transition) else {
+            tracing::debug!(agent = %self.id, ?transition, status = %self.base_status, "ignored transition");
             return;
         };
-        // Whatever the transition says, a prompt still outstanding means the
+        // The approval transitions say nothing about the status underneath:
+        // whether a prompt is out is the pending map's to say, below. Applied
+        // to the base they would leave it at `AwaitingApproval`, and clearing
+        // the last prompt could then only guess at what lies beneath.
+        if !matches!(
+            transition,
+            Transition::PermissionRequested | Transition::PermissionResolved
+        ) {
+            self.base_status = applied;
+        }
+        // Whatever the transitions say, a prompt still outstanding means the
         // agent is awaiting approval and none means it is not (§5).
-        let next = next.with_approvals(!self.pending.is_empty());
+        let next = self.base_status.with_approvals(!self.pending.is_empty());
         if transition == Transition::Spawned {
             self.status_detail = None;
             self.status = next;
@@ -2091,7 +2109,7 @@ impl Runner {
     /// pending map changed by some route other than a transition — a prompt
     /// arriving, answered or withdrawn.
     async fn sync_approvals(&mut self) {
-        let next = self.status.with_approvals(!self.pending.is_empty());
+        let next = self.base_status.with_approvals(!self.pending.is_empty());
         if next == self.status {
             return;
         }
@@ -2642,7 +2660,8 @@ impl Runner {
         } else {
             (Transition::Errored, Status::Failed)
         };
-        let status = self.status.apply(transition).unwrap_or(fallback);
+        let status = self.base_status.apply(transition).unwrap_or(fallback);
+        self.base_status = status;
         self.status = status;
         let code = info.code.map(i64::from);
         let stderr = self.last_stderr.clone();
@@ -2857,6 +2876,7 @@ mod tests {
                 cmd_rx,
                 cmd_closed: false,
                 status: Status::Starting,
+                base_status: Status::Starting,
                 status_detail: None,
                 cost_usd: 0.0,
                 pending: HashMap::new(),
@@ -4268,7 +4288,37 @@ mod tests {
         );
         assert_eq!(status, Status::AwaitingApproval);
 
+        // Once it is answered the agent is back where the turn left it: idle,
+        // not working on a turn that is already over.
         answer(&harness, "p1");
+        assert_eq!(harness.next_status().await.0, Status::Idle);
+        harness.finish().await;
+    }
+
+    /// The same for a limit that lands under an open prompt: the withdrawn
+    /// prompt uncovers the limit, not a turn that is still going.
+    #[tokio::test]
+    async fn a_limit_under_an_open_prompt_is_what_is_left_when_it_clears() {
+        let mut harness = Harness::start();
+        working(&mut harness).await;
+        ask(&harness, prompt("p1", None));
+        assert_eq!(harness.next_status().await.0, Status::AwaitingApproval);
+
+        harness.action(Action::Transition(Transition::LimitReached));
+        harness.action(Action::StatusDetail(Some("marker".to_string())));
+        let (status, detail) = harness.next_status().await;
+        assert_eq!(
+            detail.as_deref(),
+            Some("marker"),
+            "no status came before the marker"
+        );
+        assert_eq!(status, Status::AwaitingApproval);
+
+        harness.action(Action::CancelPermission("p1".to_string()));
+        assert_eq!(harness.next_status().await.0, Status::RateLimited);
+
+        // The next turn is still what clears the limit.
+        harness.action(Action::Transition(Transition::TurnStarted));
         assert_eq!(harness.next_status().await.0, Status::Working);
         harness.finish().await;
     }

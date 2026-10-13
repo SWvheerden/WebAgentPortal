@@ -96,12 +96,12 @@ impl Status {
     /// turn ending under a subagent's prompt would read as `Idle`, and a prompt
     /// the CLI withdrew would leave the agent awaiting nothing. So the status a
     /// running agent reports is passed through this, against the prompts it
-    /// actually holds. `Starting` and the terminal states have no prompts to
-    /// answer and are left alone.
+    /// actually holds. The terminal states have no process to answer and are
+    /// left alone.
     pub fn with_approvals(self, any_pending: bool) -> Status {
         use Status::*;
         match (self, any_pending) {
-            (Idle | Working | RateLimited, true) => AwaitingApproval,
+            (Starting | Idle | Working | RateLimited, true) => AwaitingApproval,
             (AwaitingApproval, false) => Working,
             (s, _) => s,
         }
@@ -337,7 +337,12 @@ mod tests {
     #[test]
     fn awaiting_approval_is_exactly_a_prompt_being_outstanding() {
         // Something is waiting: every resting or working state says so.
-        for s in [Status::Idle, Status::Working, Status::RateLimited] {
+        for s in [
+            Status::Starting,
+            Status::Idle,
+            Status::Working,
+            Status::RateLimited,
+        ] {
             assert_eq!(s.with_approvals(true), Status::AwaitingApproval, "{s}");
             assert_eq!(s.with_approvals(false), s, "{s}");
         }
@@ -350,8 +355,8 @@ mod tests {
             Status::AwaitingApproval.with_approvals(true),
             Status::AwaitingApproval
         );
-        // No prompt can be answered before the handshake or after the end.
-        for s in [Status::Starting, Status::Stopped, Status::Failed] {
+        // No prompt can be answered once the process is gone.
+        for s in [Status::Stopped, Status::Failed] {
             assert_eq!(s.with_approvals(true), s, "{s}");
             assert_eq!(s.with_approvals(false), s, "{s}");
         }

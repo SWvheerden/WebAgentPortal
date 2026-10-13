@@ -138,6 +138,10 @@ pub struct Dispatcher {
     /// this is for showing, not for deciding when a turn is over: it holds
     /// synchronous subagents too, and a subagent stays in it after it reports.
     subagents: Vec<Subagent>,
+    /// The listed subagents known to be backgrounded. The `Agent` tool result
+    /// of one of these only says it was launched; a synchronous subagent's
+    /// says it is done, and is the only completion line it gets.
+    backgrounded_subagents: HashSet<String>,
 }
 
 /// How many subagents to list before the oldest finished one is dropped.
@@ -215,6 +219,9 @@ impl Dispatcher {
                 };
                 if !is_subagent_task(sys) {
                     return false;
+                }
+                if sys.is_backgrounded == Some(true) {
+                    self.backgrounded_subagents.insert(id.clone());
                 }
                 let mut known = false;
                 for agent in self.subagents.iter_mut() {
@@ -298,9 +305,46 @@ impl Dispatcher {
                 .iter()
                 .position(|a| a.state != "running")
                 .unwrap_or(0);
-            self.subagents.remove(drop_at);
+            let dropped = self.subagents.remove(drop_at);
+            self.backgrounded_subagents.remove(&dropped.task_id);
         }
         self.subagents != before
+    }
+
+    /// The `Agent` tool call `tool_use_id` returned. For a synchronous
+    /// subagent that is its end — it has no completion line of its own — so it
+    /// is marked done, or failed if the result was an error. A backgrounded
+    /// one's result arrives as it starts and is left alone. Returns whether the
+    /// list changed.
+    fn close_synchronous_subagent(&mut self, tool_use_id: &str, is_error: bool) -> bool {
+        let mut changed = false;
+        for agent in self.subagents.iter_mut() {
+            if agent.tool_use_id.as_deref() != Some(tool_use_id) || agent.state != "running" {
+                continue;
+            }
+            if self.backgrounded_subagents.contains(&agent.task_id)
+                || self.background_tasks.contains_key(&agent.task_id)
+            {
+                continue;
+            }
+            agent.state = if is_error { "failed" } else { "completed" }.to_string();
+            changed = true;
+        }
+        changed
+    }
+
+    /// The turn is over. A synchronous subagent cannot outlive it — the parent
+    /// sat inside its tool call — so one still listed as running missed its
+    /// result and is closed here. Backgrounded ones still running carry on.
+    fn close_subagents_at_turn_end(&mut self) -> bool {
+        let mut changed = false;
+        for agent in self.subagents.iter_mut() {
+            if agent.state == "running" && !self.background_tasks.contains_key(&agent.task_id) {
+                agent.state = "completed".to_string();
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// A subagent ran a tool: that is what it is doing now.
@@ -556,6 +600,22 @@ impl Dispatcher {
                     EventKind::User
                 };
                 out.push(Action::Persist { kind, payload: raw });
+                let mut subagents_changed = false;
+                for block in msg.blocks() {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                        continue;
+                    }
+                    let Some(id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
+                    if self.close_synchronous_subagent(id, is_error) {
+                        subagents_changed = true;
+                    }
+                }
+                if subagents_changed {
+                    out.push(Action::Subagents(self.subagents.clone()));
+                }
             }
             CliEvent::Result(res) => {
                 out.push(Action::Persist {
@@ -576,6 +636,9 @@ impl Dispatcher {
                 }
                 self.tool_labels.clear();
                 self.turn_open = false;
+                if self.close_subagents_at_turn_end() {
+                    out.push(Action::Subagents(self.subagents.clone()));
+                }
                 // Out of tokens is not a finished turn, and `idle` — which
                 // claims the agent is waiting on the operator — is the one
                 // thing it is not: there is nothing they can type that will
@@ -2291,6 +2354,66 @@ mod tests {
         ))
         .expect("a list");
         assert_eq!(done[0].state, "completed");
+    }
+
+    const SYNC_STARTED: &str = r#"{"type":"system","subtype":"task_started","task_id":"c930","tool_use_id":"toolu_sync","description":"Inline work","subagent_type":"general-purpose","is_backgrounded":false,"session_id":"s1"}"#;
+
+    /// A synchronous subagent has no completion line: the `Agent` tool result
+    /// handed back to the parent is its end.
+    #[test]
+    fn a_synchronous_subagent_ends_with_its_tool_result() {
+        let mut d = Dispatcher::new();
+        d.on_stdout(SYNC_STARTED);
+        let done = last_list(&d.on_stdout(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sync","content":"found it"}]}}"#,
+        ))
+        .expect("a list");
+        assert_eq!(done[0].state, "completed");
+
+        let mut d = Dispatcher::new();
+        d.on_stdout(SYNC_STARTED);
+        let failed = last_list(&d.on_stdout(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sync","is_error":true,"content":"it died"}]}}"#,
+        ))
+        .expect("a list");
+        assert_eq!(failed[0].state, "failed");
+    }
+
+    /// A backgrounded subagent's tool result arrives as it starts and only
+    /// says it was launched: it must not close it.
+    #[test]
+    fn a_backgrounded_subagents_launch_result_does_not_end_it() {
+        let mut d = Dispatcher::new();
+        for line in [AGENT_TOOL_USE, TASK_STARTED] {
+            d.on_stdout(line);
+        }
+        let launched = d.on_stdout(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01JX","content":"Async agent launched successfully"}]}}"#,
+        );
+        assert_eq!(last_list(&launched), None, "{launched:?}");
+
+        // Nor does the end of the turn that launched it.
+        let over = d.on_stdout(TURN_OVER);
+        assert_eq!(last_list(&over), None, "{over:?}");
+    }
+
+    /// The backstop: a synchronous subagent whose result never matched is
+    /// closed when the turn ends, since it cannot outlive its parent's turn.
+    #[test]
+    fn a_turn_end_closes_a_synchronous_subagent_that_missed_its_result() {
+        let mut d = Dispatcher::new();
+        for line in [AGENT_TOOL_USE, TASK_STARTED, SYNC_STARTED] {
+            d.on_stdout(line);
+        }
+        let list = last_list(&d.on_stdout(TURN_OVER)).expect("a list");
+        let state = |id: &str| {
+            list.iter()
+                .find(|a| a.task_id == id)
+                .map(|a| a.state.clone())
+                .expect("listed")
+        };
+        assert_eq!(state("c930"), "completed");
+        assert_eq!(state("a618"), "running", "the backgrounded one carries on");
     }
 
     /// A backgrounded subagent that drops off the complete live list has
