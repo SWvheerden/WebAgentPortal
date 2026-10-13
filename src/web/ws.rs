@@ -322,6 +322,7 @@ mod tests {
             exit_code: None,
             last_stderr: None,
             cost_usd: 0.0,
+            subagents: Vec::new(),
         }
     }
 

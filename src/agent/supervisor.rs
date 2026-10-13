@@ -25,7 +25,8 @@ use crate::uploads::{self, Attachment};
 
 use super::process::{self, Action, ChildHandle, ExitInfo, ProcessMsg, SpawnConfig, Sweep};
 use super::protocol::{
-    self, EventKind, LaunchArgs, PermissionDecision, PermissionRequest, RateLimitInfo, SlashCommand,
+    self, EventKind, LaunchArgs, PermissionDecision, PermissionRequest, RateLimitInfo,
+    SlashCommand, Subagent,
 };
 use super::resume;
 use super::state::{PermissionMode, Status, Transition};
@@ -52,6 +53,10 @@ pub enum ServerMsg {
         exit_code: Option<i64>,
         last_stderr: Option<String>,
         cost_usd: f64,
+        /// Every subagent the running process has started, the finished ones
+        /// included. Empty once the process is gone: its subagents went with it.
+        #[serde(default)]
+        subagents: Vec<Subagent>,
     },
     PermissionRequest {
         agent_id: String,
@@ -170,6 +175,9 @@ pub struct AgentView {
     pub resumable: bool,
     pub pending_permissions: Vec<PermissionRequest>,
     pub commands: Vec<SlashCommand>,
+    /// The same list the live `status` message carries, so a page loaded
+    /// mid-run starts from where the run is.
+    pub subagents: Vec<Subagent>,
 }
 
 /// What a delete would destroy, when it is refused.
@@ -202,6 +210,8 @@ enum AgentCommand {
 struct RunnerHandle {
     tx: mpsc::UnboundedSender<AgentCommand>,
     commands: Arc<RwLock<Vec<SlashCommand>>>,
+    /// The runner's subagent list, shared so a view can read it.
+    subagents: Arc<RwLock<Vec<Subagent>>>,
     /// Which launch this handle belongs to. A runner only ever deregisters its
     /// own generation, so a stale task cannot evict a live one.
     generation: u64,
@@ -682,9 +692,13 @@ impl Supervisor {
     pub async fn view(&self, record: AgentRecord) -> Result<AgentView> {
         let id = record.id.clone();
         let runners = self.runners.read().await;
-        let (running, commands) = match runners.get(&id) {
-            Some(handle) => (true, handle.commands.read().await.clone()),
-            None => (false, Vec::new()),
+        let (running, commands, subagents) = match runners.get(&id) {
+            Some(handle) => (
+                true,
+                handle.commands.read().await.clone(),
+                handle.subagents.read().await.clone(),
+            ),
+            None => (false, Vec::new(), Vec::new()),
         };
         drop(runners);
         // A dead process cannot be answered: its request ids died with it, so a
@@ -705,6 +719,7 @@ impl Supervisor {
             record,
             pending_permissions: pending,
             commands,
+            subagents,
         })
     }
 
@@ -944,6 +959,7 @@ impl Supervisor {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let commands = Arc::new(RwLock::new(Vec::new()));
+        let subagents = Arc::new(RwLock::new(Vec::new()));
 
         // Claim the registry slot before anything else happens. Checking
         // `is_running` and inserting separately would let two concurrent
@@ -960,6 +976,7 @@ impl Supervisor {
                 RunnerHandle {
                     tx: cmd_tx,
                     commands: commands.clone(),
+                    subagents: subagents.clone(),
                     generation,
                 },
             );
@@ -1004,6 +1021,7 @@ impl Supervisor {
                     exit_code: None,
                     last_stderr: Some(text),
                     cost_usd: record.cost_usd,
+                    subagents: Vec::new(),
                 });
                 return Err(err);
             }
@@ -1028,6 +1046,7 @@ impl Supervisor {
             outstanding: HashSet::new(),
             init_request_id: None,
             commands,
+            subagents,
             stop_requested: false,
             last_stderr: None,
             sweep: Arc::new(RwLock::new(Sweep::default())),
@@ -1899,6 +1918,9 @@ struct Runner {
     /// answered. Answering it is what moves the agent out of `Starting`.
     init_request_id: Option<String>,
     commands: Arc<RwLock<Vec<SlashCommand>>>,
+    /// The subagent list, as last reported by the dispatcher. Shared with the
+    /// [`RunnerHandle`] so a page loaded mid-run gets it too.
+    subagents: Arc<RwLock<Vec<Subagent>>>,
     stop_requested: bool,
     last_stderr: Option<String>,
     /// Process groups started by this agent's tool calls, accumulated as the
@@ -2025,6 +2047,9 @@ impl Runner {
             tracing::debug!(agent = %self.id, ?transition, status = %self.status, "ignored transition");
             return;
         };
+        // Whatever the transition says, a prompt still outstanding means the
+        // agent is awaiting approval and none means it is not (§5).
+        let next = next.with_approvals(!self.pending.is_empty());
         if transition == Transition::Spawned {
             self.status_detail = None;
             self.status = next;
@@ -2058,6 +2083,33 @@ impl Runner {
             exit_code: None,
             last_stderr: self.last_stderr.clone(),
             cost_usd: self.cost_usd,
+            subagents: self.subagents.read().await.clone(),
+        });
+    }
+
+    /// Bring the status back in line with the prompts actually held, after the
+    /// pending map changed by some route other than a transition — a prompt
+    /// arriving, answered or withdrawn.
+    async fn sync_approvals(&mut self) {
+        let next = self.status.with_approvals(!self.pending.is_empty());
+        if next == self.status {
+            return;
+        }
+        self.status = next;
+        self.publish_status().await;
+    }
+
+    /// Store the dispatcher's subagent list and tell every page.
+    async fn set_subagents(&mut self, subagents: Vec<Subagent>) {
+        *self.subagents.write().await = subagents;
+        self.emit(ServerMsg::Status {
+            agent_id: self.id.clone(),
+            status: self.status,
+            status_detail: self.status_detail.clone(),
+            exit_code: None,
+            last_stderr: self.last_stderr.clone(),
+            cost_usd: self.cost_usd,
+            subagents: self.subagents.read().await.clone(),
         });
     }
 
@@ -2088,6 +2140,7 @@ impl Runner {
             exit_code: None,
             last_stderr: stderr,
             cost_usd: self.cost_usd,
+            subagents: self.subagents.read().await.clone(),
         });
     }
 
@@ -2314,7 +2367,10 @@ impl Runner {
                     agent_id: self.id.clone(),
                     request: *request,
                 });
+                self.sync_approvals().await;
             }
+            Action::CancelPermission(request_id) => self.withdraw(&request_id).await,
+            Action::Subagents(subagents) => self.set_subagents(subagents).await,
             Action::ControlResponse {
                 request_id,
                 payload,
@@ -2526,6 +2582,34 @@ impl Runner {
         self.set_status(Transition::PermissionResolved).await;
     }
 
+    /// The CLI withdrew a prompt (`control_cancel_request`): its tool call was
+    /// aborted, or something else answered it first. Nobody can answer it
+    /// now, so it leaves the queue the way an answered one does — logged, and
+    /// announced to every page — and the status stops claiming the agent is
+    /// waiting on it.
+    async fn withdraw(&mut self, request_id: &str) {
+        // The CLI cancels its other control requests the same way; only a
+        // prompt we are holding is ours to close.
+        let Some(request) = self.pending.remove(request_id) else {
+            return;
+        };
+        self.persist(
+            EventKind::PermissionDecision,
+            json!({
+                "request_id": request_id,
+                "behavior": "withdrawn",
+                "tool_name": request.tool_name,
+            }),
+        )
+        .await;
+        self.emit(ServerMsg::PermissionResolved {
+            agent_id: self.id.clone(),
+            request_id: request_id.to_string(),
+            behavior: "withdrawn".to_string(),
+        });
+        self.sync_approvals().await;
+    }
+
     fn take_request_id(&mut self) -> String {
         let id = format!("req_{}", self.next_request_id);
         self.next_request_id += 1;
@@ -2567,6 +2651,9 @@ impl Runner {
             .map(|s| format!("terminated by signal {s}"))
             .or_else(|| info.code.map(|c| format!("exited with code {c}")));
         self.status_detail = detail.clone();
+
+        // Its subagents ran inside it and are gone with it.
+        self.subagents.write().await.clear();
 
         // Whatever this process was still asking permission for can never be
         // answered now: close it out so the next launch starts clean (§5).
@@ -2634,6 +2721,7 @@ impl Runner {
             exit_code: code,
             last_stderr: stderr,
             cost_usd: self.cost_usd,
+            subagents: Vec::new(),
         });
         // No auto-restart: an unexpected exit waits for a human (§4).
         if !requested {
@@ -2730,6 +2818,8 @@ mod tests {
         msgs: mpsc::UnboundedSender<ProcessMsg>,
         cmds: Option<mpsc::UnboundedSender<AgentCommand>>,
         events: Receiver<ServerMsg>,
+        /// The runner's subagent list, as a view would read it.
+        subagents: Arc<RwLock<Vec<Subagent>>>,
         stops: Arc<std::sync::atomic::AtomicUsize>,
         task: tokio::task::JoinHandle<()>,
         _stdin: mpsc::UnboundedReceiver<Value>,
@@ -2756,6 +2846,7 @@ mod tests {
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
             let sweep = Arc::new(RwLock::new(sweep));
+            let subagents = Arc::new(RwLock::new(Vec::new()));
             let runner = Runner {
                 id: record.id.clone(),
                 db: db.clone(),
@@ -2773,6 +2864,7 @@ mod tests {
                 outstanding: HashSet::new(),
                 init_request_id: None,
                 commands: Arc::new(RwLock::new(Vec::new())),
+                subagents: subagents.clone(),
                 stop_requested: false,
                 last_stderr: None,
                 sweep: sweep.clone(),
@@ -2790,6 +2882,7 @@ mod tests {
                 msgs: msg_tx,
                 cmds: Some(cmd_tx),
                 events,
+                subagents,
                 stops,
                 task: tokio::spawn(runner.run()),
                 _stdin: stdin,
@@ -2872,7 +2965,10 @@ mod tests {
         let (_, detail) = harness.next_status().await;
         assert_eq!(detail.as_deref(), Some("Bash: cargo test"));
 
-        // Asking for permission must not wipe the label naming the tool.
+        // Asking for permission must not wipe the label naming the tool. The
+        // prompt is queued first, as the dispatcher does: awaiting nothing is
+        // not awaiting approval.
+        harness.action(Action::Permission(Box::new(prompt("x", None))));
         harness.action(Action::Transition(Transition::PermissionRequested));
         let (status, detail) = harness.next_status().await;
         assert_eq!(status, Status::AwaitingApproval);
@@ -2908,6 +3004,7 @@ mod tests {
             display_name: None,
             description: None,
             tool_use_id: None,
+            agent_id: None,
             input: json!({"file_path": "/tmp/x"}),
             permission_suggestions: Value::Null,
         })));
@@ -3104,6 +3201,7 @@ mod tests {
             RunnerHandle {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
+                subagents: Arc::new(RwLock::new(Vec::new())),
                 generation: 1,
             },
         );
@@ -3636,6 +3734,7 @@ mod tests {
             RunnerHandle {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
+                subagents: Arc::new(RwLock::new(Vec::new())),
                 generation: 2,
             },
         );
@@ -3928,6 +4027,7 @@ mod tests {
             RunnerHandle {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
+                subagents: Arc::new(RwLock::new(Vec::new())),
                 generation: 7,
             },
         );
@@ -3965,6 +4065,7 @@ mod tests {
             display_name: None,
             description: None,
             tool_use_id: None,
+            agent_id: None,
             input: json!({"command": "cargo test"}),
             permission_suggestions: Value::Null,
         })));
@@ -4003,6 +4104,278 @@ mod tests {
         );
         assert_eq!(decision.payload["input_modified"], json!(true));
         assert_eq!(decision.payload["tool_name"], json!("Bash"));
+    }
+
+    // -- the status follows the prompts actually held ----------------------
+
+    fn prompt(request_id: &str, agent_id: Option<&str>) -> PermissionRequest {
+        PermissionRequest {
+            request_id: request_id.to_string(),
+            tool_name: "Bash".to_string(),
+            display_name: None,
+            description: None,
+            tool_use_id: None,
+            agent_id: agent_id.map(str::to_string),
+            input: json!({"command": "ls"}),
+            permission_suggestions: Value::Null,
+        }
+    }
+
+    /// Drive a harness to `Working`, the state a prompt normally lands in.
+    async fn working(harness: &mut Harness) {
+        harness.action(Action::Transition(Transition::Initialized));
+        assert_eq!(harness.next_status().await.0, Status::Idle);
+        harness.action(Action::Transition(Transition::TurnStarted));
+        assert_eq!(harness.next_status().await.0, Status::Working);
+    }
+
+    /// What the dispatcher sends for one `can_use_tool` line.
+    fn ask(harness: &Harness, request: PermissionRequest) {
+        harness.action(Action::Persist {
+            kind: EventKind::PermissionRequest,
+            payload: serde_json::to_value(&request).expect("json"),
+        });
+        harness.action(Action::Permission(Box::new(request)));
+        harness.action(Action::Transition(Transition::PermissionRequested));
+    }
+
+    fn answer(harness: &Harness, request_id: &str) {
+        harness
+            .cmds
+            .as_ref()
+            .expect("sender")
+            .send(AgentCommand::Decide {
+                request_id: request_id.to_string(),
+                decision: PermissionDecision::Allow {
+                    updated_input: None,
+                },
+                initiator: Initiator::Local,
+            })
+            .expect("runner is alive");
+    }
+
+    /// Two prompts out at once — two subagents asking in parallel. Answering
+    /// the first used to report `working` while the second still sat in the
+    /// queue; the header has to keep saying the agent is waiting until the
+    /// queue is empty.
+    #[tokio::test]
+    async fn answering_one_of_two_prompts_leaves_the_agent_awaiting_the_other() {
+        let mut harness = Harness::start();
+        working(&mut harness).await;
+        ask(&harness, prompt("a", Some("sub-1")));
+        assert_eq!(harness.next_status().await.0, Status::AwaitingApproval);
+        ask(&harness, prompt("b", Some("sub-2")));
+
+        answer(&harness, "a");
+        // The answer is acknowledged with a resolution; no status may follow
+        // it, because nothing about the status has changed.
+        loop {
+            match harness.events.recv().await.expect("bus") {
+                ServerMsg::PermissionResolved { request_id, .. } if request_id == "a" => break,
+                ServerMsg::Status { status, .. } => {
+                    panic!("the status moved to {status} with a prompt still waiting")
+                }
+                _ => continue,
+            }
+        }
+
+        answer(&harness, "b");
+        assert_eq!(
+            harness.next_status().await.0,
+            Status::Working,
+            "the last answer is what releases the agent"
+        );
+        harness.finish().await;
+    }
+
+    /// The CLI withdraws a prompt with `control_cancel_request` when its tool
+    /// call is aborted or something else answers it first. The prompt has to
+    /// leave the queue — on the server and in every page — and the status has
+    /// to stop claiming the agent is waiting on it.
+    #[tokio::test]
+    async fn a_withdrawn_prompt_leaves_the_queue_and_the_status() {
+        let mut harness = Harness::start();
+        working(&mut harness).await;
+        ask(&harness, prompt("w1", None));
+        assert_eq!(harness.next_status().await.0, Status::AwaitingApproval);
+
+        harness.action(Action::CancelPermission("w1".to_string()));
+        let mut resolved = None;
+        let status = loop {
+            match harness.events.recv().await.expect("bus") {
+                ServerMsg::PermissionResolved {
+                    request_id,
+                    behavior,
+                    ..
+                } => resolved = Some((request_id, behavior)),
+                ServerMsg::Status { status, .. } => break status,
+                _ => continue,
+            }
+        };
+        assert_eq!(
+            resolved,
+            Some(("w1".to_string(), "withdrawn".to_string())),
+            "every page has to be told to drop the card"
+        );
+        assert_eq!(status, Status::Working);
+
+        // A cancel for anything that is not a prompt we hold changes nothing.
+        harness.action(Action::CancelPermission("never-asked".to_string()));
+
+        // Withdrawn is final: answering it afterwards is refused, not sent.
+        answer(&harness, "w1");
+        let notice = loop {
+            match harness.events.recv().await.expect("bus") {
+                ServerMsg::Notice { text, .. } => break text,
+                ServerMsg::Status { status, .. } => panic!("unexpected status {status}"),
+                _ => continue,
+            }
+        };
+        assert!(notice.contains("no longer outstanding"), "{notice}");
+
+        let id = harness.id.clone();
+        let db = harness.finish().await;
+        assert!(
+            db.pending_permissions(&id).expect("pending").is_empty(),
+            "a reload must not bring the withdrawn card back"
+        );
+        let behaviors: Vec<Value> = db
+            .events_after(&id, 0, 100)
+            .expect("events")
+            .into_iter()
+            .filter(|e| e.kind == "permission_decision")
+            .map(|e| e.payload["behavior"].clone())
+            .collect();
+        assert_eq!(behaviors, vec![json!("withdrawn")]);
+    }
+
+    /// A turn can end with a subagent's prompt still out. The prompt is still
+    /// the operator's to answer, so `idle` — "your turn to type" — is wrong.
+    #[tokio::test]
+    async fn a_turn_ending_under_an_open_prompt_stays_awaiting_approval() {
+        let mut harness = Harness::start();
+        working(&mut harness).await;
+        ask(&harness, prompt("p1", Some("sub-1")));
+        assert_eq!(harness.next_status().await.0, Status::AwaitingApproval);
+
+        harness.action(Action::Transition(Transition::TurnEnded));
+        harness.action(Action::StatusDetail(Some("marker".to_string())));
+        let (status, detail) = harness.next_status().await;
+        assert_eq!(
+            detail.as_deref(),
+            Some("marker"),
+            "no status came before the marker"
+        );
+        assert_eq!(status, Status::AwaitingApproval);
+
+        answer(&harness, "p1");
+        assert_eq!(harness.next_status().await.0, Status::Working);
+        harness.finish().await;
+    }
+
+    // -- the subagent list ----------------------------------------------------
+
+    fn subagent(task_id: &str, state: &str) -> Subagent {
+        Subagent {
+            task_id: task_id.to_string(),
+            description: Some(format!("task {task_id}")),
+            subagent_type: Some("general-purpose".to_string()),
+            activity: None,
+            state: state.to_string(),
+            tool_use_id: Some(format!("toolu_{task_id}")),
+        }
+    }
+
+    async fn next_subagents(harness: &mut Harness) -> Vec<Subagent> {
+        loop {
+            match harness.events.recv().await.expect("bus") {
+                ServerMsg::Status { subagents, .. } => return subagents,
+                _ => continue,
+            }
+        }
+    }
+
+    /// Every change to the list goes out on the live status, and every later
+    /// status — a tool label, say — still carries it, so no page can be left
+    /// with an older list than the last message it saw.
+    #[tokio::test]
+    async fn the_subagent_list_rides_every_live_status_and_goes_with_the_process() {
+        let mut harness = Harness::start();
+        let one = vec![subagent("s1", "running")];
+        harness.action(Action::Subagents(one.clone()));
+        assert_eq!(next_subagents(&mut harness).await, one);
+        assert_eq!(
+            *harness.subagents.read().await,
+            one,
+            "a view reads this copy"
+        );
+
+        let two = vec![subagent("s1", "completed"), subagent("s2", "running")];
+        harness.action(Action::Subagents(two.clone()));
+        assert_eq!(next_subagents(&mut harness).await, two);
+
+        harness.action(Action::StatusDetail(Some("Bash: ls".to_string())));
+        assert_eq!(
+            next_subagents(&mut harness).await,
+            two,
+            "a status about something else still carries the list"
+        );
+
+        // The subagents ran inside the process; once it is gone, so are they.
+        let shared = harness.subagents.clone();
+        harness
+            .msgs
+            .send(ProcessMsg::Exited(ExitInfo {
+                code: Some(0),
+                signal: None,
+                requested: true,
+            }))
+            .ok();
+        let last = loop {
+            match harness.events.recv().await.expect("bus") {
+                ServerMsg::Status {
+                    status: Status::Stopped,
+                    subagents,
+                    ..
+                } => break subagents,
+                _ => continue,
+            }
+        };
+        assert!(last.is_empty(), "{last:?}");
+        assert!(shared.read().await.is_empty());
+        harness.finish().await;
+    }
+
+    /// The agent data a page loads carries the runner's list, so a reload in
+    /// the middle of a run shows what is running.
+    #[tokio::test]
+    async fn the_agent_view_carries_the_live_subagent_list() {
+        let db = Db::open_in_memory().expect("db");
+        let mut record = agent_record("agent-subs", &std::env::temp_dir());
+        record.status = Status::Working;
+        db.insert_agent(&record).expect("insert");
+        let sup = Supervisor::new(db, Arc::new(RwLock::new(Config::default())));
+        let list = vec![subagent("s1", "running"), subagent("s0", "failed")];
+        let (tx, _rx) = mpsc::unbounded_channel();
+        sup.runners.write().await.insert(
+            record.id.clone(),
+            RunnerHandle {
+                tx,
+                commands: Arc::new(RwLock::new(Vec::new())),
+                subagents: Arc::new(RwLock::new(list.clone())),
+                generation: 1,
+            },
+        );
+        let view = sup.view(record.clone()).await.expect("view");
+        assert_eq!(view.subagents, list);
+        let json = serde_json::to_value(&view).expect("json");
+        assert_eq!(json["subagents"][0]["task_id"], json!("s1"));
+        assert_eq!(json["subagents"][0]["state"], json!("running"));
+
+        // A stopped agent has no process, and so no subagents.
+        sup.runners.write().await.clear();
+        let view = sup.view(record).await.expect("view");
+        assert!(view.subagents.is_empty());
     }
 
     #[tokio::test]
@@ -4129,6 +4502,7 @@ mod tests {
             RunnerHandle {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
+                subagents: Arc::new(RwLock::new(Vec::new())),
                 generation: 1,
             },
         );

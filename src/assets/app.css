@@ -283,6 +283,16 @@ label { display: block; font-size: calc(11rem / 13); color: var(--dim); margin-b
    way; the heading alone would read as a list that had failed to load. */
 #approvals-panel.pending #approvals-empty { display: none; }
 #approvals-panel.pending { border-color: var(--warn); }
+/* The subagent list: one row each, the name and its state on the first line,
+   what it is doing under it. */
+#subagents-panel.has-subagents #subagents-empty { display: none; }
+.subagent { padding: 4px 0; border-top: 1px solid var(--line); font-size: calc(11rem / 13); }
+.subagent:first-child { border-top: none; }
+.subagent .head { display: flex; align-items: center; gap: 6px; }
+.subagent .name { flex: 1; word-break: break-word; }
+.subagent .activity { color: var(--dim); word-break: break-word; }
+.subagent.s-awaiting_approval .name { color: var(--warn); }
+.approval .from { color: var(--dim); font-size: calc(11rem / 13); margin-bottom: 4px; }
 
 /* transcript */
 .transcript {

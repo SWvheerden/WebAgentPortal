@@ -176,8 +176,11 @@ function renderEvent(event) {
         el('div', { class: 'body', text: `⏸ asked to use ${p.tool_name}` }),
       ]);
     case 'permission_decision': {
-      const label = { allow: '✓ approved', deny: '✕ denied', expired: '⌁ expired' }[p.behavior]
-        || p.behavior;
+      // `withdrawn`: the agent stopped waiting on its own — the tool call was
+      // aborted, or something other than this page answered it first.
+      const label = {
+        allow: '✓ approved', deny: '✕ denied', expired: '⌁ expired', withdrawn: '⌁ withdrawn by the agent',
+      }[p.behavior] || p.behavior;
       const line = el('div', { class: 'ev system' }, [
         el('div', {
           class: 'body',
@@ -247,7 +250,9 @@ function renderEvent(event) {
           el('div', { class: 'body', text: `↻ the auto-resume was not delivered: ${p.error || 'the agent was gone'}` }),
         ]);
       }
-      if (p.type === 'control_response') return null;
+      // Protocol plumbing. A withdrawn prompt is shown by the decision line
+      // the server writes for it.
+      if (p.type === 'control_response' || p.type === 'control_cancel_request') return null;
       // A backgrounded subagent. The parent's `Agent` tool result only says one
       // was launched, so without these the transcript goes quiet for as long as
       // the subagent runs and then resumes as if nothing had happened.
@@ -463,6 +468,7 @@ function questionCard(request) {
 
   return el('div', { class: 'approval' }, [
     el('h3', { text: 'The agent is asking you a question' }),
+    fromLine(request),
     ...fields,
     el('div', { class: 'actions' }, [
       el('button', { class: 'primary', text: 'Answer', onclick: answer }),
@@ -485,6 +491,7 @@ function renderApprovals() {
     }
     host.append(el('div', { class: 'approval' }, [
       el('h3', { text: `Allow ${request.display_name || request.tool_name}?` }),
+      fromLine(request),
       request.description ? el('div', { class: 'small muted', text: request.description }) : null,
       el('pre', { text: pretty(request.input) }),
       el('div', { class: 'actions' }, [
@@ -501,6 +508,131 @@ function renderApprovals() {
   // Called after every change to `state.pending`, so this is the one place the
   // tab needs to be told.
   setAttention(state.pending.size);
+  renderWaitingNote();
+  // Which subagent is waiting on the operator is read off the queue.
+  renderSubagents();
+}
+
+/// The subagent a prompt came from, if it came from one. `agent_id` is the
+/// subagent's own id, which is also its task id in the subagent list.
+function subagentName(agentId) {
+  const subagents = (state.agent && state.agent.subagents) || [];
+  for (const subagent of subagents) {
+    if (subagent.task_id === agentId) {
+      return subagent.description || subagent.subagent_type || subagent.task_id;
+    }
+  }
+  return agentId;
+}
+
+function fromLine(request) {
+  if (!request.agent_id) return null;
+  return el('div', { class: 'from', text: `from subagent: ${subagentName(request.agent_id)}` });
+}
+
+/// The line under an empty queue. It only says "Nothing waiting" when the
+/// header agrees: a header that says the agent is awaiting approval with no
+/// prompt here means this page missed it, so it says that and fetches the
+/// queue again rather than contradicting the header.
+function renderWaitingNote() {
+  const note = $('approvals-empty');
+  const awaiting = !!state.agent && state.agent.status === 'awaiting_approval';
+  if (awaiting && state.pending.size === 0) {
+    note.textContent = 'The agent is waiting on an approval this page has not received yet — fetching it…';
+    refetchPending();
+  } else {
+    note.textContent = 'Nothing waiting.';
+  }
+}
+
+/// One re-read of the queue at a time, and not more than one every few
+/// seconds: a status arrives per tool call, and a disagreement the server
+/// itself holds must not turn each of them into a request.
+let refetchingPending = false;
+let lastPendingRefetch = 0;
+const PENDING_REFETCH_GAP_MS = 5000;
+
+/// Fetch the pending prompts afresh, for when the header and the queue
+/// disagree (a live update lost while the browser fell behind, say). The
+/// answer replaces the queue, as a replay's does.
+async function refetchPending() {
+  if (refetchingPending || !state.agent) return;
+  if (Date.now() - lastPendingRefetch < PENDING_REFETCH_GAP_MS) return;
+  refetchingPending = true;
+  lastPendingRefetch = Date.now();
+  try {
+    const fresh = (await api(`/api/agents/${state.agent.id}`)).agent;
+    const previous = state.pending;
+    state.pending = new Map((fresh.pending_permissions || []).map((r) => [r.request_id, r]));
+    for (const id of newKeys(previous, state.pending.keys())) announceAttention(state.agent.id, id);
+    // The status comes with it, so a page whose header was the stale one is
+    // put right as well.
+    Object.assign(state.agent, {
+      status: fresh.status,
+      status_detail: fresh.status_detail,
+      subagents: fresh.subagents || [],
+    });
+    renderHeader();
+    // Not `renderApprovals` when nothing changed: it rebuilds the cards, and a
+    // half-answered question would lose what was typed into it.
+    if (state.pending.size !== previous.size || newKeys(previous, state.pending.keys()).length) {
+      renderApprovals();
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    refetchingPending = false;
+  }
+}
+
+// -- subagents --------------------------------------------------------------
+
+/// A subagent's state, as a status class and the words for it. A subagent with
+/// a prompt in the queue is waiting on the operator, whatever the CLI calls it.
+function subagentState(subagent) {
+  if (subagent.state === 'running') {
+    for (const request of state.pending.values()) {
+      if (request.agent_id === subagent.task_id) {
+        return ['awaiting_approval', 'waiting on your approval'];
+      }
+    }
+    return ['working', 'running'];
+  }
+  if (subagent.state === 'completed') return ['idle', 'done'];
+  if (subagent.state === 'failed' || subagent.state === 'error') return ['failed', 'failed'];
+  if (subagent.state === 'stopped' || subagent.state === 'killed' || subagent.state === 'cancelled') {
+    return ['stopped', subagent.state];
+  }
+  return ['idle', subagent.state || 'unknown'];
+}
+
+function renderSubagents() {
+  const subagents = (state.agent && state.agent.subagents) || [];
+  const rows = [];
+  let running = 0;
+  for (const subagent of subagents) {
+    const [cls, words] = subagentState(subagent);
+    if (subagent.state === 'running') running += 1;
+    const name = subagent.description || subagent.subagent_type || subagent.task_id;
+    rows.push(el('div', { class: `subagent s-${cls}` }, [
+      el('div', { class: 'head' }, [
+        el('span', { class: 'dot' }),
+        el('span', { class: 'name', text: name }),
+        subagent.subagent_type && subagent.description
+          ? el('span', { class: 'badge', text: subagent.subagent_type })
+          : null,
+        el('span', { class: 'muted', text: words }),
+      ]),
+      subagent.activity && subagent.state === 'running'
+        ? el('div', { class: 'activity', text: subagent.activity })
+        : null,
+    ]));
+  }
+  $('subagents').replaceChildren(...rows);
+  $('subagents-panel').classList.toggle('has-subagents', rows.length > 0);
+  $('subagents-count').textContent = rows.length
+    ? (running ? `${running} running of ${rows.length}` : String(rows.length))
+    : '';
 }
 
 function decide(requestId, behavior, updatedInput) {
@@ -625,6 +757,9 @@ function renderHeader() {
   if (!agent) return;
   $('agent-name').textContent = agent.name;
   $('agent-status').replaceChildren(statusEl(agent.status, agent.status_detail));
+  // The rail reads the same status: its queue note and subagent list.
+  renderWaitingNote();
+  renderSubagents();
   // Rows rather than the one run-on line this used to be in the header: the
   // rail is a narrow column, and a working path is long enough on its own that
   // the line wrapped twice and buried the cost in the middle of it. The
@@ -1309,6 +1444,7 @@ async function main() {
       status_detail: fresh.status_detail,
       cost_usd: fresh.cost_usd,
       last_stderr: fresh.last_stderr,
+      subagents: fresh.subagents || [],
     });
     renderHeader();
   };
@@ -1365,6 +1501,7 @@ async function main() {
         status_detail: msg.status_detail,
         cost_usd: msg.cost_usd,
         last_stderr: msg.last_stderr,
+        subagents: msg.subagents || [],
       });
       renderHeader();
     })

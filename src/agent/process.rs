@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use super::protocol::{
     self, CliEvent, EventKind, LaunchArgs, PermissionRequest, RateLimitInfo, SlashCommand,
-    SystemLine, ToolProgressLine, tool_uses,
+    Subagent, SystemLine, ToolProgressLine, tool_uses,
 };
 use super::state::Transition;
 
@@ -55,6 +55,11 @@ pub enum Action {
     Cost(f64),
     /// A tool permission prompt needing a human.
     Permission(Box<PermissionRequest>),
+    /// The CLI withdrew a request of its own (`control_cancel_request`). For a
+    /// permission prompt: nobody is waiting on that answer any more.
+    CancelPermission(String),
+    /// The subagent list changed; this is the whole of it.
+    Subagents(Vec<Subagent>),
     /// The CLI answered one of our control requests.
     ControlResponse {
         request_id: String,
@@ -128,6 +133,36 @@ pub struct Dispatcher {
     /// waking on a subagent's result — moves the agent to `working` exactly
     /// once, rather than on every line.
     turn_open: bool,
+    /// Every subagent this process has started, oldest first, the finished
+    /// ones kept with how they ended. Unlike [`Dispatcher::background_tasks`]
+    /// this is for showing, not for deciding when a turn is over: it holds
+    /// synchronous subagents too, and a subagent stays in it after it reports.
+    subagents: Vec<Subagent>,
+}
+
+/// How many subagents to list before the oldest finished one is dropped.
+const MAX_SUBAGENTS: usize = 32;
+
+/// Is this task line about a subagent, rather than another kind of background
+/// task such as a backgrounded shell?
+fn is_subagent_task(sys: &SystemLine) -> bool {
+    if sys.subagent_type.is_some() {
+        return true;
+    }
+    match sys.task_type.as_deref() {
+        Some(kind) => kind.contains("agent"),
+        None => false,
+    }
+}
+
+/// A trimmed, non-empty string, or `None`.
+fn non_empty(text: Option<&str>) -> Option<String> {
+    let text = text?.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
 }
 
 /// How many in-flight tool labels to remember before dropping the lot. A bound
@@ -167,6 +202,119 @@ impl Dispatcher {
             .cloned()
             .or_else(|| prog.tool_name.clone())?;
         Some(format!("{base} — {}", fmt_elapsed(elapsed)))
+    }
+
+    /// Fold one task lifecycle line into the subagent list. Returns whether the
+    /// list changed.
+    fn track_subagent(&mut self, sys: &SystemLine) -> bool {
+        let before = self.subagents.clone();
+        match sys.subtype.as_deref() {
+            Some("task_started") => {
+                let Some(id) = sys.task_id.clone() else {
+                    return false;
+                };
+                if !is_subagent_task(sys) {
+                    return false;
+                }
+                let mut known = false;
+                for agent in self.subagents.iter_mut() {
+                    if agent.task_id == id {
+                        agent.state = "running".to_string();
+                        known = true;
+                    }
+                }
+                if !known {
+                    self.subagents.push(Subagent {
+                        task_id: id,
+                        description: non_empty(sys.description.as_deref()),
+                        subagent_type: non_empty(sys.subagent_type.as_deref()),
+                        activity: None,
+                        state: "running".to_string(),
+                        tool_use_id: sys.tool_use_id.clone(),
+                    });
+                }
+            }
+            Some("task_progress") => {
+                let Some(id) = sys.task_id.as_deref() else {
+                    return false;
+                };
+                // The subagent's own summary of what it is doing beats the
+                // bare name of the tool it last ran.
+                let activity = non_empty(sys.description.as_deref())
+                    .or_else(|| non_empty(sys.last_tool_name.as_deref()));
+                for agent in self.subagents.iter_mut() {
+                    if agent.task_id == id && activity.is_some() {
+                        agent.activity = activity.clone();
+                    }
+                }
+            }
+            Some("task_updated") => {
+                let (Some(id), Some(status)) = (sys.task_id.as_deref(), sys.patched_status())
+                else {
+                    return false;
+                };
+                for agent in self.subagents.iter_mut() {
+                    if agent.task_id == id {
+                        agent.state = status.to_string();
+                    }
+                }
+            }
+            Some("task_notification") => {
+                let Some(id) = sys.task_id.as_deref() else {
+                    return false;
+                };
+                let status =
+                    non_empty(sys.status.as_deref()).unwrap_or_else(|| "completed".to_string());
+                for agent in self.subagents.iter_mut() {
+                    if agent.task_id == id {
+                        agent.state = status.clone();
+                    }
+                }
+            }
+            Some("background_tasks_changed") => {
+                let Some(tasks) = &sys.tasks else {
+                    return false;
+                };
+                // A backgrounded subagent that has dropped off the complete
+                // live list has ended. How is the per-task lines' to say; if
+                // they never do, it at least stops reading as running.
+                for agent in self.subagents.iter_mut() {
+                    let listed = tasks.iter().any(|t| t.task_id == agent.task_id);
+                    if !listed
+                        && agent.state == "running"
+                        && self.background_tasks.contains_key(&agent.task_id)
+                    {
+                        agent.state = "completed".to_string();
+                    }
+                }
+            }
+            _ => return false,
+        }
+        // Bounded: the oldest finished subagent goes first, and only if every
+        // one is still running does a running one make room.
+        if self.subagents.len() > MAX_SUBAGENTS {
+            let drop_at = self
+                .subagents
+                .iter()
+                .position(|a| a.state != "running")
+                .unwrap_or(0);
+            self.subagents.remove(drop_at);
+        }
+        self.subagents != before
+    }
+
+    /// A subagent ran a tool: that is what it is doing now.
+    fn note_subagent_tool(&mut self, parent_tool_use_id: &str, label: &str) -> bool {
+        let mut changed = false;
+        for agent in self.subagents.iter_mut() {
+            if agent.tool_use_id.as_deref() == Some(parent_tool_use_id)
+                && agent.activity.as_deref() != Some(label)
+            {
+                agent.activity = Some(label.to_string());
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Fold one backgrounded-subagent lifecycle line into the live set, and say
@@ -334,6 +482,10 @@ impl Dispatcher {
                     self.saw_init = true;
                     out.push(Action::Transition(Transition::Initialized));
                 }
+                // Before `on_task_line`, which rewrites the live set this reads.
+                if self.track_subagent(&sys) {
+                    out.push(Action::Subagents(self.subagents.clone()));
+                }
                 out.extend(self.on_task_line(&sys));
             }
             CliEvent::Assistant(msg) if msg.is_api_error_message => {
@@ -367,8 +519,14 @@ impl Dispatcher {
                     kind: EventKind::Assistant,
                     payload: raw,
                 });
+                let mut subagents_changed = false;
                 for use_ in tool_uses(&msg) {
                     let label = use_.label();
+                    if let Some(parent) = msg.parent_tool_use_id.as_deref()
+                        && self.note_subagent_tool(parent, &label)
+                    {
+                        subagents_changed = true;
+                    }
                     if let Some(id) = use_.id.clone() {
                         if self.tool_labels.len() >= MAX_TRACKED_TOOLS {
                             self.tool_labels.clear();
@@ -386,6 +544,9 @@ impl Dispatcher {
                             "input": use_.input,
                         }),
                     });
+                }
+                if subagents_changed {
+                    out.push(Action::Subagents(self.subagents.clone()));
                 }
             }
             CliEvent::User(msg) => {
@@ -451,8 +612,11 @@ impl Dispatcher {
                         kind: EventKind::PermissionRequest,
                         payload,
                     });
-                    out.push(Action::Transition(Transition::PermissionRequested));
+                    // The prompt is queued before the status moves, so a page
+                    // that is told "awaiting approval" already has, or is about
+                    // to be handed, what is being awaited.
                     out.push(Action::Permission(Box::new(perm)));
+                    out.push(Action::Transition(Transition::PermissionRequested));
                 }
                 None => out.push(Action::Persist {
                     kind: EventKind::System,
@@ -480,6 +644,13 @@ impl Dispatcher {
                         is_error: res.is_error(),
                     });
                 }
+            }
+            CliEvent::ControlCancel(cancel) => {
+                out.push(Action::Persist {
+                    kind: EventKind::System,
+                    payload: raw,
+                });
+                out.push(Action::CancelPermission(cancel.request_id));
             }
             CliEvent::RateLimit(line) => {
                 // Not persisted: it is a gauge, not a transcript entry, and one
@@ -2000,6 +2171,163 @@ mod tests {
             panic!("expected a persist action");
         };
         assert_eq!(payload["request_id"], json!("9"));
+    }
+
+    /// The prompt is queued before the status says anything is awaited, so a
+    /// page told "awaiting approval" is never left with an empty queue.
+    #[test]
+    fn a_prompt_is_queued_before_the_status_moves() {
+        let actions = dispatch(&[
+            r#"{"type":"control_request","request_id":"9","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"tu_2","agent_id":"a618"}}"#,
+        ]);
+        let queued = actions
+            .iter()
+            .position(|a| matches!(a, Action::Permission(_)))
+            .expect("a permission action");
+        let moved = actions
+            .iter()
+            .position(|a| a == &Action::Transition(Transition::PermissionRequested))
+            .expect("a transition");
+        assert!(queued < moved, "{actions:?}");
+        let Action::Permission(req) = &actions[queued] else {
+            unreachable!()
+        };
+        assert_eq!(
+            req.agent_id.as_deref(),
+            Some("a618"),
+            "a subagent's prompt has to say whose it is"
+        );
+    }
+
+    /// `control_cancel_request` is the CLI withdrawing a prompt. It used to be
+    /// an unrecognised line, which left the prompt queued and the agent
+    /// reported as awaiting an answer nobody could give.
+    #[test]
+    fn a_withdrawn_prompt_is_understood_not_flagged() {
+        let actions = dispatch(&[r#"{"type":"control_cancel_request","request_id":"9"}"#]);
+        assert_eq!(kinds(&actions), vec![EventKind::System]);
+        assert!(actions.contains(&Action::CancelPermission("9".to_string())));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Unrecognised { .. })),
+            "{actions:?}"
+        );
+    }
+
+    /// The last subagent list a line produced.
+    fn last_list(actions: &[Action]) -> Option<Vec<Subagent>> {
+        actions.iter().rev().find_map(|a| match a {
+            Action::Subagents(list) => Some(list.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn subagents_are_listed_from_start_to_finish() {
+        let mut d = Dispatcher::new();
+        let started = last_list(&d.on_stdout(TASK_STARTED)).expect("a list");
+        assert_eq!(
+            started,
+            vec![Subagent {
+                task_id: "a618".into(),
+                description: Some("Read a.txt and report contents".into()),
+                subagent_type: Some("general-purpose".into()),
+                activity: None,
+                state: "running".into(),
+                tool_use_id: Some("toolu_01JX".into()),
+            }]
+        );
+
+        // Its own progress line says what it is doing.
+        let progress = last_list(&d.on_stdout(
+            r#"{"type":"system","subtype":"task_progress","task_id":"a618","description":"Reading a.txt","last_tool_name":"Read","session_id":"s1"}"#,
+        ))
+        .expect("a list");
+        assert_eq!(progress[0].activity.as_deref(), Some("Reading a.txt"));
+
+        // So do its own tool calls, which arrive tagged with the call that
+        // launched it.
+        let tool = last_list(&d.on_stdout(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_01JX","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_9","name":"Bash","input":{"command":"cat a.txt"}}]}}"#,
+        ))
+        .expect("a list");
+        assert_eq!(tool[0].activity.as_deref(), Some("Bash: cat a.txt"));
+
+        // A line that changes nothing does not resend the list.
+        let same = d.on_stdout(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_01JX","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_10","name":"Bash","input":{"command":"cat a.txt"}}]}}"#,
+        );
+        assert_eq!(last_list(&same), None, "{same:?}");
+
+        // It ends, and stays listed with how it ended.
+        let done = last_list(&d.on_stdout(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a618","status":"failed","summary":"could not read","session_id":"s1"}"#,
+        ))
+        .expect("a list");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].state, "failed");
+    }
+
+    /// The list is every subagent, not only the backgrounded ones the turn
+    /// logic tracks — and it is subagents, not other background tasks.
+    #[test]
+    fn synchronous_subagents_are_listed_and_other_tasks_are_not() {
+        let mut d = Dispatcher::new();
+        let list = last_list(&d.on_stdout(
+            r#"{"type":"system","subtype":"task_started","task_id":"c930","description":"Inline work","subagent_type":"general-purpose","is_backgrounded":false,"session_id":"s1"}"#,
+        ))
+        .expect("a list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].state, "running");
+
+        let shell = d.on_stdout(
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","description":"npm run dev","task_type":"local_bash","is_backgrounded":true,"session_id":"s1"}"#,
+        );
+        assert_eq!(last_list(&shell), None, "{shell:?}");
+
+        let done = last_list(&d.on_stdout(
+            r#"{"type":"system","subtype":"task_updated","task_id":"c930","patch":{"status":"completed"},"session_id":"s1"}"#,
+        ))
+        .expect("a list");
+        assert_eq!(done[0].state, "completed");
+    }
+
+    /// A backgrounded subagent that drops off the complete live list has
+    /// ended, even if no per-task line ever says so.
+    #[test]
+    fn a_subagent_gone_from_the_live_list_is_no_longer_running() {
+        let mut d = Dispatcher::new();
+        for line in [TASKS_ONE, TASK_STARTED] {
+            d.on_stdout(line);
+        }
+        let list = last_list(&d.on_stdout(TASKS_NONE)).expect("a list");
+        assert_eq!(list[0].state, "completed");
+    }
+
+    #[test]
+    fn the_subagent_list_is_bounded_and_drops_finished_ones_first() {
+        let mut d = Dispatcher::new();
+        let start = |id: usize| {
+            format!(
+                r#"{{"type":"system","subtype":"task_started","task_id":"t{id}","subagent_type":"Explore","session_id":"s1"}}"#
+            )
+        };
+        d.on_stdout(&start(0));
+        d.on_stdout(&start(1));
+        d.on_stdout(
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","session_id":"s1"}"#,
+        );
+        let mut list = Vec::new();
+        for id in 2..=MAX_SUBAGENTS {
+            list = last_list(&d.on_stdout(&start(id))).expect("a list");
+        }
+        assert_eq!(list.len(), MAX_SUBAGENTS);
+        assert_eq!(list[0].task_id, "t0", "a running subagent is kept");
+        assert!(
+            !list.iter().any(|a| a.task_id == "t1"),
+            "the finished one made room"
+        );
     }
 
     #[test]

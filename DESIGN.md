@@ -224,6 +224,23 @@ raises `TurnStarted`**, whoever began the turn. Sending a message still raises i
 so the transition arrives at most once per turn either way; a transition that lands
 where it already was is not published.
 
+**`AwaitingApproval` is exactly "a prompt is outstanding".** The runner passes every
+status through `Status::with_approvals` against the prompts it holds, so the header can
+never disagree with the "Waiting on you" queue: answering the first of two prompts keeps
+the agent awaiting the second, a turn that ends under a subagent's prompt does not read
+as `Idle`, and a prompt the CLI withdraws stops being waited on. The CLI withdraws one
+with `control_cancel_request` when its tool call is aborted or something else (a hook,
+the auto-mode classifier, a Remote Control client) answers first; the runner records
+that as a `withdrawn` decision and tells every page to drop the card. A prompt raised
+inside a subagent carries the subagent's `agent_id`, which is its task id, so the page
+says whose it is.
+
+The agent page's rail also lists **every subagent the running process has started** —
+synchronous and backgrounded, finished ones kept with how they ended (bounded at 32) —
+with what each is doing. The dispatcher builds the list from the task lifecycle lines;
+it rides every live `status` message as `subagents` and the agent data as the same
+field, so a reload mid-run shows it. It goes with the process.
+
 ### Out of tokens
 **`RateLimited` is what `Idle` would have lied about.** By F15 a turn killed by the
 account's rate limit closes with an ordinary `result` — the work stopped halfway, and the

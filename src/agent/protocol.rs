@@ -109,6 +109,15 @@ pub struct SystemLine {
     /// `task_progress`: the tool the subagent is running right now.
     #[serde(default)]
     pub last_tool_name: Option<String>,
+    /// `task_started` / `task_progress`: the `Agent` tool call that launched
+    /// the subagent. The subagent's own lines carry it as their
+    /// `parent_tool_use_id`.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    /// `task_started`: `local_agent` for a subagent; other kinds of background
+    /// task (a backgrounded shell, say) report their own.
+    #[serde(default)]
+    pub task_type: Option<String>,
     /// `task_updated`: the fields that changed, `status` among them.
     #[serde(default)]
     pub patch: Option<Value>,
@@ -119,6 +128,27 @@ impl SystemLine {
     pub fn patched_status(&self) -> Option<&str> {
         self.patch.as_ref()?.get("status")?.as_str()
     }
+}
+
+/// One subagent the agent has started, as the agent page lists it.
+///
+/// Built from the task lifecycle lines (F17), so it covers a synchronous
+/// subagent as well as a backgrounded one, and it keeps the ones that have
+/// finished — with how they finished — until the process exits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Subagent {
+    /// The CLI's task id, which is also the subagent's own agent id: a
+    /// permission prompt raised inside the subagent carries it as `agent_id`.
+    pub task_id: String,
+    pub description: Option<String>,
+    pub subagent_type: Option<String>,
+    /// What it is doing right now: the tool it last ran, or its own summary.
+    pub activity: Option<String>,
+    /// `running` until it ends, then the CLI's word for how: `completed`,
+    /// `failed`, `stopped`, …
+    pub state: String,
+    /// The `Agent` tool call that launched it.
+    pub tool_use_id: Option<String>,
 }
 
 /// One backgrounded subagent, as listed by `background_tasks_changed`.
@@ -289,6 +319,7 @@ impl ControlRequestLine {
             display_name: get("display_name"),
             description: get("description"),
             tool_use_id: get("tool_use_id"),
+            agent_id: get("agent_id"),
             input: self.request.get("input").cloned().unwrap_or(Value::Null),
             permission_suggestions: self
                 .request
@@ -310,10 +341,23 @@ pub struct PermissionRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub tool_use_id: Option<String>,
+    /// Set when the prompt was raised inside a subagent: that subagent's id,
+    /// which is its [`Subagent::task_id`]. Absent for the agent's own calls.
+    #[serde(default)]
+    pub agent_id: Option<String>,
     #[serde(default)]
     pub input: Value,
     #[serde(default)]
     pub permission_suggestions: Value,
+}
+
+/// A `control_cancel_request` from the CLI: it no longer needs the answer to
+/// one of its own requests. For a `can_use_tool` prompt this means the prompt
+/// was withdrawn — its tool call was aborted, or something else (a hook, the
+/// auto-mode classifier, a Remote Control client) answered it first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlCancelLine {
+    pub request_id: String,
 }
 
 /// A `control_response` from the CLI, answering a request we sent.
@@ -459,7 +503,7 @@ impl SubagentRetry {
 /// A recognised line from the CLI's stdout.
 #[derive(Debug, Clone)]
 pub enum CliEvent {
-    System(SystemLine),
+    System(Box<SystemLine>),
     Assistant(MessageLine),
     User(MessageLine),
     Result(ResultLine),
@@ -467,6 +511,8 @@ pub enum CliEvent {
     StreamEvent(Value),
     ControlRequest(ControlRequestLine),
     ControlResponse(ControlResponseLine),
+    /// The CLI withdrew one of its own control requests.
+    ControlCancel(ControlCancelLine),
     /// Account usage against the rate-limit windows.
     RateLimit(RateLimitLine),
     /// A tool is still running, or a subagent is retrying.
@@ -489,6 +535,7 @@ impl CliEvent {
             CliEvent::StreamEvent(_) => "stream_event",
             CliEvent::ControlRequest(_) => "control_request",
             CliEvent::ControlResponse(_) => "control_response",
+            CliEvent::ControlCancel(_) => "control_cancel_request",
             CliEvent::RateLimit(_) => "rate_limit_event",
             CliEvent::ToolProgress(_) => "tool_progress",
             CliEvent::Unknown { kind, .. } => kind,
@@ -543,13 +590,14 @@ pub fn parse_line(line: &str) -> ParsedLine {
     }
 
     let event = match ty.as_str() {
-        "system" => typed::<SystemLine>(&raw, CliEvent::System),
+        "system" => typed::<SystemLine>(&raw, |l| CliEvent::System(Box::new(l))),
         "assistant" => typed::<MessageLine>(&raw, CliEvent::Assistant),
         "user" => typed::<MessageLine>(&raw, CliEvent::User),
         "result" => typed::<ResultLine>(&raw, CliEvent::Result),
         "stream_event" => CliEvent::StreamEvent(raw.clone()),
         "control_request" => typed::<ControlRequestLine>(&raw, CliEvent::ControlRequest),
         "control_response" => typed::<ControlResponseLine>(&raw, CliEvent::ControlResponse),
+        "control_cancel_request" => typed::<ControlCancelLine>(&raw, CliEvent::ControlCancel),
         "rate_limit_event" => typed::<RateLimitLine>(&raw, CliEvent::RateLimit),
         "tool_progress" => typed::<ToolProgressLine>(&raw, |l| CliEvent::ToolProgress(Box::new(l))),
         "" => CliEvent::Unknown {

@@ -86,6 +86,26 @@ impl Status {
             (_, Errored) => Some(Failed),
         }
     }
+
+    /// This status, corrected by whether a permission prompt is outstanding.
+    ///
+    /// `AwaitingApproval` says one thing — a prompt is waiting on the operator —
+    /// and the pending prompts are what say whether that is true. The
+    /// transitions alone cannot keep the two in step: answering the first of
+    /// two prompts would read as `Working` with the second still waiting, a
+    /// turn ending under a subagent's prompt would read as `Idle`, and a prompt
+    /// the CLI withdrew would leave the agent awaiting nothing. So the status a
+    /// running agent reports is passed through this, against the prompts it
+    /// actually holds. `Starting` and the terminal states have no prompts to
+    /// answer and are left alone.
+    pub fn with_approvals(self, any_pending: bool) -> Status {
+        use Status::*;
+        match (self, any_pending) {
+            (Idle | Working | RateLimited, true) => AwaitingApproval,
+            (AwaitingApproval, false) => Working,
+            (s, _) => s,
+        }
+    }
 }
 
 impl fmt::Display for Status {
@@ -310,6 +330,31 @@ mod tests {
             Status::RateLimited.apply(Transition::PermissionRequested),
             Some(Status::AwaitingApproval)
         );
+    }
+
+    /// The status follows the prompts actually held, whichever transition
+    /// came last.
+    #[test]
+    fn awaiting_approval_is_exactly_a_prompt_being_outstanding() {
+        // Something is waiting: every resting or working state says so.
+        for s in [Status::Idle, Status::Working, Status::RateLimited] {
+            assert_eq!(s.with_approvals(true), Status::AwaitingApproval, "{s}");
+            assert_eq!(s.with_approvals(false), s, "{s}");
+        }
+        // Nothing is waiting: awaiting nothing is working.
+        assert_eq!(
+            Status::AwaitingApproval.with_approvals(false),
+            Status::Working
+        );
+        assert_eq!(
+            Status::AwaitingApproval.with_approvals(true),
+            Status::AwaitingApproval
+        );
+        // No prompt can be answered before the handshake or after the end.
+        for s in [Status::Starting, Status::Stopped, Status::Failed] {
+            assert_eq!(s.with_approvals(true), s, "{s}");
+            assert_eq!(s.with_approvals(false), s, "{s}");
+        }
     }
 
     #[test]
