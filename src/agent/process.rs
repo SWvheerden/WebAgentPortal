@@ -142,6 +142,14 @@ pub struct Dispatcher {
     /// of one of these only says it was launched; a synchronous subagent's
     /// says it is done, and is the only completion line it gets.
     backgrounded_subagents: HashSet<String>,
+    /// Listed subagents known to be synchronous and started by the agent's own
+    /// turn — not by another subagent. Only these are bound to that turn, so
+    /// only these may be closed when it ends.
+    top_level_synchronous: HashSet<String>,
+    /// Subagents marked done by the turn-end backstop rather than by a line
+    /// saying so. Sign of life from one of these puts it back to running; a
+    /// real completion clears the mark, so it is never undone.
+    closed_by_backstop: HashSet<String>,
 }
 
 /// How many subagents to list before the oldest finished one is dropped.
@@ -223,6 +231,13 @@ impl Dispatcher {
                 if sys.is_backgrounded == Some(true) {
                     self.backgrounded_subagents.insert(id.clone());
                 }
+                // Top level: spawned by the agent itself. A subagent another
+                // subagent started runs on that one's clock, not the turn's.
+                let top_level = sys.spawn_depth.is_none_or(|depth| depth <= 1);
+                if sys.is_backgrounded == Some(false) && top_level {
+                    self.top_level_synchronous.insert(id.clone());
+                }
+                self.closed_by_backstop.remove(&id);
                 let mut known = false;
                 for agent in self.subagents.iter_mut() {
                     if agent.task_id == id {
@@ -249,6 +264,14 @@ impl Dispatcher {
                 // bare name of the tool it last ran.
                 let activity = non_empty(sys.description.as_deref())
                     .or_else(|| non_empty(sys.last_tool_name.as_deref()));
+                // Still reporting progress: a backstop close was premature.
+                if self.closed_by_backstop.remove(id) {
+                    for agent in self.subagents.iter_mut() {
+                        if agent.task_id == id {
+                            agent.state = "running".to_string();
+                        }
+                    }
+                }
                 for agent in self.subagents.iter_mut() {
                     if agent.task_id == id && activity.is_some() {
                         agent.activity = activity.clone();
@@ -260,9 +283,19 @@ impl Dispatcher {
                 else {
                     return false;
                 };
-                for agent in self.subagents.iter_mut() {
-                    if agent.task_id == id {
-                        agent.state = status.to_string();
+                if protocol::is_terminal_task_status(status) {
+                    self.closed_by_backstop.remove(id);
+                    for agent in self.subagents.iter_mut() {
+                        if agent.task_id == id {
+                            agent.state = status.to_string();
+                        }
+                    }
+                } else if self.closed_by_backstop.remove(id) {
+                    // Still going after the backstop closed it.
+                    for agent in self.subagents.iter_mut() {
+                        if agent.task_id == id {
+                            agent.state = "running".to_string();
+                        }
                     }
                 }
             }
@@ -272,6 +305,7 @@ impl Dispatcher {
                 };
                 let status =
                     non_empty(sys.status.as_deref()).unwrap_or_else(|| "completed".to_string());
+                self.closed_by_backstop.remove(id);
                 for agent in self.subagents.iter_mut() {
                     if agent.task_id == id {
                         agent.state = status.clone();
@@ -307,6 +341,8 @@ impl Dispatcher {
                 .unwrap_or(0);
             let dropped = self.subagents.remove(drop_at);
             self.backgrounded_subagents.remove(&dropped.task_id);
+            self.top_level_synchronous.remove(&dropped.task_id);
+            self.closed_by_backstop.remove(&dropped.task_id);
         }
         self.subagents != before
     }
@@ -319,7 +355,13 @@ impl Dispatcher {
     fn close_synchronous_subagent(&mut self, tool_use_id: &str, is_error: bool) -> bool {
         let mut changed = false;
         for agent in self.subagents.iter_mut() {
-            if agent.tool_use_id.as_deref() != Some(tool_use_id) || agent.state != "running" {
+            if agent.tool_use_id.as_deref() != Some(tool_use_id) {
+                continue;
+            }
+            // A backstop close is replaced by the real end; any other end
+            // already said how it finished.
+            let backstop = self.closed_by_backstop.remove(&agent.task_id);
+            if agent.state != "running" && !backstop {
                 continue;
             }
             if self.backgrounded_subagents.contains(&agent.task_id)
@@ -333,16 +375,23 @@ impl Dispatcher {
         changed
     }
 
-    /// The turn is over. A synchronous subagent cannot outlive it — the parent
-    /// sat inside its tool call — so one still listed as running missed its
-    /// result and is closed here. Backgrounded ones still running carry on.
+    /// The turn is over. A synchronous subagent the agent itself started
+    /// cannot outlive it — the parent sat inside its tool call — so one still
+    /// listed as running missed its result and is closed here, marked as the
+    /// backstop's guess. Anything else — backgrounded, nested under another
+    /// subagent, or of unknown kind — is not this turn's to close.
     fn close_subagents_at_turn_end(&mut self) -> bool {
         let mut changed = false;
         for agent in self.subagents.iter_mut() {
-            if agent.state == "running" && !self.background_tasks.contains_key(&agent.task_id) {
-                agent.state = "completed".to_string();
-                changed = true;
+            if agent.state != "running"
+                || !self.top_level_synchronous.contains(&agent.task_id)
+                || self.background_tasks.contains_key(&agent.task_id)
+            {
+                continue;
             }
+            agent.state = "completed".to_string();
+            self.closed_by_backstop.insert(agent.task_id.clone());
+            changed = true;
         }
         changed
     }
@@ -351,9 +400,15 @@ impl Dispatcher {
     fn note_subagent_tool(&mut self, parent_tool_use_id: &str, label: &str) -> bool {
         let mut changed = false;
         for agent in self.subagents.iter_mut() {
-            if agent.tool_use_id.as_deref() == Some(parent_tool_use_id)
-                && agent.activity.as_deref() != Some(label)
-            {
+            if agent.tool_use_id.as_deref() != Some(parent_tool_use_id) {
+                continue;
+            }
+            // Running a tool is still running: a backstop close was premature.
+            if self.closed_by_backstop.remove(&agent.task_id) {
+                agent.state = "running".to_string();
+                changed = true;
+            }
+            if agent.activity.as_deref() != Some(label) {
                 agent.activity = Some(label.to_string());
                 changed = true;
             }
@@ -2395,6 +2450,62 @@ mod tests {
         // Nor does the end of the turn that launched it.
         let over = d.on_stdout(TURN_OVER);
         assert_eq!(last_list(&over), None, "{over:?}");
+    }
+
+    /// A subagent started by another subagent runs on that one's clock: the
+    /// top-level turn ending says nothing about it.
+    #[test]
+    fn a_nested_subagent_survives_the_top_level_turn_end() {
+        let mut d = Dispatcher::new();
+        d.on_stdout(
+            r#"{"type":"system","subtype":"task_started","task_id":"n1","tool_use_id":"toolu_n1","description":"Nested","subagent_type":"Explore","is_backgrounded":false,"spawn_depth":2,"session_id":"s1"}"#,
+        );
+        // Nor one whose kind was never said.
+        d.on_stdout(
+            r#"{"type":"system","subtype":"task_started","task_id":"u1","tool_use_id":"toolu_u1","description":"Unknown","subagent_type":"Explore","session_id":"s1"}"#,
+        );
+        let over = d.on_stdout(TURN_OVER);
+        assert_eq!(last_list(&over), None, "{over:?}");
+    }
+
+    /// A backstop close is a guess. A subagent that turns out to be still
+    /// going comes back to running, and its real end replaces the guess.
+    #[test]
+    fn a_backstop_closed_subagent_revives_on_progress() {
+        let mut d = Dispatcher::new();
+        d.on_stdout(SYNC_STARTED);
+        let closed = last_list(&d.on_stdout(TURN_OVER)).expect("a list");
+        assert_eq!(closed[0].state, "completed");
+
+        let revived = last_list(&d.on_stdout(
+            r#"{"type":"system","subtype":"task_progress","task_id":"c930","description":"Still at it","session_id":"s1"}"#,
+        ))
+        .expect("a list");
+        assert_eq!(revived[0].state, "running");
+        assert_eq!(revived[0].activity.as_deref(), Some("Still at it"));
+
+        let failed = last_list(&d.on_stdout(
+            r#"{"type":"system","subtype":"task_notification","task_id":"c930","status":"failed","session_id":"s1"}"#,
+        ))
+        .expect("a list");
+        assert_eq!(failed[0].state, "failed");
+
+        // A real end is not undone by a late progress line.
+        let late = d.on_stdout(
+            r#"{"type":"system","subtype":"task_progress","task_id":"c930","description":"Late","session_id":"s1"}"#,
+        );
+        let list = last_list(&late).expect("the activity changed");
+        assert_eq!(list[0].state, "failed");
+
+        // The tool result is the real end of a backstop-closed one, too.
+        let mut d = Dispatcher::new();
+        d.on_stdout(SYNC_STARTED);
+        d.on_stdout(TURN_OVER);
+        let ended = last_list(&d.on_stdout(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sync","is_error":true,"content":"it died"}]}}"#,
+        ))
+        .expect("a list");
+        assert_eq!(ended[0].state, "failed");
     }
 
     /// The backstop: a synchronous subagent whose result never matched is

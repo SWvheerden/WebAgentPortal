@@ -242,7 +242,8 @@ The agent page's rail also lists **every subagent the running process has starte
 synchronous and backgrounded, finished ones kept with how they ended (bounded at 32) —
 with what each is doing. The dispatcher builds the list from the task lifecycle lines;
 a synchronous subagent, which has no completion line, ends with its `Agent` tool result,
-and any still running when the turn ends is closed then;
+and a top-level synchronous one still running when the turn ends is closed then — as a
+guess that any later sign of life from it undoes;
 it rides every live `status` message as `subagents` and the agent data as the same
 field, so a reload mid-run shows it. It goes with the process.
 

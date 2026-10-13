@@ -103,6 +103,10 @@ pub struct SystemLine {
     /// and let go, rather than being blocked until the subagent reports.
     #[serde(default)]
     pub is_backgrounded: Option<bool>,
+    /// `task_started`: how deep in the subagent tree it was spawned — 1 for
+    /// one the agent started itself, more for one another subagent started.
+    #[serde(default)]
+    pub spawn_depth: Option<u64>,
     /// `task_notification`: `completed`, `failed`, …
     #[serde(default)]
     pub status: Option<String>,

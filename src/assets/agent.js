@@ -636,9 +636,12 @@ async function refetchPending() {
     toast(err.message, 'error');
   } finally {
     refetchingPending = false;
+    // Look again — after the gap — in case the mismatch outlived that news.
+    // Here, not after the block: the discard returns from inside it, and the
+    // live message that caused it checked while this fetch still held the
+    // flag, so nothing else will.
+    if (discarded) checkApprovalMismatch();
   }
-  // Look again — after the gap — in case the mismatch outlived that news.
-  if (discarded) checkApprovalMismatch();
 }
 
 // -- subagents --------------------------------------------------------------
