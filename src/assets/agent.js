@@ -577,7 +577,28 @@ let approvalNews = 0;
 let refetchingPending = false;
 let lastPendingRefetch = 0;
 const PENDING_REFETCH_GAP_MS = 5000;
+
+/// How long after a `permission_resolved` to look again. Long enough for the
+/// status that normally follows it to land first, so the look is a no-op.
+const AFTER_RESOLVED_MS = 1500;
+
+/// The one timer that looks at the mismatch again later, and when it fires.
+/// A request for an earlier look replaces a later one; a later one waits.
 let mismatchRetry = null;
+let mismatchRetryAt = 0;
+
+function scheduleMismatchCheck(delay) {
+  const due = Date.now() + Math.max(0, delay);
+  if (mismatchRetry && mismatchRetryAt <= due) return;
+  if (mismatchRetry) clearTimeout(mismatchRetry);
+  mismatchRetryAt = due;
+  mismatchRetry = setTimeout(() => {
+    mismatchRetry = null;
+    // The note may have been waiting on an answer that has since aged out.
+    renderWaitingNote();
+    checkApprovalMismatch();
+  }, Math.max(0, delay));
+}
 
 /// Called once the server's own status has spoken: if it says the agent is
 /// awaiting approval and this page holds no prompt — and no answer from here
@@ -585,7 +606,15 @@ let mismatchRetry = null;
 /// update lost while the browser fell behind, say), so fetch the queue.
 function checkApprovalMismatch() {
   if (!state.agent || state.agent.status !== 'awaiting_approval') return;
-  if (state.pending.size > 0 || answeredRecently()) return;
+  if (state.pending.size > 0) return;
+  if (answeredRecently()) {
+    // Held off only by an answer still on its way. If it is never
+    // confirmed, look again once the oldest one stops counting.
+    let oldest = Infinity;
+    for (const sentAt of state.answered.values()) oldest = Math.min(oldest, sentAt);
+    scheduleMismatchCheck(oldest + ANSWER_IN_FLIGHT_MS + 1 - Date.now());
+    return;
+  }
   refetchPending();
 }
 
@@ -597,12 +626,7 @@ async function refetchPending() {
   if (wait > 0) {
     // Too soon after the last one: look again once the gap is up, rather
     // than leave the mismatch standing until the next status.
-    if (!mismatchRetry) {
-      mismatchRetry = setTimeout(() => {
-        mismatchRetry = null;
-        checkApprovalMismatch();
-      }, wait);
-    }
+    scheduleMismatchCheck(wait);
     return;
   }
   refetchingPending = true;
@@ -1585,6 +1609,10 @@ async function main() {
       state.answered.delete(msg.request_id);
       releaseAttention(msg.agent_id, msg.request_id);
       renderApprovals();
+      // No status follows if the agent is still awaiting another prompt —
+      // one this page may have missed. Not at once: the status that usually
+      // does follow would race the fetch.
+      scheduleMismatchCheck(AFTER_RESOLVED_MS);
     })
     .on('agent_renamed', (msg) => {
       if (msg.agent_id !== state.agent.id) return;
