@@ -734,6 +734,11 @@ pub struct SlashCommand {
 
 /// Pull the command list out of an `initialize` control response, wherever the
 /// CLI happens to put it.
+///
+/// Names come back with a leading `/` whether or not the CLI sent one. It does
+/// not (`"compact"`, measured against `claude` 2.1.241), and the autocomplete
+/// inserts the name as-is — so without this, picking `/compact` sent the bare
+/// word `compact`, which the CLI reads as a prompt rather than a command.
 pub fn commands_from_initialize(payload: &Value) -> Vec<SlashCommand> {
     let candidates = ["commands", "slash_commands", "slashCommands"];
     let list = candidates
@@ -749,8 +754,14 @@ pub fn commands_from_initialize(payload: &Value) -> Vec<SlashCommand> {
                 description: None,
                 argument_hint: None,
             }),
-            Value::Object(_) => serde_json::from_value(v.clone()).ok(),
+            Value::Object(_) => serde_json::from_value::<SlashCommand>(v.clone()).ok(),
             _ => None,
+        })
+        .map(|mut cmd| {
+            if !cmd.name.starts_with('/') {
+                cmd.name.insert(0, '/');
+            }
+            cmd
         })
         .collect()
 }
@@ -1267,15 +1278,16 @@ mod tests {
     fn initialize_command_list_is_extracted() {
         let payload = json!({
             "commands": [
-                {"name": "/compact", "description": "Compact the conversation", "argumentHint": "[instructions]"},
+                {"name": "compact", "description": "Compact the conversation", "argumentHint": "[instructions]"},
                 {"name": "/bare"},
-                "/plain-string"
+                "plain-string"
             ]
         });
         let cmds = commands_from_initialize(&payload);
         assert_eq!(cmds.len(), 3);
         assert_eq!(cmds[0].name, "/compact");
         assert_eq!(cmds[0].argument_hint.as_deref(), Some("[instructions]"));
+        assert_eq!(cmds[1].name, "/bare", "an existing slash is not doubled");
         assert_eq!(cmds[1].description, None);
         assert_eq!(cmds[2].name, "/plain-string");
         assert!(commands_from_initialize(&json!({})).is_empty());
