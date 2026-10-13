@@ -212,6 +212,11 @@ struct RunnerHandle {
     commands: Arc<RwLock<Vec<SlashCommand>>>,
     /// The runner's subagent list, shared so a view can read it.
     subagents: Arc<RwLock<Vec<Subagent>>>,
+    /// The runner's base status — what the transitions alone say, before an
+    /// open prompt covers it. The auto-resume census reads it: an agent out of
+    /// tokens under a prompt is stored as `awaiting_approval`, and must not
+    /// read as one that has got going again.
+    base_status: Arc<RwLock<Status>>,
     /// Which launch this handle belongs to. A runner only ever deregisters its
     /// own generation, so a stale task cannot evict a live one.
     generation: u64,
@@ -407,12 +412,12 @@ impl Supervisor {
             stalls.clear();
             return Vec::new();
         }
-        let (stalled, working) = self.stall_census().await;
+        let (stalled, working, held) = self.stall_census().await;
         // An agent that is no longer running cannot be resumed and is not
         // remembered; one that has been working long enough to have got
         // somewhere has ended its stall, and its next one starts with a fresh
-        // budget.
-        stalls.retain(|id, _| stalled.contains(id) || working.contains(id));
+        // budget. One held under a prompt is left exactly as it was.
+        stalls.retain(|id, _| stalled.contains(id) || working.contains(id) || held.contains(id));
         let recovered: Vec<String> = working
             .iter()
             .filter(|id| stalls.get_mut(*id).is_some_and(|s| s.working(now)))
@@ -476,28 +481,38 @@ impl Supervisor {
     /// Running in both cases: a record left at `rate_limited` by a server that
     /// died is the memory of an agent, and Resume is what brings those back
     /// (§10).
-    async fn stall_census(&self) -> (Vec<String>, Vec<String>) {
+    ///
+    /// A third list holds the ones out of tokens *under an open prompt*: stored
+    /// as `awaiting_approval`, since the prompt is what the operator has to
+    /// act on, but still out of tokens underneath. They are neither: not
+    /// nudged — typing at an agent waiting on an answer resumes nothing — and
+    /// not working, so their stall, its backoff and whether the watcher has
+    /// given up on them all survive until the prompt clears.
+    async fn stall_census(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
         let records = match self.db.run(|db| db.list_agents()).await {
             Ok(records) => records,
             Err(err) => {
                 tracing::warn!(?err, "could not read the agent list to auto-resume");
-                return (Vec::new(), Vec::new());
+                return (Vec::new(), Vec::new(), Vec::new());
             }
         };
         let runners = self.runners.read().await;
         let mut stalled = Vec::new();
         let mut working = Vec::new();
+        let mut held = Vec::new();
         for record in records {
-            if !runners.contains_key(&record.id) {
+            let Some(handle) = runners.get(&record.id) else {
                 continue;
-            }
+            };
             if record.status == Status::RateLimited {
                 stalled.push(record.id);
+            } else if *handle.base_status.read().await == Status::RateLimited {
+                held.push(record.id);
             } else {
                 working.push(record.id);
             }
         }
-        (stalled, working)
+        (stalled, working, held)
     }
 
     /// Type the prompt at one agent, and say — in the agent's own log, not only
@@ -960,6 +975,7 @@ impl Supervisor {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let commands = Arc::new(RwLock::new(Vec::new()));
         let subagents = Arc::new(RwLock::new(Vec::new()));
+        let shared_base = Arc::new(RwLock::new(Status::Starting));
 
         // Claim the registry slot before anything else happens. Checking
         // `is_running` and inserting separately would let two concurrent
@@ -977,6 +993,7 @@ impl Supervisor {
                     tx: cmd_tx,
                     commands: commands.clone(),
                     subagents: subagents.clone(),
+                    base_status: shared_base.clone(),
                     generation,
                 },
             );
@@ -1040,6 +1057,7 @@ impl Supervisor {
             cmd_closed: false,
             status: Status::Starting,
             base_status: Status::Starting,
+            shared_base,
             status_detail: None,
             cost_usd: record.cost_usd,
             pending: HashMap::new(),
@@ -1913,6 +1931,9 @@ struct Runner {
     /// to what lies beneath it — `Idle` after a turn that ended under the
     /// prompt, `RateLimited` after a limit — rather than to a guess.
     base_status: Status,
+    /// [`Runner::base_status`], shared with the [`RunnerHandle`] for the
+    /// auto-resume census.
+    shared_base: Arc<RwLock<Status>>,
     /// The live sub-label naming the current tool (§4). Held here so an
     /// unrelated status transition does not wipe it.
     status_detail: Option<String>,
@@ -2064,6 +2085,7 @@ impl Runner {
             Transition::PermissionRequested | Transition::PermissionResolved
         ) {
             self.base_status = applied;
+            *self.shared_base.write().await = applied;
         }
         // Whatever the transitions say, a prompt still outstanding means the
         // agent is awaiting approval and none means it is not (§5).
@@ -2662,6 +2684,7 @@ impl Runner {
         };
         let status = self.base_status.apply(transition).unwrap_or(fallback);
         self.base_status = status;
+        *self.shared_base.write().await = status;
         self.status = status;
         let code = info.code.map(i64::from);
         let stderr = self.last_stderr.clone();
@@ -2877,6 +2900,7 @@ mod tests {
                 cmd_closed: false,
                 status: Status::Starting,
                 base_status: Status::Starting,
+                shared_base: Arc::new(RwLock::new(Status::Starting)),
                 status_detail: None,
                 cost_usd: 0.0,
                 pending: HashMap::new(),
@@ -3222,6 +3246,7 @@ mod tests {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
                 subagents: Arc::new(RwLock::new(Vec::new())),
+                base_status: Arc::new(RwLock::new(Status::Idle)),
                 generation: 1,
             },
         );
@@ -3288,6 +3313,53 @@ mod tests {
         // gone by morning: the prompt is persisted as an ordinary user message,
         // which would otherwise read as the operator typing at 4am.
         assert_eq!(logged(&sup, "auto_resume").await, 1);
+    }
+
+    /// Out of tokens under an open prompt: stored as `awaiting_approval`, but
+    /// still out of tokens underneath. The watcher must neither type at it nor
+    /// count it as working — that would end the stall after `PROGRESS_MS`, and
+    /// the prompt clearing would start a fresh one with a fresh budget, after
+    /// the watcher had already given up.
+    #[tokio::test]
+    async fn a_limit_under_an_open_prompt_keeps_its_stall() {
+        let (sup, mut rx) = one_agent(Status::AwaitingApproval).await;
+        let handle_base = sup.runners.read().await["agent-limited"]
+            .base_status
+            .clone();
+        *handle_base.write().await = Status::RateLimited;
+        let now = now_ms();
+        let mut stalls = HashMap::new();
+        let mut spent = resume::Stall::new(now - 3_600_000);
+        spent.nudges = 7;
+        spent.last_ms = now - 60_000;
+        stalls.insert("agent-limited".to_string(), spent);
+        *sup.rate_limit.write().await = Some((now, rejection(now / 1_000 - 60)));
+
+        for later in [
+            now,
+            now + resume::PROGRESS_MS + 1,
+            now + 2 * resume::PROGRESS_MS,
+        ] {
+            assert!(sup.auto_resume_pass(&mut stalls, later).await.is_empty());
+            assert_eq!(typed(&mut rx), None, "nothing is typed at a prompt");
+        }
+        assert_eq!(
+            stalls.get("agent-limited"),
+            Some(&spent),
+            "the stall and its spent budget are kept as they were"
+        );
+
+        // The prompt clears and the limit shows again: the same stall carries
+        // on, with the budget it had.
+        sup.db
+            .run(|db| db.set_status("agent-limited", Status::RateLimited, None, None, None))
+            .await
+            .expect("store");
+        sup.auto_resume_pass(&mut stalls, now + 2 * resume::PROGRESS_MS + 1)
+            .await;
+        let stall = stalls.get("agent-limited").expect("still stalled");
+        assert_eq!(stall.since_ms, spent.since_ms, "not a fresh stall");
+        assert!(stall.nudges >= 7, "not a fresh budget");
     }
 
     /// Only the agents the limit stopped, and only the ones still there. An
@@ -3755,6 +3827,7 @@ mod tests {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
                 subagents: Arc::new(RwLock::new(Vec::new())),
+                base_status: Arc::new(RwLock::new(Status::Idle)),
                 generation: 2,
             },
         );
@@ -4048,6 +4121,7 @@ mod tests {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
                 subagents: Arc::new(RwLock::new(Vec::new())),
+                base_status: Arc::new(RwLock::new(Status::Idle)),
                 generation: 7,
             },
         );
@@ -4413,6 +4487,7 @@ mod tests {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
                 subagents: Arc::new(RwLock::new(list.clone())),
+                base_status: Arc::new(RwLock::new(Status::Working)),
                 generation: 1,
             },
         );
@@ -4553,6 +4628,7 @@ mod tests {
                 tx,
                 commands: Arc::new(RwLock::new(Vec::new())),
                 subagents: Arc::new(RwLock::new(Vec::new())),
+                base_status: Arc::new(RwLock::new(Status::Idle)),
                 generation: 1,
             },
         );
