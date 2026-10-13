@@ -542,14 +542,28 @@ function fromLine(request) {
 /// `checkApprovalMismatch` goes and fetches.
 function renderWaitingNote() {
   const note = $('approvals-empty');
-  const awaiting = !!state.agent && state.agent.status === 'awaiting_approval';
-  if (!awaiting || state.pending.size > 0) {
+  if (!awaitingLiveApproval() || state.pending.size > 0) {
     note.textContent = 'Nothing waiting.';
   } else if (answeredRecently()) {
     note.textContent = 'Answer sent — waiting for the agent to take it.';
   } else {
     note.textContent = 'The agent is waiting on an approval this page has not received yet — fetching it…';
   }
+}
+
+/// Whether the agent says it is awaiting approval *and* has a process that
+/// could be asking. A record left at `awaiting_approval` with nothing running —
+/// a server that died mid-prompt, say — has no prompt anyone can answer: the
+/// server shows none, so the empty queue is the truth, not a missed prompt.
+function awaitingLiveApproval() {
+  return !!state.agent && state.agent.running && state.agent.status === 'awaiting_approval';
+}
+
+/// Whether a status means a process is behind it. A live `status` message
+/// carries no `running` flag of its own, but only a terminal status is sent
+/// for an agent with no process.
+function liveStatus(status) {
+  return status !== 'stopped' && status !== 'failed';
 }
 
 /// How long an answer sent from this page is assumed to be on its way. Its
@@ -605,7 +619,7 @@ function scheduleMismatchCheck(delay) {
 /// is still on its way, which would explain it — the page missed one (a live
 /// update lost while the browser fell behind, say), so fetch the queue.
 function checkApprovalMismatch() {
-  if (!state.agent || state.agent.status !== 'awaiting_approval') return;
+  if (!awaitingLiveApproval()) return;
   if (state.pending.size > 0) return;
   if (answeredRecently()) {
     // Held off only by an answer still on its way. If it is never
@@ -647,6 +661,7 @@ async function refetchPending() {
     // put right as well.
     Object.assign(state.agent, {
       status: fresh.status,
+      running: fresh.running,
       status_detail: fresh.status_detail,
       subagents: fresh.subagents || [],
     });
@@ -1526,6 +1541,7 @@ async function main() {
     trackSnapshot(state.agent.id, fresh.status);
     Object.assign(state.agent, {
       status: fresh.status,
+      running: fresh.running,
       status_detail: fresh.status_detail,
       cost_usd: fresh.cost_usd,
       last_stderr: fresh.last_stderr,
@@ -1586,6 +1602,7 @@ async function main() {
       trackStatus(msg.agent_id, state.agent.status, msg.status);
       Object.assign(state.agent, {
         status: msg.status,
+        running: liveStatus(msg.status),
         status_detail: msg.status_detail,
         cost_usd: msg.cost_usd,
         last_stderr: msg.last_stderr,

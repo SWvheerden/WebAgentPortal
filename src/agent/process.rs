@@ -142,6 +142,10 @@ pub struct Dispatcher {
     /// of one of these only says it was launched; a synchronous subagent's
     /// says it is done, and is the only completion line it gets.
     backgrounded_subagents: HashSet<String>,
+    /// Listed subagents whose `task_started` said outright that they are
+    /// synchronous. Only for these is the `Agent` tool result their end; for
+    /// any other it may be the "launched" note of a backgrounded one.
+    synchronous_subagents: HashSet<String>,
     /// Listed subagents known to be synchronous and started by the agent's own
     /// turn — not by another subagent. Only these are bound to that turn, so
     /// only these may be closed when it ends.
@@ -234,6 +238,9 @@ impl Dispatcher {
                 // Top level: spawned by the agent itself. A subagent another
                 // subagent started runs on that one's clock, not the turn's.
                 let top_level = sys.spawn_depth.is_none_or(|depth| depth <= 1);
+                if sys.is_backgrounded == Some(false) {
+                    self.synchronous_subagents.insert(id.clone());
+                }
                 if sys.is_backgrounded == Some(false) && top_level {
                     self.top_level_synchronous.insert(id.clone());
                 }
@@ -342,6 +349,7 @@ impl Dispatcher {
             let dropped = self.subagents.remove(drop_at);
             self.backgrounded_subagents.remove(&dropped.task_id);
             self.top_level_synchronous.remove(&dropped.task_id);
+            self.synchronous_subagents.remove(&dropped.task_id);
             self.closed_by_backstop.remove(&dropped.task_id);
         }
         self.subagents != before
@@ -349,9 +357,10 @@ impl Dispatcher {
 
     /// The `Agent` tool call `tool_use_id` returned. For a synchronous
     /// subagent that is its end — it has no completion line of its own — so it
-    /// is marked done, or failed if the result was an error. A backgrounded
-    /// one's result arrives as it starts and is left alone. Returns whether the
-    /// list changed.
+    /// is marked done, or failed if the result was an error. Only one whose
+    /// start said `is_backgrounded: false`: a backgrounded one's result arrives
+    /// as it starts, and one of unknown kind might be that. Returns whether
+    /// the list changed.
     fn close_synchronous_subagent(&mut self, tool_use_id: &str, is_error: bool) -> bool {
         let mut changed = false;
         for agent in self.subagents.iter_mut() {
@@ -364,7 +373,8 @@ impl Dispatcher {
             if agent.state != "running" && !backstop {
                 continue;
             }
-            if self.backgrounded_subagents.contains(&agent.task_id)
+            if !self.synchronous_subagents.contains(&agent.task_id)
+                || self.backgrounded_subagents.contains(&agent.task_id)
                 || self.background_tasks.contains_key(&agent.task_id)
             {
                 continue;
@@ -2506,6 +2516,21 @@ mod tests {
         ))
         .expect("a list");
         assert_eq!(ended[0].state, "failed");
+    }
+
+    /// A subagent whose start did not say which kind it is may be a
+    /// backgrounded one whose "launched" result beat the live list: its tool
+    /// result must not end it.
+    #[test]
+    fn a_tool_result_does_not_end_a_subagent_of_unknown_kind() {
+        let mut d = Dispatcher::new();
+        d.on_stdout(
+            r#"{"type":"system","subtype":"task_started","task_id":"u1","tool_use_id":"toolu_u1","description":"Unknown","subagent_type":"Explore","session_id":"s1"}"#,
+        );
+        let launched = d.on_stdout(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_u1","content":"Async agent launched successfully"}]}}"#,
+        );
+        assert_eq!(last_list(&launched), None, "{launched:?}");
     }
 
     /// The backstop: a synchronous subagent whose result never matched is
