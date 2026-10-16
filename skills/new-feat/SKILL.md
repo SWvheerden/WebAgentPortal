@@ -133,6 +133,15 @@ Search the existing cocoindex-code:ccc index to find files, callers, and related
 Write boring code: plain loops, built-in functions, and concrete types, so a reader follows
 it top to bottom without chasing helper classes, factories, or metaprogramming.
 
+Write the least code that does the TASK. Reuse the helpers and patterns already in the
+codebase rather than adding new ones. Don't add options, abstractions, or error handling
+for cases that don't exist yet, and don't refactor, rename, or tidy code the TASK doesn't
+touch.
+
+Keep comments short — a line or two, only where the code doesn't explain itself. No long
+comment blocks, and no code history: don't describe what changed, what used to be there,
+or which review round prompted it — that belongs in the commit message.
+
 ** Task
 Implement the TASK at hand:
 $ARGUMENTS
