@@ -294,26 +294,160 @@ label { display: block; font-size: calc(11rem / 13); color: var(--dim); margin-b
 .subagent.s-awaiting_approval .name { color: var(--warn); }
 .approval .from { color: var(--dim); font-size: calc(11rem / 13); margin-bottom: 4px; }
 
-/* transcript */
+/* transcript
+
+   Set the way the Claude desktop app sets a conversation: Claude's replies as
+   rendered markdown in a serif at reading size with no speaker label, your
+   messages in a sans-serif bubble on the right, and the tool traffic between
+   them as quiet one-line rows that open on a click. Code — fenced blocks,
+   inline spans, tool input and output — stays monospace. */
 .transcript {
+  --serif: "Anthropic Serif", ui-serif, Georgia, Cambria, "Times New Roman", serif;
+  --sans: "Anthropic Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   background: #0a0e14;
   border: 1px solid var(--line);
   border-radius: 6px;
-  padding: 10px 12px;
+  padding: 16px 20px;
   height: 62vh;
   overflow-y: auto;
-  white-space: pre-wrap;
   word-break: break-word;
 }
-.ev { margin-bottom: 8px; }
+.ev { margin-bottom: 8px; white-space: pre-wrap; }
 .ev .who { color: var(--dim); font-size: calc(10rem / 13); text-transform: uppercase; letter-spacing: .06em; }
-.ev.user .body { color: var(--accent-2); }
-.ev.assistant .body { color: var(--fg); }
 .ev.stderr .body, .ev.error .body { color: var(--err); }
 .ev.system .body { color: var(--dim); font-size: calc(11rem / 13); }
-.ev.result .body { color: var(--accent); font-size: calc(11rem / 13); }
+.ev.result .body { color: var(--dim); font-size: calc(11rem / 13); }
+
+.ev.user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  margin: 20px 0 16px;
+}
+.ev.user .body {
+  max-width: min(85%, 720px);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 8px 14px;
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: calc(15rem / 13);
+  line-height: 1.5;
+}
+.ev.user .attachments { justify-content: flex-end; }
+
+.ev.assistant { white-space: normal; margin-bottom: 14px; }
+.md {
+  font-family: var(--serif);
+  font-size: calc(16rem / 13);
+  line-height: 1.65;
+  color: #ece9e1;
+}
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 .75em; }
+.md h3, .md h4, .md h5, .md h6 {
+  font-family: var(--sans);
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 1.2em 0 .5em;
+  color: var(--fg);
+}
+.md .md-h1 { font-size: 1.35em; }
+.md .md-h2 { font-size: 1.2em; }
+.md .md-h3 { font-size: 1.05em; }
+.md .md-h4, .md .md-h5, .md .md-h6 { font-size: 1em; }
+.md ul, .md ol { margin: 0 0 .75em; padding-left: 1.6em; }
+.md li { margin: .25em 0; }
+.md li > p { margin: 0 0 .35em; }
+.md li > p:last-child { margin-bottom: 0; }
+.md li > ul, .md li > ol { margin-bottom: 0; }
+.md strong { font-weight: 600; color: var(--fg); }
+.md a { color: var(--accent-2); text-decoration: underline; text-underline-offset: 2px; }
+.md hr { border: none; border-top: 1px solid var(--line); margin: 1.2em 0; }
+.md blockquote { margin: 0 0 .75em; padding-left: 1em; border-left: 3px solid var(--line); color: var(--dim); }
+.md code {
+  font-family: var(--mono);
+  font-size: .82em;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: .05em .35em;
+  color: #f0a58f;
+}
+.md .md-code {
+  margin: 0 0 .9em;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.md .md-lang {
+  font-family: var(--sans);
+  font-size: calc(11rem / 13);
+  color: var(--dim);
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--line);
+}
+/* A code block is the one thing in a reply that keeps its columns, so it
+   scrolls sideways rather than wrapping. The model's prose is not attacker-
+   proof either, but here the eye is reading code, not vetting a command —
+   that rule is for tool input and approvals, below. */
+.md .md-code pre {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  white-space: pre;
+  font-size: calc(12rem / 13);
+  line-height: 1.5;
+}
+.md .md-code code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--fg);
+  font-size: 1em;
+}
+.md .md-table { overflow-x: auto; margin: 0 0 .9em; }
+.md table { border-collapse: collapse; font-family: var(--sans); font-size: .88em; }
+.md th, .md td { border: 1px solid var(--line); padding: 5px 10px; text-align: left; vertical-align: top; }
+.md th { background: var(--panel); font-weight: 600; }
+.md .align-center { text-align: center; }
+.md .align-right { text-align: right; }
+
+/* Tool calls: a muted line each — the tool, then what it was pointed at — and
+   the input or output behind it. */
+.ev.tool { margin-bottom: 4px; }
+.ev.tool + .ev.assistant, .ev.assistant + .ev.tool { margin-top: 12px; }
 details.tool { border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; background: var(--panel); }
 details.tool summary { cursor: pointer; color: var(--warn); }
+.ev.tool details.tool {
+  border: none;
+  background: none;
+  padding: 0;
+}
+.ev.tool details.tool summary {
+  color: var(--dim);
+  font-size: calc(12rem / 13);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  list-style: none;
+}
+.ev.tool details.tool summary::-webkit-details-marker { display: none; }
+.ev.tool details.tool summary::before { content: "▸ "; }
+.ev.tool details.tool[open] summary::before { content: "▾ "; }
+.ev.tool details.tool summary:hover { color: var(--fg); }
+.ev.tool details.tool summary.failed { color: var(--err); }
+.ev.tool .tool-name { color: var(--fg); font-weight: 600; }
+.ev.tool .tool-gist { margin-left: 8px; }
+.ev.tool details.tool pre {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
 /* Attacker-influenced text. It must wrap: a `pre` that scrolls horizontally
    hides everything past the right edge, and macOS overlay scrollbars give no
    hint that there is more — which is how `npm test<200 spaces>; curl … | sh`
@@ -328,7 +462,7 @@ details.tool pre, .approval pre {
   overflow-y: auto;
 }
 details.tool pre { color: var(--dim); }
-.partial { color: var(--dim); font-style: italic; }
+.partial .md { opacity: .85; }
 
 /* approvals */
 .approval { border: 1px solid var(--warn); border-radius: 6px; padding: 10px; margin-bottom: 10px; background: #1c1a10; }

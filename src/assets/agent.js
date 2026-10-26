@@ -1,6 +1,7 @@
 // Agent detail: transcript, approvals, composer, slash commands.
 import { announceAttention, releaseAttention, api, applyTextSize, el, needToken, statusEl, fmtCost, setAttention, setTitle, Socket, takeSpawnWarning, toast, token, trackStatus, trackSnapshot } from '/assets/common.js';
 import { Transcript, nextWalkCursor } from '/assets/transcript.js';
+import { parse as parseMarkdown } from '/assets/markdown.js';
 import { newKeys } from '/assets/attention.js';
 import { awaitingConfirmation, composerState, frameTooLarge, newClientId, splitCancelled, confirmSent, humanSize, markSending, mergePending, pastedFiles, restoreDraft, settleSend, uploadsUrl } from '/assets/uploads.js';
 import { clampSideWidth, keyedSideWidth, loadSideWidth, saveSideWidth, sideWidthBounds } from '/assets/splitter.js';
@@ -24,6 +25,7 @@ const state = {
   /// from a prompt the page never received.
   answered: new Map(),
   partial: null,
+  partialText: '',
   queued: [],
   acIndex: 0,
   acItems: [],
@@ -95,6 +97,63 @@ function pretty(value, limit = MAX_SHOWN) {
   return `${text.slice(0, limit)}\n… ${text.length - limit} more characters not shown`;
 }
 
+// Markdown as the Claude apps show it. The tree comes from markdown.js and
+// every node is built here through `el()`, so the model's text only ever lands
+// in `textContent`: there is no HTML to sanitise.
+function mdInline(nodes) {
+  return nodes.map((n) => {
+    switch (n.t) {
+      case 'text': return document.createTextNode(n.v);
+      case 'br': return el('br');
+      case 'code': return el('code', { text: n.v });
+      case 'strong': return el('strong', {}, mdInline(n.c));
+      case 'em': return el('em', {}, mdInline(n.c));
+      case 'del': return el('del', {}, mdInline(n.c));
+      case 'a': return el('a', { href: n.href, target: '_blank', rel: 'noopener noreferrer' }, mdInline(n.c));
+      default: return null;
+    }
+  });
+}
+
+function mdBlocks(nodes) {
+  return nodes.map((n) => {
+    switch (n.t) {
+      case 'p': return el('p', {}, mdInline(n.c));
+      case 'h': return el(`h${Math.min(n.level + 2, 6)}`, { class: `md-h${n.level}` }, mdInline(n.c));
+      case 'hr': return el('hr');
+      case 'quote': return el('blockquote', {}, mdBlocks(n.c));
+      case 'ul': return el('ul', {}, n.items.map((item) => el('li', {}, mdBlocks(item))));
+      case 'ol': return el('ol', { start: n.start !== 1 ? n.start : null }, n.items.map((item) => el('li', {}, mdBlocks(item))));
+      case 'code': return el('div', { class: 'md-code' }, [
+        n.lang ? el('div', { class: 'md-lang', text: n.lang }) : null,
+        el('pre', {}, [el('code', { text: n.text })]),
+      ]);
+      case 'table': {
+        const cell = (tag, c, k) => el(tag, { class: n.align[k] ? `align-${n.align[k]}` : null }, mdInline(c));
+        return el('div', { class: 'md-table' }, [el('table', {}, [
+          el('thead', {}, [el('tr', {}, n.head.map((c, k) => cell('th', c, k)))]),
+          el('tbody', {}, n.rows.map((row) => el('tr', {}, row.map((c, k) => cell('td', c, k))))),
+        ])]);
+      }
+      default: return null;
+    }
+  });
+}
+
+function markdown(text) {
+  return el('div', { class: 'body md' }, mdBlocks(parseMarkdown(text)));
+}
+
+// The one-line gist of a tool call for its collapsed row — the command, the
+// file, the pattern — the way the Claude apps label one.
+function toolGist(input) {
+  if (!input || typeof input !== 'object') return '';
+  const pick = input.description || input.command || input.file_path || input.notebook_path
+    || input.path || input.pattern || input.url || input.query || input.prompt || input.skill || '';
+  const line = String(pick).split('\n')[0];
+  return line.length > 120 ? `${line.slice(0, 120)}…` : line;
+}
+
 function renderEvent(event) {
   const p = event.payload || {};
   switch (event.kind) {
@@ -105,7 +164,6 @@ function renderEvent(event) {
       const attachments = Array.isArray(p.attachments) ? p.attachments : [];
       if (!text && !attachments.length) return null;
       return el('div', { class: 'ev user' }, [
-        el('div', { class: 'who', text: 'you' }),
         text ? el('div', { class: 'body', text }) : null,
         attachments.length
           ? el('div', { class: 'attachments' }, attachments.map((a) => el('button', {
@@ -120,15 +178,15 @@ function renderEvent(event) {
     case 'assistant': {
       const text = textOf(p.message);
       if (!text.trim() && toolBlocks(p.message).length) return null; // rendered as tool_use
-      return el('div', { class: 'ev assistant' }, [
-        el('div', { class: 'who', text: 'claude' }),
-        el('div', { class: 'body', text }),
-      ]);
+      return el('div', { class: 'ev assistant' }, [markdown(text)]);
     }
     case 'tool_use':
       return el('div', { class: 'ev tool' }, [
         el('details', { class: 'tool' }, [
-          el('summary', { text: `⚒ ${p.name || 'tool'}` }),
+          el('summary', {}, [
+            el('span', { class: 'tool-name', text: p.name || 'tool' }),
+            toolGist(p.input) ? el('span', { class: 'tool-gist', text: toolGist(p.input) }) : null,
+          ]),
           el('pre', { text: pretty(p.input) }),
         ]),
       ]);
@@ -140,7 +198,7 @@ function renderEvent(event) {
       const failed = results.some((r) => r.is_error);
       return el('div', { class: 'ev tool' }, [
         el('details', { class: 'tool' }, [
-          el('summary', { text: failed ? '↩ tool result (error)' : '↩ tool result' }),
+          el('summary', { class: failed ? 'failed' : null, text: failed ? 'Result (error)' : 'Result' }),
           el('pre', { text: body.slice(0, 20000) }),
         ]),
       ]);
@@ -357,14 +415,14 @@ function onPartial(msg) {
   const text = delta && (delta.text || delta.partial_json);
   if (!text) return;
   if (!state.partial) {
-    state.partial = el('div', { class: 'ev assistant partial' }, [
-      el('div', { class: 'who', text: 'claude' }),
-      el('div', { class: 'body', text: '' }),
-    ]);
+    state.partial = el('div', { class: 'ev assistant partial' }, [markdown('')]);
+    state.partialText = '';
     $('transcript').append(state.partial);
   }
-  const body = state.partial.querySelector('.body');
-  body.textContent += text;
+  // Re-rendered whole on every delta, so a list or a code fence takes shape
+  // as it is typed rather than jumping into place at the end.
+  state.partialText += text;
+  state.partial.replaceChildren(markdown(state.partialText));
   if (atBottom()) $('transcript').scrollTop = $('transcript').scrollHeight;
 }
 
@@ -372,6 +430,7 @@ function clearPartial() {
   if (state.partial) {
     state.partial.remove();
     state.partial = null;
+    state.partialText = '';
   }
 }
 

@@ -1023,9 +1023,16 @@ ahead of a gap.
 
 ### Frontend
 **No build step.** Hand-written HTML/CSS/vanilla ES modules embedded via `rust-embed`.
-`cargo build` yields one self-contained binary; no npm, no bundler. Terminal-styled
-monospace transcript pane — structured events underneath (tool calls as collapsible
-blocks), terminal look on top. Both pages carry a turtle favicon — an inline SVG, drawn for
+`cargo build` yields one self-contained binary; no npm, no bundler. The chrome around it is
+terminal-styled; the transcript is set the way the Claude desktop app sets a conversation —
+Claude's replies as rendered markdown in a serif at reading size, the operator's messages in
+a sans-serif bubble on the right, tool calls as muted one-line rows (the tool, then the
+command or file it was pointed at) that open to show the input or output. Code stays
+monospace. The markdown is parsed by `assets/markdown.js` into a plain tree, never HTML, and
+`agent.js` builds every node through `el()` with `textContent`, so there is no sanitiser to
+own: raw HTML in a reply is shown as text, and a link survives only with an http(s) or
+mailto target. The parser is DOM-free and driven under node by a test. (Notes stay plain
+text — see below.) Both pages carry a turtle favicon — an inline SVG, drawn for
 16px rather than shrunk to it, so a tab is identifiable at a glance.
 
 ### Fitting the screen

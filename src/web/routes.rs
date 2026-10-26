@@ -4601,6 +4601,66 @@ console.log("ok");
         );
     }
 
+    /// The transcript renders the model's markdown, and the model's text is
+    /// attacker-influenced: the parser must hand back text, never markup, and
+    /// must drop a link whose target is not http(s) or mailto. Driven through
+    /// `node` like the walk above; skipped when it is not installed.
+    #[test]
+    fn markdown_parses_to_text_and_drops_unsafe_links() {
+        let module =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/assets/markdown.js");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = dir.path().join("md.mjs");
+        let source = format!(
+            r##"
+import {{ parse }} from "{module}";
+
+const assert = (cond, msg) => {{ if (!cond) {{ console.error("FAIL: " + msg); process.exit(1); }} }};
+const json = (v) => JSON.stringify(v);
+
+const doc = parse("# Plan\n\nSome **bold**, *em*, `code` and snake_case_name.\nNext.\n\n- one\n- two\n  - nested\n\n```rust\nfn main() {{}}\n```\n\n| a | b |\n|---|--:|\n| 1 | `x|y` |");
+assert(json(doc.map((b) => b.t)) === json(["h", "p", "ul", "code", "table"]), "blocks: " + json(doc));
+assert(doc[0].level === 1, "heading level");
+const para = doc[1].c;
+assert(para.some((n) => n.t === "strong") && para.some((n) => n.t === "em") && para.some((n) => n.t === "code"), "inline marks");
+assert(para.some((n) => n.t === "text" && n.v.includes("snake_case_name")), "intraword underscores are not emphasis");
+assert(para.some((n) => n.t === "br"), "a single newline is a line break");
+assert(doc[2].items[1].some((b) => b.t === "ul"), "nested list");
+assert(doc[3].lang === "rust" && doc[3].text === "fn main() {{}}", "fenced code");
+assert(doc[4].align[1] === "right" && doc[4].rows[0][1][0].v === "x|y", "table");
+
+// Raw HTML is text, and only http(s)/mailto links survive.
+const hostile = parse("<img src=x onerror=alert(1)> [a](javascript:alert(1)) [b](https://ok.example/x) [c](data:text/html,x)");
+const nodes = hostile[0].c;
+const links = nodes.filter((n) => n.t === "a");
+assert(links.length === 1 && links[0].href === "https://ok.example/x", "links: " + json(links));
+assert(nodes.filter((n) => n.t === "text").map((n) => n.v).join("").includes("<img src=x onerror=alert(1)>"), "html stays text");
+const kinds = new Set();
+const walk = (n) => {{ if (Array.isArray(n)) n.forEach(walk); else if (n && typeof n === "object") {{ if (n.t) kinds.add(n.t); Object.values(n).forEach(walk); }} }};
+walk(hostile);
+assert([...kinds].every((k) => ["p", "text", "a"].includes(k)), "unexpected nodes: " + [...kinds]);
+
+// Unclosed marks and fences do not swallow or lose text.
+assert(json(parse("**open")) === json([{{ t: "p", c: [{{ t: "text", v: "**open" }}] }}]), "unclosed strong");
+assert(parse("```\nstill typing").at(0).text === "still typing", "unclosed fence");
+console.log("ok");
+"##,
+            module = module.display()
+        );
+        std::fs::write(&driver, source).expect("write driver");
+
+        let output = match std::process::Command::new("node").arg(&driver).output() {
+            Ok(output) => output,
+            Err(_) => return,
+        };
+        assert!(
+            output.status.success(),
+            "markdown parse failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Drive the real `splitter.js` — the divider's bounds, keys and storage,
     /// kept free of the DOM for exactly this — and hold the stylesheet's
     /// fallback and backstop to the numbers it uses.
