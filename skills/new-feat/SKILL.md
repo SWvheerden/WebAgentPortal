@@ -41,6 +41,13 @@ agent types. Spawn each as a `general-purpose` agent with the model the user cho
   same agent via `SendMessage`, so it keeps its context of the change it is making.
 - **reviewer** — spawn a fresh one for every review round, so it reads the code cold.
 
+**Free disk while waiting**: in a Rust repo checked out as a git worktree (`git rev-parse
+--git-dir` differs from `git rev-parse --git-common-dir`), each time `coder` has reported
+back and you are waiting on a reviewer or `security-analysis`, delete the worktree's `target/`
+folder (`rm -rf <worktree-root>/target`). Only delete a `target/` inside this worktree —
+never one in the main checkout or a shared `CARGO_TARGET_DIR`. Skip it while `coder` is still
+working.
+
 **Cycle cap**: if a loop in Step 3 or Step 5 runs 5 cycles without coming back clean, stop
 and ask the user how to proceed, listing the findings still open.
 
