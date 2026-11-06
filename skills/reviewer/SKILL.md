@@ -22,6 +22,7 @@ git history exactly as you found them. Fixing is a separate step the user invoke
 ## Contents
 
 - [Subagents](#subagents)
+- [Called from another skill](#called-from-another-skill)
 - [Step 0 — Settle choices, scope, and index before spawning anything](#step-0--settle-choices-scope-and-index-before-spawning-anything)
   - [0a — Ask the user](#0a--ask-the-user)
   - [0b — Resolve the scope](#0b--resolve-the-scope)
@@ -60,6 +61,22 @@ Question (where the intent can be read two ways and the code commits to one):
 ```
 
 Paste that block into each reviewer prompt where it says `<finding format>`.
+
+## Called from another skill
+
+Another skill (such as `new-feat` or `pr-reviewer`) may run this one and supply some inputs.
+Use each supplied input as given and skip the part of Step 0 that would set it:
+
+- **Model** → `$REVIEWER_MODEL`; skip 0a.
+- **Scope** — `$WORKDIR`, plus `$BASE` and whether to include uncommitted work, or the paths
+  → skip 0b's classification and questions. Still build `$SCOPE`, set `$HAS_RUST`, and run
+  the empty-scope check.
+- **Spec** → `$SPEC`, used verbatim.
+- **Preflight done**, with `$UNAVAILABLE` → skip 0c.
+- **Index done** → skip 0d.
+
+Then run Steps 1–3 as written. The Step 3 report goes back to the calling skill, which
+decides what to do with it. Never remove a worktree the caller created.
 
 ## Step 0 — Settle choices, scope, and index before spawning anything
 
@@ -301,5 +318,5 @@ Tell the user:
 - Dropped findings worth a second look, and everything in `$UNAVAILABLE`.
 - Which reviewers ran, and `$REVIEWER_MODEL`.
 
-If you created a worktree in Step 0b, remove it with `git worktree remove --force <path>`
+If you created a worktree yourself in Step 0b, remove it with `git worktree remove --force <path>`
 once the report is written.

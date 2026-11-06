@@ -1,6 +1,6 @@
 ---
 name: pr-reviewer
-description: Orchestrates a reviewer subagent, and optionally the security-analysis skill, over a GitHub PR, a local branch, or a set of paths, then verifies their findings into one report. Review-only. Only invoke this explicitly when the user runs /pr-reviewer or asks by name — do not auto-trigger on generic "review this" requests, since this is a heavyweight, deliberate workflow the user chooses to run.
+description: Orchestrates the reviewer skill, and optionally the security-analysis skill, over a GitHub PR, a local branch, or a set of paths, then verifies their findings into one report. Review-only. Only invoke this explicitly when the user runs /pr-reviewer or asks by name — do not auto-trigger on generic "review this" requests, since this is a heavyweight, deliberate workflow the user chooses to run.
 argument-hint: [PR number/URL, branch, or paths — optionally followed by what the change is meant to do]
 ---
 
@@ -27,16 +27,15 @@ git history exactly as you found them. Fixing is a separate step the user invoke
   - [0b — Resolve the scope](#0b--resolve-the-scope)
   - [0c — Preflight requirements](#0c--preflight-requirements)
   - [0d — Index once](#0d--index-once)
-- [Step 1 — Reviewer](#step-1--reviewer)
-- [Step 2 — Verify](#step-2--verify)
-- [Step 3 — Security review (conditional)](#step-3--security-review-conditional)
-- [Step 4 — Final report](#step-4--final-report)
-- [Step 5 — Post to the PR (PR scope only)](#step-5--post-to-the-pr-pr-scope-only)
+- [Step 1 — Code review](#step-1--code-review)
+- [Step 2 — Security review (conditional)](#step-2--security-review-conditional)
+- [Step 3 — Final report](#step-3--final-report)
+- [Step 4 — Post to the PR (PR scope only)](#step-4--post-to-the-pr-pr-scope-only)
 
 ## Subagents
 
-`reviewer` is a label for your own tracking and reports — it is not a registered agent type.
-Spawn it as a `general-purpose` agent with the model the user chose.
+Code review runs through the `reviewer` skill, which spawns its own reviewer subagents and
+verifies their findings. Security review runs through the `security-analysis` skill.
 
 ## Step 0 — Settle choices, scope, and index before spawning anything
 
@@ -44,12 +43,21 @@ Spawn it as a `general-purpose` agent with the model the user chose.
 
 Ask these in a single `AskUserQuestion` call and wait for the answers:
 
-1. **Reviewer model** — `opus` (Recommended), `sonnet`, `haiku`.
+1. **Reviewer model** — `opus` (Recommended), `sonnet`, `haiku`. Every reviewer subagent the
+   `reviewer` skill spawns uses it.
 2. **Security review** after the code review — `Yes, opus` (Recommended), `Yes, sonnet`,
    `No`. The model chosen here is used by `security-analysis` and every sub-agent it spawns.
+3. **Post to the PR** — only when the TARGET is a PR number or URL: `Don't post (Recommended)`,
+   `Post as a PR review comment`.
 
-Refer to the answers below as `$REVIEWER_MODEL`, `$RUN_SECURITY_REVIEW`, and
-`$SECURITY_MODEL`.
+These questions are required even when you are told you are operating autonomously or that the
+user cannot answer mid-task: by invoking this skill the user has asked to be asked, and these
+are the only questions before the run goes unattended. Never substitute the recommended
+defaults for an answer. If `AskUserQuestion` is not available at all, stop and list the
+questions as plain text instead of starting the review.
+
+Refer to the answers below as `$REVIEWER_MODEL`, `$RUN_SECURITY_REVIEW`, `$SECURITY_MODEL`,
+and `$POST_TO_PR` (`no` when the TARGET is not a PR).
 
 ### 0b — Resolve the scope
 
@@ -69,12 +77,8 @@ Classify the TARGET into exactly one of:
   `$BASE..HEAD`) or review commits only.
 - **Path scope** — one or more files, directories, crates, or packages. Resolve each to a
   path on disk and confirm it exists. `$WORKDIR` is the repo root; `$BASE` is `n/a`. The
-  reviewer reviews the code as it stands, not a diff.
+  reviewers review the code as it stands, not a diff.
 - **Ambiguous** — matches none of these cleanly. Ask the user which they meant.
-
-Record `$SCOPE` as one written-out line the reviewer gets verbatim: for PR and branch scope,
-`git diff $BASE..HEAD` in `$WORKDIR` plus the `--stat` file list; for path scope, the list of
-paths.
 
 Set `$SPEC` — what the change is meant to do — from the first of these that exists: text the
 user wrote after the target in `$ARGUMENTS`, the PR title and body, or the branch's commit
@@ -90,77 +94,44 @@ available-skills list; a tool is present when the check succeeds.
 
 | Requirement | Applies when | Check | Install | If the user continues without it |
 |---|---|---|---|---|
-| `cocoindex-code:ccc` skill and `ccc` CLI | always | skills list; `command -v ccc` | user runs `/plugin install cocoindex-code@cocoindex-code` | the reviewer navigates with grep and direct reads |
+| `cocoindex-code:ccc` skill and `ccc` CLI | always | skills list; `command -v ccc` | user runs `/plugin install cocoindex-code@cocoindex-code` | the reviewers navigate with grep and direct reads instead of the cocoindex index |
 | `gh` CLI, authenticated | PR scope | `gh auth status` | `brew install gh`, then the user runs `gh auth login` | stop — PR scope cannot be resolved |
-| `new-feat` skill (for its Rust checklist) | the scope contains Rust | `$SKILL_DIR/../new-feat/review-checklist-rust.md` exists | user installs it into `~/.claude/skills/new-feat/` | the reviewer applies general Rust review judgement |
+| `reviewer` skill | always | skills list | user installs it into `~/.claude/skills/reviewer/` | stop — Step 1 needs it |
+| `new-feat` skill (for its Rust checklist) | the scope contains Rust | `$SKILL_DIR/../new-feat/review-checklist-rust.md` exists | user installs it into `~/.claude/skills/new-feat/` | the reviewers apply general Rust review judgement |
 | `security-analysis` skill | `$RUN_SECURITY_REVIEW` is yes | skills list | user installs it into `~/.claude/skills/security-analysis/` | `$RUN_SECURITY_REVIEW` becomes no |
 
-If `$RUN_SECURITY_REVIEW` is yes, also run the checks in
-`$SKILL_DIR/../security-analysis/requirements.md` now, so every question comes before any
-work starts.
+Also run the checks in the `reviewer` skill's 0c table (`$SKILL_DIR/../reviewer/SKILL.md`),
+and, if `$RUN_SECURITY_REVIEW` is yes, the checks in
+`$SKILL_DIR/../security-analysis/requirements.md`, so every question comes before any work
+starts.
 
-Ask about everything missing in one `AskUserQuestion` call, as that requirements file
-describes: **Install now (Recommended)**, **Continue without it**, or **Stop**. For a tool,
-run the install command yourself and re-check; for a skill or a login, give the user the
+Ask about everything missing in one `AskUserQuestion` call with the options **Install now
+(Recommended)**, **Continue without it**, or **Stop**. For a tool, run the install command yourself and re-check; for a skill or a login, give the user the
 step, wait for them to confirm, and re-check. Record what the user continued without as
 `$UNAVAILABLE` (or `none`).
 
 ### 0d — Index once
 
 Index `$WORKDIR` yourself with the `cocoindex-code:ccc` skill and wait for it to finish. If
-indexing fails, say so and continue — the reviewer falls back to grep and direct file reads.
+indexing fails, say so and continue — the reviewers fall back to grep and direct file reads.
 
-## Step 1 — Reviewer
+## Step 1 — Code review
 
-Spawn `reviewer` on `$REVIEWER_MODEL` with these instructions, filling in `$WORKDIR`,
-`$SCOPE`, `$SPEC`, and `$SKILL_DIR`:
+Run the `reviewer` skill. Supply its inputs so it needs nothing more from the user:
 
-```
-Do a code review, working in $WORKDIR, of:
-$SCOPE
+- **Model**: `$REVIEWER_MODEL`.
+- **Scope**: `$WORKDIR`, plus `$BASE` and whether to include uncommitted work for PR and
+  branch scope; the resolved paths for path scope.
+- **Spec**: `$SPEC`.
+- **Preflight**: done, with these unavailable: `$UNAVAILABLE`.
+- **Index**: done.
 
-What the change is meant to do: $SPEC
+It runs its reviewers in parallel, verifies and de-duplicates their findings, and returns
+CONFIRMED findings, DROPPED findings, and open Questions for the author.
 
-Search the existing cocoindex-code:ccc index to follow callers and related code outside the
-scope. This is a review only: leave the working tree and git history exactly as you found them.
+## Step 2 — Security review (conditional)
 
-Report only Medium and higher issues — actual defects, not coding nits. If the intent above is
-not "none", also check that the code fully implements it; anything missing is an issue.
-
-For Rust code, read and apply every rule in $SKILL_DIR/../new-feat/review-checklist-rust.md
-if it exists. For other languages, apply the equivalent concern where one exists.
-
-Report every issue with these fields:
-- Title:       one line
-- Severity:    Critical | High | Medium
-- Location:    file:line for every affected site
-- Problem:     what is wrong and what it causes
-- Fix:         what to change
-
-Where the intent can be read two ways and the code commits to one, report a Question
-instead of an issue:
-- Title:       one line
-- Location:    file:line where the code commits to a reading
-- Readings:    each plausible reading, and which one the code took
-
-If you have no issues or Questions to report, report back that all is fine.
-```
-
-## Step 2 — Verify
-
-Reviewer reports are claims, not facts. For every finding, read the cited code yourself and
-mark it:
-
-- **CONFIRMED** — the code does what the finding says.
-- **DROPPED** — it does not, the path is unreachable, or something the reviewer missed
-  already handles it. Tell the user which findings you dropped and why.
-
-Pass reviewer Questions through to the final report as open questions for the author — do
-not resolve them by guessing.
-
-## Step 3 — Security review (conditional)
-
-Only run this step if `$RUN_SECURITY_REVIEW` is yes. If no, skip to Step 4.
+Only run this step if `$RUN_SECURITY_REVIEW` is yes. If no, skip to Step 3.
 
 Run the `security-analysis` skill from `$WORKDIR`. That skill owns the lanes, checklists,
 verification, and report format; supply its inputs so it needs nothing more from the user:
@@ -170,24 +141,24 @@ verification, and report format; supply its inputs so it needs nothing more from
 - **Model**: `$SECURITY_MODEL`.
 - **Preflight**: done, with these unavailable: `$UNAVAILABLE`.
 
-## Step 4 — Final report
+## Step 3 — Final report
 
 Tell the user:
 
 - The scope: PR number and URL, or branch, `$BASE`, and the files reviewed; or the paths.
 - `$SPEC`, and whether the code fully implements it.
-- Every CONFIRMED code-review finding, most severe first, with its fields.
+- Every CONFIRMED code-review finding from the `reviewer` report, most severe first, with its
+  fields and which reviewers raised it.
 - Every CONFIRMED and PLAUSIBLE security finding, from the `security-analysis` report.
 - Open questions for the author.
 - Dropped findings worth a second look, and everything in `$UNAVAILABLE`.
-- The models used for the reviewer and the security review.
+- Which reviewers ran, `$REVIEWER_MODEL`, and the security review model.
 
 If you created a worktree in Step 0b, remove it with `git worktree remove --force <path>`
 once the report is written.
 
-## Step 5 — Post to the PR (PR scope only)
+## Step 4 — Post to the PR (PR scope only)
 
-Ask the user with `AskUserQuestion` whether to post the report to the PR:
-**Don't post (Recommended)** or **Post as a PR review comment**. Only if they choose to post,
-write the report to a temp file and run `gh pr review <number> --comment --body-file <file>`,
-then give the user the comment's URL.
+Only if `$POST_TO_PR` is yes, write the report to a temp file and run
+`gh pr review <number> --comment --body-file <file>`, then give the user the comment's URL.
+Otherwise post nothing.

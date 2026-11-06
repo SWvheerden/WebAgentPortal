@@ -1,6 +1,6 @@
 ---
 name: new-feat
-description: Orchestrates coder, reviewer, and (optionally) security-reviewer subagents to implement a fix or feature end-to-end, looping review cycles until clean. Only invoke this explicitly when the user runs /new-feat or asks by name — do not auto-trigger on generic "fix this" or "implement X" requests, since this is a heavyweight, deliberate workflow the user chooses to run.
+description: Orchestrates a coder subagent, the reviewer skill, and (optionally) the security-analysis skill to implement a fix or feature end-to-end, looping review cycles until clean. Only invoke this explicitly when the user runs /new-feat or asks by name — do not auto-trigger on generic "fix this" or "implement X" requests, since this is a heavyweight, deliberate workflow the user chooses to run.
 argument-hint: [task description]
 ---
 
@@ -26,24 +26,25 @@ Report to the user as each step and each cycle completes, naming the model each 
   - [0c — Preflight requirements](#0c--preflight-requirements)
   - [0d — Index once](#0d--index-once)
 - [Step 1 — Coder](#step-1--coder)
-- [Step 2 — Reviewer](#step-2--reviewer)
-- [Step 3 — Verify and loop](#step-3--verify-and-loop)
+- [Step 2 — Review](#step-2--review)
+- [Step 3 — Fix and loop](#step-3--fix-and-loop)
 - [Step 4 — Security review (conditional)](#step-4--security-review-conditional)
 - [Step 5 — Security fix loop](#step-5--security-fix-loop)
 - [Step 6 — Final report](#step-6--final-report)
 
 ## Subagents
 
-`coder` and `reviewer` are labels for your own tracking and reports — they are not registered
-agent types. Spawn each as a `general-purpose` agent with the model the user chose.
+`coder` is a label for your own tracking and reports — it is not a registered agent type.
+Spawn it as a `general-purpose` agent with the model the user chose.
 
 - **coder** — spawn it once, in Step 1, and keep its ID. Every later fix round goes to that
   same agent via `SendMessage`, so it keeps its context of the change it is making.
-- **reviewer** — spawn a fresh one for every review round, so it reads the code cold.
+- **reviews** run through the `reviewer` skill, which spawns fresh reviewer subagents every
+  round, so each round reads the code cold.
 
 **Free disk while waiting**: in a Rust repo checked out as a git worktree (`git rev-parse
 --git-dir` differs from `git rev-parse --git-common-dir`), each time `coder` has reported
-back and you are waiting on a reviewer or `security-analysis`, delete the worktree's `target/`
+back and you are waiting on a `reviewer` run or `security-analysis`, delete the worktree's `target/`
 folder (`rm -rf <worktree-root>/target`). Only delete a `target/` inside this worktree —
 never one in the main checkout or a shared `CARGO_TARGET_DIR`. Skip it while `coder` is still
 working.
@@ -54,8 +55,8 @@ and ask the user how to proceed, listing the findings still open.
 ### Open questions and assumptions
 
 Subagents cannot ask the user; they report back to you. Keep a `$DECISIONS` list (initially
-`none`) of every clarification the user gives. Pass it, with the TASK, to every coder and
-reviewer message, so later rounds build on the answers.
+`none`) of every clarification the user gives. Pass it, with the TASK, to every coder
+message and every `reviewer` run, so later rounds build on the answers.
 
 When a report contains an **open question** — from the coder, or a reviewer's Question item:
 
@@ -76,7 +77,8 @@ Keep a list of assumptions the user never confirmed for Step 6.
 Ask these in a single `AskUserQuestion` call and wait for the answers:
 
 1. **Coder model** — `opus` (Recommended), `sonnet`, `haiku`.
-2. **Reviewer model** — `opus` (Recommended), `sonnet`, `haiku`.
+2. **Reviewer model** — `opus` (Recommended), `sonnet`, `haiku`. Every reviewer subagent the
+   `reviewer` skill spawns uses it.
 3. **Security review** after the coder/reviewer loop is clean — `Yes, opus` (Recommended),
    `Yes, sonnet`, `No`. The model chosen here is used by `security-analysis` and every
    sub-agent it spawns.
@@ -101,6 +103,7 @@ available-skills list; a tool is present when the check succeeds.
 | Requirement | Applies when | Check | Install | If the user continues without it |
 |---|---|---|---|---|
 | `cocoindex-code:ccc` skill and `ccc` CLI | always | skills list; `command -v ccc` | user runs `/plugin install cocoindex-code@cocoindex-code` | subagents navigate with grep and direct reads |
+| `reviewer` skill | always | skills list | user installs it into `~/.claude/skills/reviewer/` | stop — Step 2 needs it |
 | `security-analysis` skill | `$RUN_SECURITY_REVIEW` is yes | skills list | user installs it into `~/.claude/skills/security-analysis/` | `$RUN_SECURITY_REVIEW` becomes no |
 | `cargo-nextest` | `.cargo/config.toml` defines the `ci-*` aliases | `command -v cargo-nextest` | `cargo install cargo-nextest --locked` | the coder skips `cargo ci-test` |
 | `cargo-lints` | same | `command -v cargo-lints` | `cargo install cargo-lints` | the coder skips `cargo ci-clippy` |
@@ -108,14 +111,15 @@ available-skills list; a tool is present when the check succeeds.
 | nightly `rustfmt` | same | `rustup run nightly rustfmt --version` | `rustup toolchain install nightly --component rustfmt` | the coder skips `cargo +nightly ci-fmt-fix` |
 | `rg` (ripgrep) | `scripts/file_license_check.sh` exists | `command -v rg` | `brew install ripgrep` | the coder skips the licence check |
 
-If `$RUN_SECURITY_REVIEW` is yes, also run the checks in
-`$SKILL_DIR/../security-analysis/requirements.md` now, so every question comes before any
-work starts.
+Also run the checks in the `reviewer` skill's 0c table
+(`$SKILL_DIR/../reviewer/SKILL.md`) that apply to branch scope, and, if
+`$RUN_SECURITY_REVIEW` is yes, the checks in `$SKILL_DIR/../security-analysis/requirements.md`,
+so every question comes before any work starts.
 
-Ask about everything missing in one `AskUserQuestion` call, as that requirements file
-describes: **Install now (Recommended)**, **Continue without it**, or **Stop**. For a tool,
-run the install command yourself and re-check; for a skill, give the user the install step,
-wait for them to confirm, and re-check. Record what the user continued without as
+Ask about everything missing in one `AskUserQuestion` call with the options **Install now
+(Recommended)**, **Continue without it**, or **Stop**. For a tool, run the install command
+yourself and re-check; for a skill, give the user the install step, wait for them to confirm,
+and re-check. Record what the user continued without as
 `$UNAVAILABLE` (or `none`) — the coder skips those commands, and Step 6 lists them.
 
 The preflight is **done** when every requirement is present or the user has chosen to
@@ -196,61 +200,35 @@ Then make a commit on the current branch.
 - Skipped: each feature, option or flexibility you chose not to add, one line each, or "none".
 ```
 
-## Step 2 — Reviewer
+## Step 2 — Review
 
-Spawn a fresh `reviewer` on `$REVIEWER_MODEL` with these instructions, filling in `$BASE`,
-`$SKILL_DIR`, and `$DECISIONS`:
+Run the `reviewer` skill. Supply its inputs so it needs nothing from the user:
 
-```
-Do a code review of `git diff $BASE..HEAD` against this TASK:
-$ARGUMENTS
+- **Model**: `$REVIEWER_MODEL`.
+- **Scope**: `$WORKDIR` is the repo root, base `$BASE`, commits only (`git diff $BASE..HEAD`).
+- **Spec**: the TASK, followed by "Decisions the user has already made, which are part of the
+  TASK: $DECISIONS".
+- **Preflight**: done, with these unavailable: `$UNAVAILABLE`.
+- **Index**: done.
 
-Decisions the user has already made, which are part of the TASK: $DECISIONS
+It runs its reviewers in parallel, verifies and de-duplicates their findings, and returns
+CONFIRMED findings, DROPPED findings, and open Questions. Every run spawns fresh reviewers.
 
-Search the existing cocoindex-code:ccc index to follow callers and related code outside the
-diff. This is a review only: leave the working tree and git history exactly as you found them.
+## Step 3 — Fix and loop
 
-Report only Medium and higher issues — actual defects, not coding nits. Also check that the
-diff fully implements the TASK; anything missing is an issue.
+The `reviewer` skill has already verified each finding by reading the code, so work from its
+CONFIRMED list. Tell the user which findings it dropped and why.
 
-For Rust code, read and apply every rule in $SKILL_DIR/review-checklist-rust.md. For other
-languages, apply the equivalent concern where one exists.
-
-Report every issue with these fields:
-- Title:       one line
-- Severity:    Critical | High | Medium
-- Location:    file:line for every affected site
-- Problem:     what is wrong and what it causes
-- Fix:         what to change
-
-Where the TASK can be read two ways and the diff commits to one, report a Question
-instead of an issue:
-- Title:       one line
-- Location:    file:line where the diff commits to a reading
-- Readings:    each plausible reading of the TASK, and which one the diff took
-
-If you have no issues or Questions to report, report back that all is fine.
-```
-
-## Step 3 — Verify and loop
-
-Reviewer reports are claims, not facts. For every finding, read the cited code yourself and
-mark it:
-
-- **CONFIRMED** — the code does what the finding says.
-- **DROPPED** — it does not, the path is unreachable, or something the reviewer missed
-  already handles it. Tell the user which findings you dropped and why.
-
-Route reviewer Questions through [Open questions and assumptions](#open-questions-and-assumptions);
+Route its Questions through [Open questions and assumptions](#open-questions-and-assumptions);
 when the answer differs from the diff's reading, send it to `coder` as a finding.
 
 Send the CONFIRMED findings to `coder` via `SendMessage` to fix and commit. When it reports
 back, read the new diff and check each finding is actually fixed — send any that aren't
 back before the next review. Then run Step 2 again.
 
-The loop is **clean** when a fresh reviewer's findings all come out DROPPED (or it reports
-all fine), every open question is answered, the diff fully implements the TASK, and the coder's last run of the Step 1
-commands passed.
+The loop is **clean** when a `reviewer` run returns no CONFIRMED findings and no open
+Questions, every open question is answered, the diff fully implements the TASK, and the
+coder's last run of the Step 1 commands passed.
 
 ## Step 4 — Security review (conditional)
 
