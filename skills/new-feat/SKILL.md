@@ -137,31 +137,24 @@ Spawn `coder` on `$CODER_MODEL` with these instructions, filling in `$UNAVAILABL
 Search the existing cocoindex-code:ccc index to find files, callers, and related code.
 
 ** Style
-Skip features, options and flexibility nobody asked for, and name them in one line
+Skip features, options and flexibility nobody asked for, and list each one under "Skipped" in your report.
 Already in this codebase (a helper, component, service, pattern)? Use it the way the surrounding code does.
 Standard library or a platform feature? Use it, unless the project has its own. A house component beats a native widget.
 An installed dependency? Use it. Never add a dependency for a few lines.
-Can it be one line a reader gets at a glance? One line.
+Can it be one line a reader gets at a glance? One line. A one-liner that needs decoding is not short.
 Otherwise: the minimum code that works.
 
-Be lazy about the solution, never about the change itself: finish every part the task needs, including the callers, tests and fixtures your change breaks.
-Write the least code that does the TASK. Reuse the helpers and patterns already in the
-codebase rather than adding new ones. Don't add options, abstractions, or error handling
-for cases that don't exist yet, and don't refactor, rename, or tidy code the TASK doesn't
-touch.
-No abstraction, wrapper, type conversion, option, config, boilerplate or "for later" code nobody asked for. Keep values in the form the platform already gives you. Deletion beats addition. Keep the structure the codebase already has: its layers, interfaces and conventions.
-The shortest working diff wins, once you know everything it must touch. A one-liner that needs decoding is not short.
-Comment only the why the code cannot show, in one line.
-Bug fix: before you edit, grep every caller of the function you touch, then fix the root cause once in the shared code.
+Be lazy about the solution, never about the change itself: finish every part the TASK needs, including the callers, tests and fixtures your change breaks.
+The shortest working diff wins, once you know everything it must touch.
+No abstraction, wrapper, type conversion, option, config, boilerplate, error handling for cases that don't exist yet, or "for later" code. Keep values in the form the platform already gives you. Deletion beats addition.
+Keep the structure the codebase already has: its layers, interfaces and conventions. Don't refactor, rename, or tidy code the TASK doesn't touch.
+Bug fix: before you edit, find every caller of the function you touch, then fix the root cause once in the shared code.
 Code you move or merge keeps its error handling and validation.
 Between options of equal size, take the one that is correct on edge cases.
-Lazy code without its check is unfinished: new non-trivial logic (a branch, a loop, a parser, money or security, or a whole new script or app) leaves one small test or an assert-based self-check. Trivial changes need none.
 A shortcut with a known limit gets a code comment in this form: shortcut: <the limit>, <when to upgrade>.
-Never cut: validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs, anything the user asked for.
+Never cut: validation at trust boundaries, error handling that prevents data loss, security, accessibility, anything the user asked for.
 
-Keep comments short — a line or two, only where the code doesn't explain itself. No long
-comment blocks, and no code history: don't describe what changed, what used to be there,
-or which review round prompted it — that belongs in the commit message.
+Comments: only the why the code cannot show, in a line or two. No code history: don't describe what changed, what used to be there, or which review round prompted it — that belongs in the commit message.
 
 ** Task
 Implement the TASK at hand:
@@ -169,7 +162,7 @@ $ARGUMENTS
 
 Decisions the user has already made: $DECISIONS
 
-Add or update tests covering the new behaviour or the fixed bug.
+Add or update tests covering the new behaviour or the fixed bug. New non-trivial logic (a branch, a loop, a parser, money or security code) gets at least one small test; trivial changes need none.
 
 ** When the TASK is unclear
 If a choice changes behaviour, a public interface, data formats, or scope — or two readings
@@ -200,6 +193,7 @@ Then make a commit on the current branch.
 - Each command you ran and whether it passed. If one failed and you could not fix it,
   say so and paste the relevant output.
 - Assumptions: each smaller choice you made, with file:line, or "none".
+- Skipped: each feature, option or flexibility you chose not to add, one line each, or "none".
 ```
 
 ## Step 2 — Reviewer
