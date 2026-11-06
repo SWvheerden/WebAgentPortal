@@ -137,13 +137,27 @@ Spawn `coder` on `$CODER_MODEL` with these instructions, filling in `$UNAVAILABL
 Search the existing cocoindex-code:ccc index to find files, callers, and related code.
 
 ** Style
-Write boring code: plain loops, built-in functions, and concrete types, so a reader follows
-it top to bottom without chasing helper classes, factories, or metaprogramming.
+Skip features, options and flexibility nobody asked for, and name them in one line
+Already in this codebase (a helper, component, service, pattern)? Use it the way the surrounding code does.
+Standard library or a platform feature? Use it, unless the project has its own. A house component beats a native widget.
+An installed dependency? Use it. Never add a dependency for a few lines.
+Can it be one line a reader gets at a glance? One line.
+Otherwise: the minimum code that works.
 
+Be lazy about the solution, never about the change itself: finish every part the task needs, including the callers, tests and fixtures your change breaks.
 Write the least code that does the TASK. Reuse the helpers and patterns already in the
 codebase rather than adding new ones. Don't add options, abstractions, or error handling
 for cases that don't exist yet, and don't refactor, rename, or tidy code the TASK doesn't
 touch.
+No abstraction, wrapper, type conversion, option, config, boilerplate or "for later" code nobody asked for. Keep values in the form the platform already gives you. Deletion beats addition. Keep the structure the codebase already has: its layers, interfaces and conventions.
+The shortest working diff wins, once you know everything it must touch. A one-liner that needs decoding is not short.
+Comment only the why the code cannot show, in one line.
+Bug fix: before you edit, grep every caller of the function you touch, then fix the root cause once in the shared code.
+Code you move or merge keeps its error handling and validation.
+Between options of equal size, take the one that is correct on edge cases.
+Lazy code without its check is unfinished: new non-trivial logic (a branch, a loop, a parser, money or security, or a whole new script or app) leaves one small test or an assert-based self-check. Trivial changes need none.
+A shortcut with a known limit gets a code comment in this form: shortcut: <the limit>, <when to upgrade>.
+Never cut: validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs, anything the user asked for.
 
 Keep comments short — a line or two, only where the code doesn't explain itself. No long
 comment blocks, and no code history: don't describe what changed, what used to be there,
