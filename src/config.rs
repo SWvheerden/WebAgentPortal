@@ -1,5 +1,6 @@
 //! `config.toml` load/save plus the tiny bits of path handling it needs.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
@@ -41,6 +42,12 @@ pub struct Config {
     pub branch_prefix: String,
     pub max_agents: usize,
     pub default_model: String,
+    /// Short model names the CLI does not resolve itself, mapped to the full
+    /// ID passed as `--model`. Matched case-insensitively, at every launch, so
+    /// moving `mythos` to a new version is a config edit and takes effect on
+    /// the next start or resume. The CLI already knows `opus`, `sonnet`,
+    /// `haiku` and `fable`; `mythos` passed through bare comes back 404.
+    pub model_aliases: BTreeMap<String, String>,
     pub default_permission_mode: PermissionMode,
     pub claude_bin: String,
     pub pinned_cli_version: String,
@@ -80,6 +87,7 @@ impl Default for Config {
             branch_prefix: "sw_".to_string(),
             max_agents: 8,
             default_model: "opus".to_string(),
+            model_aliases: default_model_aliases(),
             default_permission_mode: PermissionMode::Ask,
             claude_bin: "claude".to_string(),
             pinned_cli_version: "2.1.241".to_string(),
@@ -91,7 +99,22 @@ impl Default for Config {
     }
 }
 
+/// The aliases a fresh config, or one written before the setting existed,
+/// starts with.
+pub fn default_model_aliases() -> BTreeMap<String, String> {
+    BTreeMap::from([("mythos".to_string(), "claude-mythos-5-2".to_string())])
+}
+
 impl Config {
+    /// The model ID to hand the CLI: a configured alias (case-insensitive)
+    /// becomes its full ID, anything else passes through unchanged.
+    pub fn resolve_model(&self, model: &str) -> String {
+        self.model_aliases
+            .iter()
+            .find(|(alias, _)| alias.eq_ignore_ascii_case(model))
+            .map_or_else(|| model.to_string(), |(_, id)| id.clone())
+    }
+
     pub fn from_toml_str(s: &str) -> Result<Self> {
         toml::from_str(s).context("parsing config.toml")
     }
@@ -169,6 +192,13 @@ impl Config {
         }
         if self.upload_max_mb == 0 {
             anyhow::bail!("upload_max_mb must be at least 1");
+        }
+        // The target reaches the CLI as `--model`'s value, so it is held to
+        // the same rules as a model typed into the spawn form.
+        for (alias, id) in &self.model_aliases {
+            crate::agent::protocol::validate_cli_value("model alias", alias)?;
+            crate::agent::protocol::validate_cli_value("model alias target", id)
+                .with_context(|| format!("model_aliases.{alias}"))?;
         }
         self.validate_roots_against(&state_dir())?;
         self.validate_bind(key_file)
@@ -823,5 +853,42 @@ pinned_cli_version = "2.1.241"
             confine_to_roots(&repo, &[]).is_err(),
             "no roots means nothing is allowed"
         );
+    }
+
+    #[test]
+    fn mythos_alias_resolves_case_insensitively() {
+        let cfg = Config::default();
+        for alias in ["mythos", "Mythos", "MYTHOS"] {
+            assert_eq!(cfg.resolve_model(alias), "claude-mythos-5-2");
+        }
+        for passthrough in ["opus", "fable", "claude-mythos-5-2", "mythosx"] {
+            assert_eq!(cfg.resolve_model(passthrough), passthrough);
+        }
+    }
+
+    /// The version lives in config, not code: a new Mythos is a config edit.
+    #[test]
+    fn model_aliases_come_from_config() {
+        let cfg = Config::from_toml_str(
+            "[model_aliases]\nmythos = \"claude-mythos-6\"\nquick = \"claude-haiku-5-5\"\n",
+        )
+        .expect("parse");
+        assert_eq!(cfg.resolve_model("Mythos"), "claude-mythos-6");
+        assert_eq!(cfg.resolve_model("quick"), "claude-haiku-5-5");
+    }
+
+    /// A config file written before the setting existed still gets `mythos`.
+    #[test]
+    fn model_aliases_default_when_absent() {
+        let cfg = Config::from_toml_str("port = 9000\n").expect("parse");
+        assert_eq!(cfg.model_aliases, default_model_aliases());
+    }
+
+    #[test]
+    fn option_shaped_alias_target_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.model_aliases
+            .insert("evil".into(), "--dangerously-skip-permissions".into());
+        assert!(cfg.validate().is_err());
     }
 }

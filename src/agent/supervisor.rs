@@ -2800,7 +2800,9 @@ fn launch_args(
         session_id: record.id.clone(),
         resume,
         permission_mode: record.permission_mode,
-        model: record.model.clone(),
+        // Resolved here, not at spawn: the record keeps the name typed, and an
+        // alias moved to a new version in config applies on the next resume.
+        model: record.model.as_deref().map(|m| cfg.resolve_model(m)),
         effort: record.effort.clone(),
         max_budget_usd: record.max_budget_usd,
         add_dirs: record.add_dirs.clone(),
@@ -3165,6 +3167,27 @@ mod tests {
                 "resume = {resume}: {argv:?}"
             );
         }
+    }
+
+    /// A model alias is resolved from the config at launch, so a stored
+    /// `Mythos` follows whatever version the config names now, on resume too.
+    #[test]
+    fn model_alias_is_resolved_from_config_at_launch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = agent_record("agent-alias", dir.path());
+        record.model = Some("Mythos".to_string());
+        let mut cfg = Config::default();
+        cfg.model_aliases
+            .insert("mythos".into(), "claude-mythos-6".into());
+
+        for resume in [false, true] {
+            let argv = launch_args(&record, &cfg, resume, None).to_argv();
+            assert!(
+                argv.windows(2).any(|w| w == ["--model", "claude-mythos-6"]),
+                "resume = {resume}: {argv:?}"
+            );
+        }
+        assert_eq!(record.model.as_deref(), Some("Mythos"), "record unchanged");
     }
 
     /// A CLI that answers the `initialize` handshake and nothing else — which

@@ -839,21 +839,6 @@ pub fn validate_cli_value(field: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Short model names the CLI does not resolve itself, mapped to full IDs.
-///
-/// The CLI knows `opus`, `sonnet`, `haiku` and `fable` in any case, but not
-/// `mythos`: passed through, it reaches the API verbatim and comes back 404.
-const MODEL_ALIASES: &[(&str, &str)] = &[("mythos", "claude-mythos-5-2")];
-
-/// The model ID to hand the CLI: a known alias (case-insensitive) becomes its
-/// full ID, anything else passes through unchanged.
-pub fn resolve_model_alias(model: &str) -> String {
-    MODEL_ALIASES
-        .iter()
-        .find(|(alias, _)| alias.eq_ignore_ascii_case(model))
-        .map_or_else(|| model.to_string(), |(_, id)| (*id).to_string())
-}
-
 /// Build the launch argument list for a child process.
 ///
 /// Kept separate from spawning so it can be asserted on in tests.
@@ -894,7 +879,7 @@ impl LaunchArgs {
         }
         if let Some(model) = &self.model {
             args.push("--model".into());
-            args.push(resolve_model_alias(model));
+            args.push(model.clone());
         }
         if let Some(effort) = &self.effort {
             args.push("--effort".into());
@@ -1491,31 +1476,5 @@ mod tests {
         for good in ["opus", "claude-sonnet-4-5", "high", "v1.2"] {
             assert!(validate_cli_value("model", good).is_ok(), "{good:?}");
         }
-    }
-
-    #[test]
-    fn mythos_alias_resolves_to_full_id() {
-        for alias in ["mythos", "Mythos", "MYTHOS"] {
-            assert_eq!(resolve_model_alias(alias), "claude-mythos-5-2");
-        }
-        for passthrough in ["opus", "fable", "claude-mythos-5-2", "mythosx"] {
-            assert_eq!(resolve_model_alias(passthrough), passthrough);
-        }
-        let argv = LaunchArgs {
-            session_id: "u".into(),
-            resume: true,
-            permission_mode: PermissionMode::Ask,
-            model: Some("Mythos".into()),
-            effort: None,
-            max_budget_usd: None,
-            add_dirs: vec![],
-            allowed_tools: vec![],
-            remote_control: None,
-        }
-        .to_argv();
-        assert!(
-            argv.windows(2)
-                .any(|w| w == ["--model", "claude-mythos-5-2"])
-        );
     }
 }
