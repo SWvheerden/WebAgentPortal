@@ -318,7 +318,8 @@ async function remove(agent) {
   } catch {
     uploads = '';
   }
-  if (!confirm(`Delete "${agent.name}"?${keeps}${uploads}`)) return;
+  const spec = agent.spec_file ? `\n\nThe spec file it was spawned from will be deleted:\n${agent.spec_file}` : '';
+  if (!confirm(`Delete "${agent.name}"?${keeps}${uploads}${spec}`)) return;
   // A branch the agent did not create is not ours to destroy, so it is not
   // even offered — the server refuses it too.
   const deleteBranch = agent.branch && agent.branch_is_new !== false
@@ -737,10 +738,11 @@ async function loadRepos() {
 
 // -- spawn ------------------------------------------------------------------
 
-async function spawn() {
+// What the form says, as a spawn request; null when no repository is picked.
+function spawnBody() {
   if (!state.selectedRepo) {
     toast('Pick a repository, or the whole folder, first', 'warn');
-    return;
+    return null;
   }
   const budget = parseFloat($('budget').value);
   const source = $('branch-source').value;
@@ -768,7 +770,15 @@ async function spawn() {
     add_dirs: $('add-dirs').value.split('\n').map((s) => s.trim()).filter(Boolean),
     first_message: $('first-message').value.trim() || null,
   };
-  const button = $('spawn-btn');
+  return body;
+}
+
+// `extra` overrides the form, e.g. `{ spec_file }` for a spawn from a spec,
+// where the server names the agent and writes its first message.
+async function spawn(extra = {}, button = $('spawn-btn')) {
+  const form = spawnBody();
+  if (!form) return false;
+  const body = { ...form, ...extra };
   button.disabled = true;
   try {
     const data = await api('/api/agents', { method: 'POST', body: JSON.stringify(body) });
@@ -778,11 +788,92 @@ async function spawn() {
     stashSpawnWarning(data.agent.slug, data.warning);
     $('first-message').value = '';
     location.href = `/agent/${data.agent.slug}`;
+    return true;
   } catch (err) {
     toast(err.message, 'error');
+    return false;
   } finally {
     button.disabled = false;
   }
+}
+
+// -- spawn from spec --------------------------------------------------------
+
+const specPicker = { specs: [], selected: null };
+
+async function openSpecPicker() {
+  // The repository and the rest of the form still decide where the agent runs,
+  // so a missing pick is caught before the picker opens.
+  if (!state.selectedRepo) {
+    toast('Pick a repository, or the whole folder, first', 'warn');
+    return;
+  }
+  let data;
+  try {
+    data = await api('/api/specs');
+  } catch (err) {
+    toast(err.message, 'error');
+    return;
+  }
+  specPicker.specs = data.specs || [];
+  specPicker.selected = null;
+  $('spec-folder').textContent = data.folder;
+  $('spec-filter').value = '';
+  $('spec-name').value = '';
+  $('spec-spawn').disabled = true;
+  renderSpecs();
+  $('spec-dialog').showModal();
+  $('spec-filter').focus();
+}
+
+function renderSpecs() {
+  const list = $('spec-list');
+  list.replaceChildren();
+  const needle = $('spec-filter').value.trim().toLowerCase();
+  const shown = specPicker.specs.filter((spec) => !needle
+    || spec.path.toLowerCase().includes(needle)
+    || spec.title.toLowerCase().includes(needle));
+  if (!shown.length) {
+    list.append(el('div', { class: 'spec muted small', text: specPicker.specs.length ? 'No spec matches.' : 'No spec files in this folder.' }));
+    return;
+  }
+  let folder = null;
+  for (const spec of shown) {
+    const dir = spec.path.includes('/') ? spec.path.slice(0, spec.path.lastIndexOf('/')) : '.';
+    if (dir !== folder) {
+      folder = dir;
+      list.append(el('div', { class: 'group-label', text: dir }));
+    }
+    const file = spec.path.slice(spec.path.lastIndexOf('/') + 1);
+    const selected = specPicker.selected && specPicker.selected.path === spec.path;
+    list.append(el('div', {
+      class: `spec${selected ? ' selected' : ''}`,
+      title: spec.path,
+      'data-path': spec.path,
+      onclick: () => selectSpec(spec),
+      ondblclick: () => { selectSpec(spec); spawnFromSpec(); },
+    }, [
+      el('span', { class: 'file', text: file }),
+      el('span', { class: 'title muted', text: spec.title }),
+    ]));
+  }
+}
+
+function selectSpec(spec) {
+  specPicker.selected = spec;
+  $('spec-name').value = spec.agent_name;
+  $('spec-spawn').disabled = false;
+  // Classes only, not a re-render: a double-click must land on the same node.
+  for (const row of $('spec-list').querySelectorAll('.spec')) {
+    row.classList.toggle('selected', row.dataset.path === spec.path);
+  }
+}
+
+async function spawnFromSpec() {
+  const spec = specPicker.selected;
+  if (!spec) return;
+  const ok = await spawn({ spec_file: spec.path }, $('spec-spawn'));
+  if (ok) $('spec-dialog').close();
 }
 
 // -- clone ------------------------------------------------------------------
@@ -837,6 +928,7 @@ function fillSettings() {
   $('cfg-auto-resume').checked = cfg.auto_resume;
   $('cfg-remote-control').checked = cfg.remote_control;
   $('cfg-text-size').value = cfg.text_size;
+  $('cfg-spec-folder').value = cfg.spec_folder || '';
   // Shown, never edited: the server keeps its own values whatever this panel
   // sends back (§12).
   $('cfg-bind').value = `${cfg.bind}:${cfg.port}`;
@@ -856,6 +948,7 @@ async function saveSettings() {
     open_browser: $('cfg-open').checked,
     auto_resume: $('cfg-auto-resume').checked,
     remote_control: $('cfg-remote-control').checked,
+    spec_folder: $('cfg-spec-folder').value.trim(),
     // Sent as typed: the server holds it to its bounds and says so, rather than
     // this quietly saving a different size from the one on screen.
     text_size: $('cfg-text-size').value === '' ? DEFAULT_TEXT_SIZE : Number($('cfg-text-size').value),
@@ -917,7 +1010,11 @@ async function main() {
     updateBranchPreview();
     renderSpawnWarnings(state.repoInfo);
   };
-  $('spawn-btn').onclick = spawn;
+  $('spawn-btn').onclick = () => spawn();
+  $('spawn-spec-btn').onclick = openSpecPicker;
+  $('spec-close').onclick = () => $('spec-dialog').close();
+  $('spec-filter').oninput = renderSpecs;
+  $('spec-spawn').onclick = spawnFromSpec;
   $('clone-btn').onclick = startClone;
   $('cfg-save').onclick = saveSettings;
   $('fetch-btn').onclick = async () => {

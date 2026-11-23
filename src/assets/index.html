@@ -104,7 +104,10 @@
             </div>
           </details>
           <div id="spawn-warnings"></div>
-          <button id="spawn-btn" class="primary">Spawn agent</button>
+          <div class="spawn-actions">
+            <button id="spawn-btn" class="primary">Spawn agent</button>
+            <button id="spawn-spec-btn" title="Pick a spec file: it names the agent and is sent as its first message via the new-feat skill. The spec file is deleted when the agent is.">Spawn agent new spec</button>
+          </div>
         </div>
       </div>
     </section>
@@ -145,6 +148,9 @@
           <div class="field"><label for="cfg-pin">Pinned CLI version</label><input id="cfg-pin"></div>
           <div class="field"><label for="cfg-text-size">Text size (px, 10–24)</label><input id="cfg-text-size" type="number" min="10" max="24" step="1"></div>
         </div>
+      </div>
+      <div class="row">
+        <div class="field"><label for="cfg-spec-folder">Spec folder (for "Spawn agent new spec"; empty turns it off)</label><input id="cfg-spec-folder" placeholder="~/code/tari-issues"></div>
       </div>
       <div class="row">
         <div class="field"><label for="cfg-bind">Listening on (read-only)</label><input id="cfg-bind" readonly disabled></div>
@@ -199,6 +205,24 @@
       <p class="muted small">Esc closes without saving. Cmd/Ctrl+Enter saves and closes.</p>
     </section>
   </main>
+
+  <!-- The spec picker: the files under the configured spec folder. -->
+  <dialog id="spec-dialog" class="spec-dialog">
+    <h2>
+      <span>Spawn from spec</span>
+      <span class="spacer"></span>
+      <button id="spec-close">Cancel</button>
+    </h2>
+    <div class="small muted" id="spec-folder"></div>
+    <input id="spec-filter" placeholder="Filter specs">
+    <div class="spec-list" id="spec-list"></div>
+    <div class="field">
+      <label>Agent name</label>
+      <input id="spec-name" readonly>
+    </div>
+    <p class="small muted">The whole spec is sent as the first message, asking for the new-feat skill with Opus for the coder, reviewer and security review. <strong>Deleting the agent deletes the spec file.</strong></p>
+    <button id="spec-spawn" class="primary" disabled>Spawn</button>
+  </dialog>
 
   <script type="module" src="/assets/dashboard.js"></script>
 </body>

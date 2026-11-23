@@ -348,6 +348,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/{*path}", get(asset))
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/repos", get(list_repos))
+        .route("/api/specs", get(list_specs))
         .route("/api/repos/branches", get(repo_branches))
         .route("/api/repos/fetch", post(fetch_repo))
         .route("/api/repos/clone", post(clone_repo))
@@ -626,6 +627,21 @@ async fn list_repos(State(state): State<AppState>) -> ApiResult<Json<scan::RepoL
         .await
         .map_err(ApiError::bad_request)?;
     Ok(Json(listing))
+}
+
+/// Every spec under the configured spec folder, for the "Spawn from spec"
+/// picker.
+async fn list_specs(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let cfg = state.sup.config().await;
+    let Some(dir) = cfg.spec_dir() else {
+        return Err(ApiError::bad_request("no spec folder is configured"));
+    };
+    let shown = dir.to_string_lossy().to_string();
+    let specs = tokio::task::spawn_blocking(move || crate::specs::list(&dir))
+        .await
+        .map_err(ApiError::bad_request)?
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "folder": shown, "specs": specs })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2941,6 +2957,7 @@ console.log("ok");
                     effort: None,
                     max_budget_usd: None,
                     add_dirs: Vec::new(),
+                    spec_file: None,
                     status: crate::agent::state::Status::Stopped,
                     status_detail: None,
                     exit_code: None,
@@ -3017,6 +3034,7 @@ console.log("ok");
                     effort: None,
                     max_budget_usd: None,
                     add_dirs: Vec::new(),
+                    spec_file: None,
                     status: crate::agent::state::Status::Stopped,
                     status_detail: None,
                     exit_code: None,

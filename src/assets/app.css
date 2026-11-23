@@ -625,3 +625,20 @@ details.tool pre { color: var(--dim); }
   body.app #load-earlier { align-self: start; }
   body.app .conversation > p:last-child { margin-bottom: 0; }
 }
+
+/* -- spawn from spec ------------------------------------------------------ */
+.spawn-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.spec-dialog {
+  width: min(900px, 92vw); max-height: 85vh;
+  background: var(--panel); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 8px; padding: 16px;
+}
+.spec-dialog::backdrop { background: #0008; }
+.spec-dialog h2 { display: flex; align-items: center; gap: 8px; margin-top: 0; }
+.spec-dialog > input { width: 100%; margin: 8px 0; }
+.spec-list { max-height: 50vh; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+.spec-list .spec { padding: 4px 8px; cursor: pointer; display: flex; gap: 8px; }
+.spec-list .spec:hover { background: #ffffff0d; }
+.spec-list .spec.selected { background: #1f6feb33; }
+.spec-list .spec .file { flex: 0 0 auto; }
+.spec-list .spec .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

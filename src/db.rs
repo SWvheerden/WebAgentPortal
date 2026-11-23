@@ -140,6 +140,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE agents ADD COLUMN is_root INTEGER", [])
             .context("adding the is_root column")?;
     }
+    // The spec file an agent was spawned from, deleted with it. NULL for every
+    // agent that predates the column, and for any not spawned from a spec.
+    if !existing.iter().any(|c| c == "spec_file") {
+        conn.execute("ALTER TABLE agents ADD COLUMN spec_file TEXT", [])
+            .context("adding the spec_file column")?;
+    }
     Ok(())
 }
 
@@ -196,6 +202,10 @@ pub struct AgentRecord {
     /// `--add-dir` values. Stored so a resume keeps them.
     #[serde(default)]
     pub add_dirs: Vec<String>,
+    /// The spec file this agent was spawned from, canonical and absolute.
+    /// Deleted when the agent is.
+    #[serde(default)]
+    pub spec_file: Option<String>,
     pub status: Status,
     pub status_detail: Option<String>,
     pub exit_code: Option<i64>,
@@ -317,9 +327,9 @@ impl Db {
                 "INSERT INTO agents (id, name, slug, repo_path, work_path, is_git, branch,
                      base_ref, uses_worktree, permission_mode, model, effort, max_budget_usd,
                      status, status_detail, exit_code, last_stderr, cost_usd, created_at,
-                     last_active_at, add_dirs, branch_is_new, is_root)
+                     last_active_at, add_dirs, branch_is_new, is_root, spec_file)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 params![
                     a.id,
                     a.name,
@@ -344,6 +354,7 @@ impl Db {
                     serde_json::to_string(&a.add_dirs).unwrap_or_else(|_| "[]".to_string()),
                     a.branch_is_new as i64,
                     a.is_root as i64,
+                    a.spec_file,
                 ],
             )
             .context("inserting agent")?;
@@ -1079,7 +1090,7 @@ fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
 const AGENT_COLUMNS: &str = "id, name, slug, repo_path, work_path, is_git, branch, base_ref, \
      uses_worktree, permission_mode, model, effort, max_budget_usd, status, status_detail, \
      exit_code, last_stderr, cost_usd, created_at, last_active_at, add_dirs, branch_is_new, \
-     is_root";
+     is_root, spec_file";
 
 fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let mode: String = row.get(9)?;
@@ -1115,6 +1126,7 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
             .map(|v| v != 0)
             .unwrap_or(true),
         is_root: row.get::<_, Option<i64>>(22)?.is_some_and(|v| v != 0),
+        spec_file: row.get(23)?,
     })
 }
 
@@ -1152,6 +1164,7 @@ mod tests {
             effort: None,
             max_budget_usd: None,
             add_dirs: vec!["/extra/one".to_string()],
+            spec_file: None,
             status: Status::Starting,
             status_detail: None,
             exit_code: None,

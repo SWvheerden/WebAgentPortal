@@ -20,6 +20,8 @@ pub const MIN_TEXT_SIZE: u8 = 10;
 pub const MAX_TEXT_SIZE: u8 = 24;
 /// The default cap on one attached file, in MiB.
 pub const DEFAULT_UPLOAD_MAX_MB: u64 = 50;
+/// Where spec files live unless configured otherwise.
+pub const DEFAULT_SPEC_FOLDER: &str = "~/code/tari-issues";
 
 /// User-editable server configuration, persisted as `config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,6 +76,10 @@ pub struct Config {
     /// The largest file the agent page may attach, in MiB. Enforced while the
     /// upload streams, so a bigger one is cut off rather than buffered.
     pub upload_max_mb: u64,
+    /// Folder the "Spawn from spec" picker browses. A spec chosen there names
+    /// the agent and becomes its first message, and the file is deleted when
+    /// the agent is. Empty turns the feature off.
+    pub spec_folder: String,
 }
 
 impl Default for Config {
@@ -95,6 +101,7 @@ impl Default for Config {
             remote_control: false,
             text_size: DEFAULT_TEXT_SIZE,
             upload_max_mb: DEFAULT_UPLOAD_MAX_MB,
+            spec_folder: DEFAULT_SPEC_FOLDER.to_string(),
         }
     }
 }
@@ -201,6 +208,11 @@ impl Config {
                 .with_context(|| format!("model_aliases.{alias}"))?;
         }
         self.validate_roots_against(&state_dir())?;
+        // Files under the spec folder are read into prompts and deleted with
+        // their agent, so it may not reach the portal's own state.
+        if let Some(dir) = self.spec_dir() {
+            refuse_overlap("spec folder", &dir, &state_dir())?;
+        }
         self.validate_bind(key_file)
     }
 
@@ -251,6 +263,12 @@ impl Config {
                 self.bind
             )
         })
+    }
+
+    /// The spec folder with `~` expanded, or `None` when it is not configured.
+    pub fn spec_dir(&self) -> Option<PathBuf> {
+        let raw = self.spec_folder.trim();
+        (!raw.is_empty()).then(|| expand_tilde(raw))
     }
 
     /// Repo roots with `~` expanded.
@@ -882,6 +900,25 @@ pinned_cli_version = "2.1.241"
     fn model_aliases_default_when_absent() {
         let cfg = Config::from_toml_str("port = 9000\n").expect("parse");
         assert_eq!(cfg.model_aliases, default_model_aliases());
+    }
+
+    #[test]
+    fn spec_folder_defaults_and_can_be_turned_off() {
+        let cfg = Config::from_toml_str("port = 9000\n").expect("parse");
+        assert_eq!(cfg.spec_folder, DEFAULT_SPEC_FOLDER);
+        assert!(cfg.spec_dir().is_some());
+        let off = Config::from_toml_str("spec_folder = \"  \"\n").expect("parse");
+        assert!(off.spec_dir().is_none());
+        assert!(off.validate().is_ok());
+    }
+
+    #[test]
+    fn a_spec_folder_over_the_state_folder_is_refused() {
+        let cfg = Config {
+            spec_folder: "~".to_string(),
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

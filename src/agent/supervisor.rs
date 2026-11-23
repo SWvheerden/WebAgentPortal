@@ -156,6 +156,11 @@ pub struct SpawnRequest {
     pub add_dirs: Vec<String>,
     #[serde(default)]
     pub first_message: Option<String>,
+    /// Spawn from this spec file, relative to the configured spec folder. The
+    /// spec names the agent and becomes its first message, overriding
+    /// `task_name` and `first_message`; the file is deleted with the agent.
+    #[serde(default)]
+    pub spec_file: Option<String>,
 }
 
 /// The answer to a spawn, including the soft-cap warning.
@@ -791,6 +796,26 @@ impl Supervisor {
         .await
         .context("path check panicked")??;
 
+        // A spec decides the name and the first message, so it is read before
+        // either is used. Confined to the spec folder by the resolver.
+        let mut req = req;
+        let spec_file = match req.spec_file.as_deref().filter(|s| !s.trim().is_empty()) {
+            None => None,
+            Some(relative) => {
+                let Some(dir) = cfg.spec_dir() else {
+                    bail!("no spec folder is configured");
+                };
+                let relative = relative.to_string();
+                let spec =
+                    tokio::task::spawn_blocking(move || crate::specs::resolve(&dir, &relative))
+                        .await
+                        .context("spec read panicked")??;
+                req.task_name = spec.agent_name;
+                req.first_message = Some(spec.first_message);
+                Some(spec.path.to_string_lossy().to_string())
+            }
+        };
+
         let taken_slugs: HashSet<String> = self
             .db
             .run(|db| db.taken_names())
@@ -847,6 +872,7 @@ impl Supervisor {
             effort: req.effort.clone(),
             max_budget_usd: req.max_budget_usd,
             add_dirs,
+            spec_file,
             status: Status::Starting,
             status_detail: None,
             exit_code: None,
@@ -1556,6 +1582,31 @@ impl Supervisor {
                     "The agent was deleted, but its uploads could not be removed: {err:#}"
                 ),
             });
+        }
+        // The spec the agent was spawned from goes with it. Re-confined to the
+        // spec folder as configured now; anything that will not go is reported,
+        // not fatal — the agent itself is already gone.
+        if let Some(spec) = record.spec_file.clone() {
+            let dir = self.config().await.spec_dir();
+            let result = match dir {
+                None => Err(anyhow!("no spec folder is configured")),
+                Some(dir) => tokio::task::spawn_blocking(move || {
+                    crate::specs::delete(&dir, Path::new(&spec))
+                })
+                .await
+                .unwrap_or_else(|err| Err(anyhow!(err))),
+            };
+            if let Err(err) = result {
+                tracing::warn!(?err, "could not delete the agent's spec file");
+                self.broadcast(ServerMsg::Notice {
+                    agent_id: None,
+                    level: "warn".to_string(),
+                    text: format!(
+                        "The agent was deleted, but its spec file {} was not: {err:#}",
+                        record.spec_file.as_deref().unwrap_or_default()
+                    ),
+                });
+            }
         }
         self.broadcast(ServerMsg::AgentRemoved {
             agent_id: record.id.clone(),
@@ -2841,6 +2892,7 @@ mod tests {
             effort: None,
             max_budget_usd: None,
             add_dirs: Vec::new(),
+            spec_file: None,
             status: Status::Stopped,
             status_detail: None,
             exit_code: None,
@@ -4708,6 +4760,7 @@ mod tests {
             existing_branch: None,
             no_branch: false,
             add_dirs: Vec::new(),
+            spec_file: None,
             first_message: None,
         }
     }
@@ -5092,6 +5145,47 @@ mod tests {
         assert!(record.is_git);
         assert!(record.uses_worktree);
         assert_eq!(record.branch.as_deref(), Some("sw_fix_the_parser"));
+    }
+
+    /// A spec names the agent, is recorded on it, and is deleted with it.
+    #[tokio::test]
+    async fn a_spec_spawn_is_named_from_the_spec_and_deletes_it_with_the_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("Code");
+        let specs = dir.path().join("specs");
+        let state = dir.path().join("state");
+        for d in [&root, &specs.join("cake"), &state] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        let spec = specs.join("cake").join("19-pid.md");
+        std::fs::write(&spec, "# SPEC-19: pid kill\n\nDo the thing.\n").expect("write");
+        let cfg = Config {
+            repo_roots: vec![root.to_string_lossy().to_string()],
+            spec_folder: specs.to_string_lossy().to_string(),
+            claude_bin: "claude-web-no-such-binary".to_string(),
+            ..Config::default()
+        };
+        let db = Db::open_in_memory().expect("db");
+        let sup = Supervisor::with_files_root(db, Arc::new(RwLock::new(cfg)), state);
+        let mut req = spawn_req(&root);
+        req.spec_file = Some("cake/19-pid.md".to_string());
+        let _ = sup.spawn_agent(req).await;
+        let agents = sup.db().run(|db| db.list_agents()).await.expect("list");
+        let record = agents.into_iter().next().expect("one agent");
+        assert_eq!(record.name, "cake-SPEC-19: pid kill");
+        let canonical = std::fs::canonicalize(&spec).expect("canonicalize");
+        assert_eq!(
+            record.spec_file.as_deref(),
+            Some(&*canonical.to_string_lossy())
+        );
+
+        sup.delete(&record.id, true, false).await.expect("delete");
+        assert!(!spec.exists(), "the spec goes with the agent");
+
+        // An escape attempt is refused before anything is written.
+        let mut req = spawn_req(&root);
+        req.spec_file = Some("../state/x.md".to_string());
+        assert!(sup.spawn_agent(req).await.is_err());
     }
 
     /// Delete has nothing to take off disk for a rootless agent, and must not
